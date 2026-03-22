@@ -136,7 +136,7 @@ if (import.meta.main) {
     const now = new Date().toISOString();
     const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
     if (existing) { deleteUndeliveredForPeer.run(existing.id); deletePeer.run(existing.id); }
-    insertPeer.run(id, body.pid, body.machine, body.tailscale_ip,
+    insertPeer.run(id, body.pid, config.machine, config.tailscale_ip,
       body.cwd, body.git_root, body.tty, body.summary, now, now);
     return { id };
   }
@@ -161,9 +161,13 @@ if (import.meta.main) {
       })
       .map(p => ({ ...p, is_remote: false }));
 
-    // Remote peers always included regardless of scope
-    const remotePeers = (selectAllRemotePeers.all() as any[]).map(p => ({ ...p, is_remote: true }));
-    let allPeers = [...localPeers, ...remotePeers];
+    let allPeers: Peer[];
+    if (body.scope === "machine") {
+      const remotePeers = (selectAllRemotePeers.all() as any[]).map(p => ({ ...p, is_remote: true }));
+      allPeers = [...localPeers, ...remotePeers];
+    } else {
+      allPeers = localPeers;
+    }
     if (body.exclude_id) allPeers = allPeers.filter(p => p.id !== body.exclude_id);
     return allPeers;
   }
@@ -187,6 +191,8 @@ if (import.meta.main) {
         signal: AbortSignal.timeout(5000),
       });
       if (!res.ok) return { ok: false, error: `Remote broker error: ${res.status}` };
+      const result = await res.json() as { ok: boolean };
+      if (!result.ok) return { ok: false, error: "Remote broker rejected message (target peer not found)" };
       return { ok: true, routed: "remote" };
     } catch {
       return { ok: false, error: "Remote broker unreachable" };

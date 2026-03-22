@@ -27,8 +27,14 @@ if [ ! -f "$CONFIG_FILE" ]; then
   echo "No config found for $MACHINE — create deploy/configs/${MACHINE}.json first"
   exit 1
 fi
-cp "$CONFIG_FILE" ~/.claude-peers.json
-echo "Config installed to ~/.claude-peers.json"
+TARGET_CONFIG="$HOME/.claude-peers.json"
+if [ -f "$TARGET_CONFIG" ]; then
+  BACKUP_CONFIG="${TARGET_CONFIG}.bak.$(date +%Y%m%d-%H%M%S)"
+  cp "$TARGET_CONFIG" "$BACKUP_CONFIG"
+  echo "Existing config backed up to $BACKUP_CONFIG"
+fi
+cp "$CONFIG_FILE" "$TARGET_CONFIG"
+echo "Config installed to $TARGET_CONFIG"
 
 # 4. Install systemd service (Linux only)
 if [ "$(uname)" = "Linux" ]; then
