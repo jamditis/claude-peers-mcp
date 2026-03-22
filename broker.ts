@@ -203,6 +203,18 @@ if (import.meta.main) {
       console.error(`[claude-peers broker] Warning: gossip protocol_version ${body.protocol_version}, expected ${PROTOCOL_VERSION}`);
     }
     mergeGossipPeers(db, body.peers, body.machine, body.tailscale_ip);
+    // Remove remote peers from this machine that are no longer in the payload
+    // (handles graceful shutdown sending empty list, and mid-session deregistrations)
+    if (body.peers.length === 0) {
+      db.run("DELETE FROM remote_peers WHERE machine = ?", [body.machine]);
+    } else {
+      const incomingIds = body.peers.map(p => p.id);
+      const placeholders = incomingIds.map(() => "?").join(", ");
+      db.run(
+        `DELETE FROM remote_peers WHERE machine = ? AND id NOT IN (${placeholders})`,
+        [body.machine, ...incomingIds]
+      );
+    }
     return { ok: true };
   }
 
