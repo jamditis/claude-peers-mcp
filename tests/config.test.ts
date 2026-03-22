@@ -2,9 +2,9 @@ import { describe, it, expect } from "bun:test";
 import { loadConfig, type PeersConfig } from "../shared/config.ts";
 
 describe("loadConfig", () => {
-  it("loads config from a file path", () => {
+  it("loads config from a file path", async () => {
     const tmpPath = "/tmp/test-claude-peers.json";
-    Bun.write(tmpPath, JSON.stringify({
+    await Bun.write(tmpPath, JSON.stringify({
       machine: "testmachine",
       tailscale_ip: "100.0.0.1",
       port: 7899,
@@ -26,9 +26,9 @@ describe("loadConfig", () => {
     expect(() => loadConfig("/tmp/nonexistent-peers.json")).toThrow();
   });
 
-  it("throws if required fields are missing", () => {
+  it("throws if required fields are missing", async () => {
     const tmpPath = "/tmp/test-claude-peers-bad.json";
-    Bun.write(tmpPath, JSON.stringify({ machine: "test" }));
+    await Bun.write(tmpPath, JSON.stringify({ machine: "test" }));
     expect(() => loadConfig(tmpPath)).toThrow();
   });
 });

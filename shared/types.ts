@@ -12,7 +12,7 @@ export interface Peer {
   summary: string;
   registered_at: string;
   last_seen: string;
-  is_remote: boolean;
+  is_remote?: boolean;
 }
 
 export interface Message {

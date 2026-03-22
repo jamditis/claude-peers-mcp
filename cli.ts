@@ -15,9 +15,6 @@
 import { loadConfig } from "./shared/config.ts";
 import type { PeersConfig } from "./shared/config.ts";
 
-const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
-
 // Load config once; CLI may run without it for basic commands
 let config: PeersConfig | null = null;
 try {
@@ -25,6 +22,9 @@ try {
 } catch {
   // Config is optional — commands that need it will handle the null case
 }
+
+const BROKER_PORT = config?.port ?? parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
+const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 
 async function brokerFetch<T>(path: string, body?: unknown): Promise<T> {
   const opts: RequestInit = body
