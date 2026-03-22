@@ -1,0 +1,44 @@
+import { readFileSync } from "fs";
+
+export interface SiblingConfig {
+  machine: string;
+  url: string;
+}
+
+export interface PeersConfig {
+  machine: string;
+  tailscale_ip: string;
+  port: number;
+  id_prefix: string;
+  siblings: SiblingConfig[];
+  allowed_ips: string[];
+  db_path: string;
+}
+
+const REQUIRED_FIELDS = ["machine", "tailscale_ip", "port", "id_prefix", "siblings", "allowed_ips"] as const;
+
+const DEFAULT_CONFIG_PATH = `${process.env.HOME}/.claude-peers.json`;
+const DEFAULT_DB_PATH = `${process.env.HOME}/.claude-peers.db`;
+
+export function loadConfig(path?: string): PeersConfig {
+  const configPath = path ?? process.env.CLAUDE_PEERS_CONFIG ?? DEFAULT_CONFIG_PATH;
+  let raw: string;
+  try {
+    raw = readFileSync(configPath, "utf-8");
+  } catch {
+    throw new Error(`Config file not found: ${configPath}`);
+  }
+
+  const parsed = JSON.parse(raw);
+
+  for (const field of REQUIRED_FIELDS) {
+    if (!(field in parsed)) {
+      throw new Error(`Missing required config field: ${field}`);
+    }
+  }
+
+  // db_path from: env var > config file > default
+  const db_path = process.env.CLAUDE_PEERS_DB ?? parsed.db_path ?? DEFAULT_DB_PATH;
+
+  return { ...parsed, db_path } as PeersConfig;
+}
