@@ -31,16 +31,24 @@ export function loadConfig(path?: string): PeersConfig {
     throw new Error(`Config file not found: ${configPath}`);
   }
 
-  const parsed = JSON.parse(raw);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`Failed to parse config JSON at ${configPath}: ${message}`);
+  }
+
+  const obj = parsed as Record<string, unknown>;
 
   for (const field of REQUIRED_FIELDS) {
-    if (!(field in parsed)) {
+    if (!(field in obj)) {
       throw new Error(`Missing required config field: ${field}`);
     }
   }
 
   // db_path from: env var > config file > default
-  const db_path = process.env.CLAUDE_PEERS_DB ?? parsed.db_path ?? DEFAULT_DB_PATH;
+  const db_path = process.env.CLAUDE_PEERS_DB ?? (obj.db_path as string | undefined) ?? DEFAULT_DB_PATH;
 
-  return { ...parsed, db_path } as PeersConfig;
+  return { ...obj, db_path } as PeersConfig;
 }

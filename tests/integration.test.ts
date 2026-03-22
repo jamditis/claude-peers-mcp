@@ -74,8 +74,9 @@ describe("two-broker federation", () => {
           break;
         }
       } catch {
-        await new Promise(r => setTimeout(r, 300));
+        // ignore, retry
       }
+      await new Promise(r => setTimeout(r, 300));
     }
     if (!brokersReady) {
       throw new Error("Brokers failed to become ready within allotted time");
@@ -118,20 +119,32 @@ describe("two-broker federation", () => {
     expect(result.id).toMatch(/^brb-/);
   });
 
-  it("gossip syncs peers between brokers (wait for gossip cycle)", async () => {
-    // Wait for at least one gossip cycle (5s + buffer)
-    await new Promise(r => setTimeout(r, 7000));
+  it("gossip syncs peers between brokers", async () => {
+    const maxWaitMs = 15_000;
+    const pollIntervalMs = 300;
+    const start = Date.now();
 
-    const peersOnA = await brokerFetch(BROKER_A_PORT, "/list-peers", {
-      scope: "machine",
-      cwd: "/",
-      git_root: null,
-    }) as any[];
+    while (true) {
+      const peersOnA = await brokerFetch(BROKER_A_PORT, "/list-peers", {
+        scope: "machine",
+        cwd: "/",
+        git_root: null,
+      }) as any[];
 
-    // Broker A should see broker B's peer as remote
-    const remotePeer = peersOnA.find((p: any) => p.machine === "broker-b");
-    expect(remotePeer).toBeDefined();
-    expect(remotePeer.is_remote).toBeTruthy();
+      const remotePeer = peersOnA.find((p: any) => p.machine === "broker-b");
+      if (remotePeer) {
+        expect(remotePeer.is_remote).toBeTruthy();
+        return;
+      }
+
+      if (Date.now() - start > maxWaitMs) {
+        throw new Error(
+          `Timed out waiting for gossip sync. Peers on A: ${JSON.stringify(peersOnA)}`
+        );
+      }
+
+      await new Promise(r => setTimeout(r, pollIntervalMs));
+    }
   });
 
   it("sends a cross-broker message", async () => {
@@ -153,6 +166,18 @@ describe("two-broker federation", () => {
     expect(pollResult.messages).toHaveLength(1);
     expect(pollResult.messages[0].text).toBe("hello from broker A");
     expect(pollResult.messages[0].from_id).toBe(localA.id);
+  });
+
+  it("reports error when forwarding to unknown remote peer", async () => {
+    const peersOnA = await brokerFetch(BROKER_A_PORT, "/list-peers", { scope: "machine", cwd: "/", git_root: null }) as any[];
+    const localA = peersOnA.find((p: any) => !p.is_remote);
+
+    const sendResult = await brokerFetch(BROKER_A_PORT, "/send-message", {
+      from_id: localA.id,
+      to_id: "brb-nonexist",
+      text: "this should fail",
+    }) as any;
+    expect(sendResult.ok).toBe(false);
   });
 
   it("graceful shutdown clears remote peers on sibling", async () => {
