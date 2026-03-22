@@ -29,7 +29,7 @@ import type {
 import {
   getGitBranch,
   getRecentFiles,
-} from "./shared/summarize.ts";
+} from "./shared/summarize.ts"; // used when populating peer context for federation (Task 6)
 
 // --- Configuration ---
 
