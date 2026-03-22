@@ -32,7 +32,15 @@ async function brokerFetch(port: number, path: string, body: unknown) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  return res.json();
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`brokerFetch ${path} failed: ${res.status} ${res.statusText} - ${text}`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    throw new Error(`brokerFetch non-JSON response from ${path}: ${text}`);
+  }
 }
 
 describe("two-broker federation", () => {
@@ -56,14 +64,21 @@ describe("two-broker federation", () => {
     });
 
     // Wait for both brokers to be ready
+    let brokersReady = false;
     for (let i = 0; i < 20; i++) {
       try {
-        await fetch(`http://127.0.0.1:${BROKER_A_PORT}/health`);
-        await fetch(`http://127.0.0.1:${BROKER_B_PORT}/health`);
-        break;
+        const resA = await fetch(`http://127.0.0.1:${BROKER_A_PORT}/health`);
+        const resB = await fetch(`http://127.0.0.1:${BROKER_B_PORT}/health`);
+        if (resA.ok && resB.ok) {
+          brokersReady = true;
+          break;
+        }
       } catch {
         await new Promise(r => setTimeout(r, 300));
       }
+    }
+    if (!brokersReady) {
+      throw new Error("Brokers failed to become ready within allotted time");
     }
   });
 

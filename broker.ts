@@ -116,12 +116,15 @@ if (import.meta.main) {
     "SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC"
   );
   const markDelivered = db.prepare("UPDATE messages SET delivered = 1 WHERE id = ?");
+  const deleteUndeliveredForPeer = db.prepare(
+    "DELETE FROM messages WHERE to_id = ? AND delivered = 0"
+  );
 
   // --- Clean stale peers ---
   function cleanStalePeers() {
     const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
     for (const peer of peers) {
-      try { process.kill(peer.pid, 0); } catch { deletePeer.run(peer.id); }
+      try { process.kill(peer.pid, 0); } catch { deleteUndeliveredForPeer.run(peer.id); deletePeer.run(peer.id); }
     }
     pruneRemotePeers(db, REMOTE_TTL_MS);
   }
@@ -132,7 +135,7 @@ if (import.meta.main) {
     const id = generatePeerId(config.id_prefix);
     const now = new Date().toISOString();
     const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
-    if (existing) deletePeer.run(existing.id);
+    if (existing) { deleteUndeliveredForPeer.run(existing.id); deletePeer.run(existing.id); }
     insertPeer.run(id, body.pid, body.machine, body.tailscale_ip,
       body.cwd, body.git_root, body.tty, body.summary, now, now);
     return { id };
@@ -154,7 +157,7 @@ if (import.meta.main) {
     }
     localPeers = localPeers
       .filter(p => {
-        try { process.kill(p.pid, 0); return true; } catch { deletePeer.run(p.id); return false; }
+        try { process.kill(p.pid, 0); return true; } catch { deleteUndeliveredForPeer.run(p.id); deletePeer.run(p.id); return false; }
       })
       .map(p => ({ ...p, is_remote: false }));
 
@@ -193,6 +196,11 @@ if (import.meta.main) {
   function handleForwardMessage(body: ForwardMessageRequest): { ok: boolean } {
     if (body.protocol_version !== PROTOCOL_VERSION) {
       console.error(`[claude-peers broker] Warning: received protocol_version ${body.protocol_version}, expected ${PROTOCOL_VERSION}`);
+    }
+    const localTarget = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id);
+    if (!localTarget) {
+      console.error(`[claude-peers broker] Dropping forwarded message: unknown local peer ${body.to_id}`);
+      return { ok: false };
     }
     insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
     return { ok: true };
@@ -246,7 +254,16 @@ if (import.meta.main) {
     }
   }
 
-  const gossipTimer = setInterval(gossipToSiblings, GOSSIP_INTERVAL_MS);
+  let gossipInFlight = false;
+  const gossipTimer = setInterval(async () => {
+    if (gossipInFlight) return;
+    gossipInFlight = true;
+    try {
+      await gossipToSiblings();
+    } finally {
+      gossipInFlight = false;
+    }
+  }, GOSSIP_INTERVAL_MS);
   const cleanupTimer = setInterval(cleanStalePeers, CLEANUP_INTERVAL_MS);
 
   // --- Graceful shutdown ---
@@ -299,6 +316,7 @@ if (import.meta.main) {
           case "/send-message": return Response.json(await handleSendMessage(body));
           case "/poll-messages": return Response.json(handlePollMessages(body));
           case "/unregister":
+            deleteUndeliveredForPeer.run(body.id);
             deletePeer.run(body.id);
             return Response.json({ ok: true });
           case "/gossip": return Response.json(handleGossip(body));

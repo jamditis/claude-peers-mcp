@@ -1,4 +1,5 @@
 import { readFileSync } from "fs";
+import { homedir } from "os";
 
 export interface SiblingConfig {
   machine: string;
@@ -17,8 +18,9 @@ export interface PeersConfig {
 
 const REQUIRED_FIELDS = ["machine", "tailscale_ip", "port", "id_prefix", "siblings", "allowed_ips"] as const;
 
-const DEFAULT_CONFIG_PATH = `${process.env.HOME}/.claude-peers.json`;
-const DEFAULT_DB_PATH = `${process.env.HOME}/.claude-peers.db`;
+const HOME = homedir();
+const DEFAULT_CONFIG_PATH = `${HOME}/.claude-peers.json`;
+const DEFAULT_DB_PATH = `${HOME}/.claude-peers.db`;
 
 export function loadConfig(path?: string): PeersConfig {
   const configPath = path ?? process.env.CLAUDE_PEERS_CONFIG ?? DEFAULT_CONFIG_PATH;
