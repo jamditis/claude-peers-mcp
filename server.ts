@@ -498,8 +498,17 @@ async function main() {
   await mcp.connect(new StdioServerTransport());
   log("MCP connected");
 
-  // 6. Start polling for inbound messages
-  const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
+  // 6. Start polling for inbound messages (only if channel push is explicitly enabled)
+  // mcp.notification() silently no-ops when the channel capability isn't loaded,
+  // so the poll loop acks messages that were never delivered. Only enable if the
+  // user explicitly opts in via CLAUDE_PEERS_CHANNEL=1 env var.
+  const channelEnabled = process.env.CLAUDE_PEERS_CHANNEL === "1";
+  const pollTimer = channelEnabled
+    ? setInterval(pollAndPushMessages, POLL_INTERVAL_MS)
+    : null;
+  if (!channelEnabled) {
+    log("Poll loop disabled — messages delivered via check_messages only. Set CLAUDE_PEERS_CHANNEL=1 to enable channel push.");
+  }
 
   // 7. Start heartbeat
   const heartbeatTimer = setInterval(async () => {
@@ -514,7 +523,7 @@ async function main() {
 
   // 8. Clean up on exit
   const cleanup = async () => {
-    clearInterval(pollTimer);
+    if (pollTimer) clearInterval(pollTimer);
     clearInterval(heartbeatTimer);
     if (myId) {
       try {
