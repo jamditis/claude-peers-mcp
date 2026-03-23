@@ -238,6 +238,18 @@ if (import.meta.main) {
     return { messages };
   }
 
+  // Peek: return undelivered messages WITHOUT marking them delivered
+  function handlePeekMessages(body: PollMessagesRequest): PollMessagesResponse {
+    const messages = selectUndelivered.all(body.id) as Message[];
+    return { messages };
+  }
+
+  // Ack: mark specific message IDs as delivered
+  function handleAckMessages(body: { ids: number[] }): { ok: boolean } {
+    for (const id of body.ids) markDelivered.run(id);
+    return { ok: true };
+  }
+
   // --- Gossip loop ---
   async function gossipToSiblings(peerList?: Peer[]) {
     const peers = peerList ?? (selectAllPeers.all() as Peer[]).filter(p => {
@@ -321,6 +333,8 @@ if (import.meta.main) {
           case "/list-peers": return Response.json(handleListPeers(body));
           case "/send-message": return Response.json(await handleSendMessage(body));
           case "/poll-messages": return Response.json(handlePollMessages(body));
+          case "/peek-messages": return Response.json(handlePeekMessages(body));
+          case "/ack-messages": return Response.json(handleAckMessages(body));
           case "/unregister":
             deleteUndeliveredForPeer.run(body.id);
             deletePeer.run(body.id);
