@@ -1,0 +1,11 @@
+{
+  "machine": "officejawn",
+  "tailscale_ip": "100.84.214.24",
+  "port": 7899,
+  "id_prefix": "ofj",
+  "siblings": [
+    { "machine": "houseofjawn", "url": "http://100.122.208.15:7899" },
+    { "machine": "legion2025", "url": "http://100.108.24.67:7899" }
+  ],
+  "allowed_ips": ["127.0.0.1", "100.122.208.15", "100.84.214.24", "100.108.24.67"]
+}

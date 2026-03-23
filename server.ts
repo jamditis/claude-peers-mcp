@@ -27,14 +27,16 @@ import type {
   Message,
 } from "./shared/types.ts";
 import {
-  generateSummary,
   getGitBranch,
   getRecentFiles,
-} from "./shared/summarize.ts";
+} from "./shared/summarize.ts"; // used when populating peer context for federation (Task 6)
+import { loadConfig } from "./shared/config.ts";
+
+const config = loadConfig();
 
 // --- Configuration ---
 
-const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
+const BROKER_PORT = config.port;
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
@@ -148,7 +150,7 @@ const mcp = new Server(
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    instructions: `You are connected to the claude-peers network. Other Claude Code instances on this machine can see you and send you messages.
+    instructions: `You are connected to the claude-peers network. Other Claude Code instances on this machine and across the network can see you and send you messages. Peers on other machines are marked with their hostname. Messages to remote peers are routed automatically.
 
 IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
 
@@ -170,7 +172,7 @@ const TOOLS = [
   {
     name: "list_peers",
     description:
-      "List other Claude Code instances running on this machine. Returns their ID, working directory, git repo, and summary.",
+      "List other Claude Code instances on this machine and across the network. Returns their ID, machine, working directory, git repo, and summary. Remote peers are marked.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -178,7 +180,7 @@ const TOOLS = [
           type: "string" as const,
           enum: ["machine", "directory", "repo"],
           description:
-            'Scope of peer discovery. "machine" = all instances on this computer. "directory" = same working directory. "repo" = same git repository (including worktrees or subdirectories).',
+            'Scope of peer discovery. "machine" = all instances on this computer and across the network. "directory" = same working directory. "repo" = same git repository (including worktrees or subdirectories).',
         },
       },
       required: ["scope"],
@@ -263,9 +265,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const lines = peers.map((p) => {
           const parts = [
             `ID: ${p.id}`,
-            `PID: ${p.pid}`,
-            `CWD: ${p.cwd}`,
           ];
+          if (p.machine) parts.push(`Machine: ${p.machine} (${p.tailscale_ip})`);
+          if (p.is_remote) parts.push(`[REMOTE]`);
+          parts.push(`CWD: ${p.cwd}`);
           if (p.git_root) parts.push(`Repo: ${p.git_root}`);
           if (p.tty) parts.push(`TTY: ${p.tty}`);
           if (p.summary) parts.push(`Summary: ${p.summary}`);
@@ -463,54 +466,18 @@ async function main() {
   log(`Git root: ${myGitRoot ?? "(none)"}`);
   log(`TTY: ${tty ?? "(unknown)"}`);
 
-  // 3. Generate initial summary via gpt-5.4-nano (non-blocking, best-effort)
-  let initialSummary = "";
-  const summaryPromise = (async () => {
-    try {
-      const branch = await getGitBranch(myCwd);
-      const recentFiles = await getRecentFiles(myCwd);
-      const summary = await generateSummary({
-        cwd: myCwd,
-        git_root: myGitRoot,
-        git_branch: branch,
-        recent_files: recentFiles,
-      });
-      if (summary) {
-        initialSummary = summary;
-        log(`Auto-summary: ${summary}`);
-      }
-    } catch (e) {
-      log(`Auto-summary failed (non-critical): ${e instanceof Error ? e.message : String(e)}`);
-    }
-  })();
-
-  // Wait briefly for summary, but don't block startup
-  await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
-
-  // 4. Register with broker
+  // 3. Register with broker
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
-    summary: initialSummary,
+    summary: "",
+    machine: config.machine,
+    tailscale_ip: config.tailscale_ip,
   });
   myId = reg.id;
   log(`Registered as peer ${myId}`);
-
-  // If summary generation is still running, update it when done
-  if (!initialSummary) {
-    summaryPromise.then(async () => {
-      if (initialSummary && myId) {
-        try {
-          await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
-          log(`Late auto-summary applied: ${initialSummary}`);
-        } catch {
-          // Non-critical
-        }
-      }
-    });
-  }
 
   // 5. Connect MCP over stdio
   await mcp.connect(new StdioServerTransport());

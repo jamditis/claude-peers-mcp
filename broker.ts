@@ -1,273 +1,339 @@
 #!/usr/bin/env bun
 /**
- * claude-peers broker daemon
+ * claude-peers broker daemon (federated)
  *
- * A singleton HTTP server on localhost:7899 backed by SQLite.
- * Tracks all registered Claude Code peers and routes messages between them.
- *
- * Auto-launched by the MCP server if not already running.
- * Run directly: bun broker.ts
+ * A singleton HTTP server backed by SQLite.
+ * Tracks local peers, syncs with sibling brokers via gossip,
+ * and routes messages between local and remote peers.
  */
 
 import { Database } from "bun:sqlite";
+import { loadConfig, type SiblingConfig } from "./shared/config.ts";
 import type {
-  RegisterRequest,
-  RegisterResponse,
-  HeartbeatRequest,
-  SetSummaryRequest,
-  ListPeersRequest,
-  SendMessageRequest,
-  PollMessagesRequest,
-  PollMessagesResponse,
-  Peer,
-  Message,
+  RegisterRequest, RegisterResponse, HeartbeatRequest,
+  SetSummaryRequest, ListPeersRequest, SendMessageRequest,
+  PollMessagesRequest, PollMessagesResponse, Peer, Message,
+  GossipRequest, ForwardMessageRequest,
 } from "./shared/types.ts";
 
-const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
+const PROTOCOL_VERSION = 1;
+const GOSSIP_INTERVAL_MS = 5_000;
+const CLEANUP_INTERVAL_MS = 15_000;
+const REMOTE_TTL_MS = 30_000;
 
-// --- Database setup ---
+// --- Exported testable functions (no side effects) ---
 
-const db = new Database(DB_PATH);
-db.run("PRAGMA journal_mode = WAL");
-db.run("PRAGMA busy_timeout = 3000");
-
-db.run(`
-  CREATE TABLE IF NOT EXISTS peers (
-    id TEXT PRIMARY KEY,
-    pid INTEGER NOT NULL,
-    cwd TEXT NOT NULL,
-    git_root TEXT,
-    tty TEXT,
-    summary TEXT NOT NULL DEFAULT '',
-    registered_at TEXT NOT NULL,
-    last_seen TEXT NOT NULL
-  )
-`);
-
-db.run(`
-  CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    from_id TEXT NOT NULL,
-    to_id TEXT NOT NULL,
-    text TEXT NOT NULL,
-    sent_at TEXT NOT NULL,
-    delivered INTEGER NOT NULL DEFAULT 0,
-    FOREIGN KEY (from_id) REFERENCES peers(id),
-    FOREIGN KEY (to_id) REFERENCES peers(id)
-  )
-`);
-
-// Clean up stale peers (PIDs that no longer exist) on startup
-function cleanStalePeers() {
-  const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
-  for (const peer of peers) {
-    try {
-      // Check if process is still alive (signal 0 doesn't kill, just checks)
-      process.kill(peer.pid, 0);
-    } catch {
-      // Process doesn't exist, remove it
-      db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
-      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
-    }
-  }
-}
-
-cleanStalePeers();
-
-// Periodically clean stale peers (every 30s)
-setInterval(cleanStalePeers, 30_000);
-
-// --- Prepared statements ---
-
-const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-`);
-
-const updateLastSeen = db.prepare(`
-  UPDATE peers SET last_seen = ? WHERE id = ?
-`);
-
-const updateSummary = db.prepare(`
-  UPDATE peers SET summary = ? WHERE id = ?
-`);
-
-const deletePeer = db.prepare(`
-  DELETE FROM peers WHERE id = ?
-`);
-
-const selectAllPeers = db.prepare(`
-  SELECT * FROM peers
-`);
-
-const selectPeersByDirectory = db.prepare(`
-  SELECT * FROM peers WHERE cwd = ?
-`);
-
-const selectPeersByGitRoot = db.prepare(`
-  SELECT * FROM peers WHERE git_root = ?
-`);
-
-const insertMessage = db.prepare(`
-  INSERT INTO messages (from_id, to_id, text, sent_at, delivered)
-  VALUES (?, ?, ?, ?, 0)
-`);
-
-const selectUndelivered = db.prepare(`
-  SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC
-`);
-
-const markDelivered = db.prepare(`
-  UPDATE messages SET delivered = 1 WHERE id = ?
-`);
-
-// --- Generate peer ID ---
-
-function generateId(): string {
+export function generatePeerId(prefix: string): string {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-  let id = "";
+  let id = prefix + "-";
   for (let i = 0; i < 8; i++) {
     id += chars[Math.floor(Math.random() * chars.length)];
   }
   return id;
 }
 
-// --- Request handlers ---
+export function isAllowedIp(ip: string, allowList: string[]): boolean {
+  const normalized = ip.startsWith("::ffff:") ? ip.slice(7) : ip;
+  return allowList.includes(normalized);
+}
 
-function handleRegister(body: RegisterRequest): RegisterResponse {
-  const id = generateId();
+export function mergeGossipPeers(
+  db: Database, peers: Peer[], machine: string, tailscaleIp: string
+): void {
+  const upsert = db.prepare(`
+    INSERT OR REPLACE INTO remote_peers
+      (id, machine, tailscale_ip, pid, cwd, git_root, tty, summary, registered_at, last_seen)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
   const now = new Date().toISOString();
-
-  // Remove any existing registration for this PID (re-registration)
-  const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
-  if (existing) {
-    deletePeer.run(existing.id);
+  for (const p of peers) {
+    upsert.run(p.id, machine, tailscaleIp, p.pid, p.cwd,
+      p.git_root, p.tty, p.summary, p.registered_at, now);
   }
-
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
-  return { id };
 }
 
-function handleHeartbeat(body: HeartbeatRequest): void {
-  updateLastSeen.run(new Date().toISOString(), body.id);
+export function pruneRemotePeers(db: Database, ttlMs: number): number {
+  const cutoff = new Date(Date.now() - ttlMs).toISOString();
+  const result = db.run("DELETE FROM remote_peers WHERE last_seen < ?", [cutoff]);
+  return result.changes;
 }
 
-function handleSetSummary(body: SetSummaryRequest): void {
-  updateSummary.run(body.summary, body.id);
+export function resolveTargetBroker(
+  db: Database, toId: string, siblings: SiblingConfig[]
+): string | null {
+  const remote = db.query("SELECT machine FROM remote_peers WHERE id = ?").get(toId) as
+    { machine: string } | null;
+  if (!remote) return null;
+  const sibling = siblings.find(s => s.machine === remote.machine);
+  return sibling?.url ?? null;
 }
 
-function handleListPeers(body: ListPeersRequest): Peer[] {
-  let peers: Peer[];
+// --- Main: only runs when executed directly (not imported by tests) ---
 
-  switch (body.scope) {
-    case "machine":
-      peers = selectAllPeers.all() as Peer[];
-      break;
-    case "directory":
-      peers = selectPeersByDirectory.all(body.cwd) as Peer[];
-      break;
-    case "repo":
-      if (body.git_root) {
-        peers = selectPeersByGitRoot.all(body.git_root) as Peer[];
-      } else {
-        // No git root, fall back to directory
-        peers = selectPeersByDirectory.all(body.cwd) as Peer[];
-      }
-      break;
-    default:
-      peers = selectAllPeers.all() as Peer[];
+if (import.meta.main) {
+  const config = loadConfig();
+  const PORT = config.port;
+  const DB_PATH = config.db_path;
+
+  // --- Database setup ---
+  const db = new Database(DB_PATH);
+  db.run("PRAGMA journal_mode = WAL");
+  db.run("PRAGMA busy_timeout = 3000");
+
+  db.run(`CREATE TABLE IF NOT EXISTS peers (
+    id TEXT PRIMARY KEY, pid INTEGER NOT NULL, machine TEXT NOT NULL,
+    tailscale_ip TEXT NOT NULL, cwd TEXT NOT NULL, git_root TEXT, tty TEXT,
+    summary TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL, last_seen TEXT NOT NULL
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS remote_peers (
+    id TEXT PRIMARY KEY, machine TEXT NOT NULL, tailscale_ip TEXT NOT NULL,
+    pid INTEGER NOT NULL, cwd TEXT NOT NULL, git_root TEXT, tty TEXT,
+    summary TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL, last_seen TEXT NOT NULL
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT NOT NULL, to_id TEXT NOT NULL,
+    text TEXT NOT NULL, sent_at TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0
+  )`);
+
+  // --- Prepared statements ---
+  const insertPeer = db.prepare(`
+    INSERT INTO peers (id, pid, machine, tailscale_ip, cwd, git_root, tty, summary, registered_at, last_seen)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const updateLastSeen = db.prepare("UPDATE peers SET last_seen = ? WHERE id = ?");
+  const updateSummary = db.prepare("UPDATE peers SET summary = ? WHERE id = ?");
+  const deletePeer = db.prepare("DELETE FROM peers WHERE id = ?");
+  const selectAllPeers = db.prepare("SELECT * FROM peers");
+  const selectPeersByDirectory = db.prepare("SELECT * FROM peers WHERE cwd = ?");
+  const selectPeersByGitRoot = db.prepare("SELECT * FROM peers WHERE git_root = ?");
+  const selectAllRemotePeers = db.prepare("SELECT * FROM remote_peers");
+  const insertMessage = db.prepare(
+    "INSERT INTO messages (from_id, to_id, text, sent_at, delivered) VALUES (?, ?, ?, ?, 0)"
+  );
+  const selectUndelivered = db.prepare(
+    "SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC"
+  );
+  const markDelivered = db.prepare("UPDATE messages SET delivered = 1 WHERE id = ?");
+  const deleteUndeliveredForPeer = db.prepare(
+    "DELETE FROM messages WHERE to_id = ? AND delivered = 0"
+  );
+
+  // --- Clean stale peers ---
+  function cleanStalePeers() {
+    const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
+    for (const peer of peers) {
+      try { process.kill(peer.pid, 0); } catch { deleteUndeliveredForPeer.run(peer.id); deletePeer.run(peer.id); }
+    }
+    pruneRemotePeers(db, REMOTE_TTL_MS);
+  }
+  cleanStalePeers();
+
+  // --- Request handlers ---
+  function handleRegister(body: RegisterRequest): RegisterResponse {
+    const id = generatePeerId(config.id_prefix);
+    const now = new Date().toISOString();
+    const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
+    if (existing) { deleteUndeliveredForPeer.run(existing.id); deletePeer.run(existing.id); }
+    insertPeer.run(id, body.pid, config.machine, config.tailscale_ip,
+      body.cwd, body.git_root, body.tty, body.summary, now, now);
+    return { id };
   }
 
-  // Exclude the requesting peer
-  if (body.exclude_id) {
-    peers = peers.filter((p) => p.id !== body.exclude_id);
+  function handleListPeers(body: ListPeersRequest): Peer[] {
+    let localPeers: Peer[];
+    switch (body.scope) {
+      case "directory":
+        localPeers = selectPeersByDirectory.all(body.cwd) as Peer[];
+        break;
+      case "repo":
+        localPeers = body.git_root
+          ? selectPeersByGitRoot.all(body.git_root) as Peer[]
+          : selectPeersByDirectory.all(body.cwd) as Peer[];
+        break;
+      default:
+        localPeers = selectAllPeers.all() as Peer[];
+    }
+    localPeers = localPeers
+      .filter(p => {
+        try { process.kill(p.pid, 0); return true; } catch { deleteUndeliveredForPeer.run(p.id); deletePeer.run(p.id); return false; }
+      })
+      .map(p => ({ ...p, is_remote: false }));
+
+    let allPeers: Peer[];
+    if (body.scope === "machine") {
+      const remotePeers = (selectAllRemotePeers.all() as any[]).map(p => ({ ...p, is_remote: true }));
+      allPeers = [...localPeers, ...remotePeers];
+    } else {
+      allPeers = localPeers;
+    }
+    if (body.exclude_id) allPeers = allPeers.filter(p => p.id !== body.exclude_id);
+    return allPeers;
   }
 
-  // Verify each peer's process is still alive
-  return peers.filter((p) => {
+  async function handleSendMessage(body: SendMessageRequest): Promise<{ ok: boolean; error?: string; routed?: string }> {
+    const localTarget = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id);
+    if (localTarget) {
+      insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
+      return { ok: true, routed: "local" };
+    }
+    const siblingUrl = resolveTargetBroker(db, body.to_id, config.siblings);
+    if (!siblingUrl) return { ok: false, error: `Peer ${body.to_id} not found` };
     try {
-      process.kill(p.pid, 0);
-      return true;
+      const res = await fetch(`${siblingUrl}/forward-message`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          protocol_version: PROTOCOL_VERSION, from_id: body.from_id,
+          to_id: body.to_id, text: body.text, from_machine: config.machine,
+        } satisfies ForwardMessageRequest),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) return { ok: false, error: `Remote broker error: ${res.status}` };
+      const result = await res.json() as { ok: boolean };
+      if (!result.ok) return { ok: false, error: "Remote broker rejected message (target peer not found)" };
+      return { ok: true, routed: "remote" };
     } catch {
-      // Clean up dead peer
-      deletePeer.run(p.id);
-      return false;
+      return { ok: false, error: "Remote broker unreachable" };
     }
-  });
-}
-
-function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
-  // Verify target exists
-  const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null;
-  if (!target) {
-    return { ok: false, error: `Peer ${body.to_id} not found` };
   }
 
-  insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
-  return { ok: true };
-}
-
-function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
-  const messages = selectUndelivered.all(body.id) as Message[];
-
-  // Mark them as delivered
-  for (const msg of messages) {
-    markDelivered.run(msg.id);
+  function handleForwardMessage(body: ForwardMessageRequest): { ok: boolean } {
+    if (body.protocol_version !== PROTOCOL_VERSION) {
+      console.error(`[claude-peers broker] Warning: received protocol_version ${body.protocol_version}, expected ${PROTOCOL_VERSION}`);
+    }
+    const localTarget = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id);
+    if (!localTarget) {
+      console.error(`[claude-peers broker] Dropping forwarded message: unknown local peer ${body.to_id}`);
+      return { ok: false };
+    }
+    insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
+    return { ok: true };
   }
 
-  return { messages };
-}
+  function handleGossip(body: GossipRequest): { ok: boolean } {
+    if (body.protocol_version !== PROTOCOL_VERSION) {
+      console.error(`[claude-peers broker] Warning: gossip protocol_version ${body.protocol_version}, expected ${PROTOCOL_VERSION}`);
+    }
+    mergeGossipPeers(db, body.peers, body.machine, body.tailscale_ip);
+    // Remove remote peers from this machine that are no longer in the payload
+    // (handles graceful shutdown sending empty list, and mid-session deregistrations)
+    if (body.peers.length === 0) {
+      db.run("DELETE FROM remote_peers WHERE machine = ?", [body.machine]);
+    } else {
+      const incomingIds = body.peers.map(p => p.id);
+      const placeholders = incomingIds.map(() => "?").join(", ");
+      db.run(
+        `DELETE FROM remote_peers WHERE machine = ? AND id NOT IN (${placeholders})`,
+        [body.machine, ...incomingIds]
+      );
+    }
+    return { ok: true };
+  }
 
-function handleUnregister(body: { id: string }): void {
-  deletePeer.run(body.id);
-}
+  function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
+    const messages = selectUndelivered.all(body.id) as Message[];
+    for (const msg of messages) markDelivered.run(msg.id);
+    return { messages };
+  }
 
-// --- HTTP Server ---
-
-Bun.serve({
-  port: PORT,
-  hostname: "127.0.0.1",
-  async fetch(req) {
-    const url = new URL(req.url);
-    const path = url.pathname;
-
-    if (req.method !== "POST") {
-      if (path === "/health") {
-        return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length });
+  // --- Gossip loop ---
+  async function gossipToSiblings(peerList?: Peer[]) {
+    const peers = peerList ?? (selectAllPeers.all() as Peer[]).filter(p => {
+      try { process.kill(p.pid, 0); return true; } catch { return false; }
+    });
+    for (const sibling of config.siblings) {
+      try {
+        await fetch(`${sibling.url}/gossip`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            protocol_version: PROTOCOL_VERSION, machine: config.machine,
+            tailscale_ip: config.tailscale_ip, peers,
+          } satisfies GossipRequest),
+          signal: AbortSignal.timeout(3000),
+        });
+      } catch (e) {
+        console.error(`[claude-peers broker] Gossip to ${sibling.machine} failed: ${e instanceof Error ? e.message : String(e)}`);
       }
-      return new Response("claude-peers broker", { status: 200 });
     }
+  }
 
+  let gossipInFlight = false;
+  const gossipTimer = setInterval(async () => {
+    if (gossipInFlight) return;
+    gossipInFlight = true;
     try {
-      const body = await req.json();
-
-      switch (path) {
-        case "/register":
-          return Response.json(handleRegister(body as RegisterRequest));
-        case "/heartbeat":
-          handleHeartbeat(body as HeartbeatRequest);
-          return Response.json({ ok: true });
-        case "/set-summary":
-          handleSetSummary(body as SetSummaryRequest);
-          return Response.json({ ok: true });
-        case "/list-peers":
-          return Response.json(handleListPeers(body as ListPeersRequest));
-        case "/send-message":
-          return Response.json(handleSendMessage(body as SendMessageRequest));
-        case "/poll-messages":
-          return Response.json(handlePollMessages(body as PollMessagesRequest));
-        case "/unregister":
-          handleUnregister(body as { id: string });
-          return Response.json({ ok: true });
-        default:
-          return Response.json({ error: "not found" }, { status: 404 });
-      }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      return Response.json({ error: msg }, { status: 500 });
+      await gossipToSiblings();
+    } finally {
+      gossipInFlight = false;
     }
-  },
-});
+  }, GOSSIP_INTERVAL_MS);
+  const cleanupTimer = setInterval(cleanStalePeers, CLEANUP_INTERVAL_MS);
 
-console.error(`[claude-peers broker] listening on 127.0.0.1:${PORT} (db: ${DB_PATH})`);
+  // --- Graceful shutdown ---
+  async function shutdown() {
+    clearInterval(gossipTimer);
+    clearInterval(cleanupTimer);
+    await gossipToSiblings([]);
+    db.close();
+    process.exit(0);
+  }
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+
+  // --- HTTP Server ---
+  Bun.serve({
+    port: PORT,
+    hostname: "0.0.0.0",
+    async fetch(req, server) {
+      const socketInfo = server.requestIP(req);
+      const clientIp = socketInfo?.address ?? "unknown";
+      if (!isAllowedIp(clientIp, config.allowed_ips)) {
+        console.error(`[claude-peers broker] Rejected connection from ${clientIp}`);
+        return Response.json({ error: "forbidden" }, { status: 403 });
+      }
+
+      const url = new URL(req.url);
+      const path = url.pathname;
+
+      if (req.method !== "POST") {
+        if (path === "/health") {
+          return Response.json({
+            status: "ok", peers: (selectAllPeers.all() as any[]).length,
+            machine: config.machine, remote_peer_count: (selectAllRemotePeers.all() as any[]).length,
+          });
+        }
+        return new Response("claude-peers broker (federated)", { status: 200 });
+      }
+
+      try {
+        const body = await req.json();
+        switch (path) {
+          case "/register": return Response.json(handleRegister(body));
+          case "/heartbeat":
+            updateLastSeen.run(new Date().toISOString(), body.id);
+            return Response.json({ ok: true });
+          case "/set-summary":
+            updateSummary.run(body.summary, body.id);
+            return Response.json({ ok: true });
+          case "/list-peers": return Response.json(handleListPeers(body));
+          case "/send-message": return Response.json(await handleSendMessage(body));
+          case "/poll-messages": return Response.json(handlePollMessages(body));
+          case "/unregister":
+            deleteUndeliveredForPeer.run(body.id);
+            deletePeer.run(body.id);
+            return Response.json({ ok: true });
+          case "/gossip": return Response.json(handleGossip(body));
+          case "/forward-message": return Response.json(handleForwardMessage(body));
+          default: return Response.json({ error: "not found" }, { status: 404 });
+        }
+      } catch (e) {
+        return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status: 500 });
+      }
+    },
+  });
+
+  console.error(`[claude-peers broker] listening on 0.0.0.0:${PORT} (machine: ${config.machine}, db: ${DB_PATH})`);
+}

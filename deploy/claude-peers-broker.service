@@ -1,0 +1,15 @@
+[Unit]
+Description=Claude Peers Broker
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jamditis
+ExecStart=/home/jamditis/.bun/bin/bun /home/jamditis/projects/claude-peers-mcp/broker.ts
+Restart=always
+RestartSec=5
+Environment=HOME=/home/jamditis
+
+[Install]
+WantedBy=multi-user.target
