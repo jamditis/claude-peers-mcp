@@ -408,7 +408,11 @@ async function pollAndPushMessages() {
   if (!myId) return;
 
   try {
-    const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+    // Peek at messages without marking them delivered
+    const result = await brokerFetch<PollMessagesResponse>("/peek-messages", { id: myId });
+    if (result.messages.length === 0) return;
+
+    const ackedIds: number[] = [];
 
     for (const msg of result.messages) {
       // Look up the sender's info for context
@@ -429,21 +433,32 @@ async function pollAndPushMessages() {
         // Non-critical, proceed without sender info
       }
 
-      // Push as channel notification — this is what makes it immediate
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: msg.text,
-          meta: {
-            from_id: msg.from_id,
-            from_summary: fromSummary,
-            from_cwd: fromCwd,
-            sent_at: msg.sent_at,
+      // Try to push as channel notification
+      try {
+        await mcp.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: msg.text,
+            meta: {
+              from_id: msg.from_id,
+              from_summary: fromSummary,
+              from_cwd: fromCwd,
+              sent_at: msg.sent_at,
+            },
           },
-        },
-      });
+        });
+        // Channel push succeeded — mark this message for ack
+        ackedIds.push(msg.id);
+        log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+      } catch {
+        // Channel push failed (no channel flag) — leave message for check_messages
+        log(`Channel push failed for message ${msg.id}, leaving for manual check`);
+      }
+    }
 
-      log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+    // Only ack messages that were successfully pushed via channel
+    if (ackedIds.length > 0) {
+      await brokerFetch("/ack-messages", { ids: ackedIds });
     }
   } catch (e) {
     // Broker might be down temporarily, don't crash
