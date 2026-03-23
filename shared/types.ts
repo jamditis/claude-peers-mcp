@@ -1,15 +1,18 @@
-// Unique ID for each Claude Code instance (generated on registration)
+// shared/types.ts
 export type PeerId = string;
 
 export interface Peer {
   id: PeerId;
   pid: number;
+  machine: string;
+  tailscale_ip: string;
   cwd: string;
   git_root: string | null;
   tty: string | null;
   summary: string;
-  registered_at: string; // ISO timestamp
-  last_seen: string; // ISO timestamp
+  registered_at: string;
+  last_seen: string;
+  is_remote?: boolean;
 }
 
 export interface Message {
@@ -17,7 +20,7 @@ export interface Message {
   from_id: PeerId;
   to_id: PeerId;
   text: string;
-  sent_at: string; // ISO timestamp
+  sent_at: string;
   delivered: boolean;
 }
 
@@ -29,6 +32,8 @@ export interface RegisterRequest {
   git_root: string | null;
   tty: string | null;
   summary: string;
+  machine: string;
+  tailscale_ip: string;
 }
 
 export interface RegisterResponse {
@@ -46,7 +51,6 @@ export interface SetSummaryRequest {
 
 export interface ListPeersRequest {
   scope: "machine" | "directory" | "repo";
-  // The requesting peer's context (used for filtering)
   cwd: string;
   git_root: string | null;
   exclude_id?: PeerId;
@@ -64,4 +68,21 @@ export interface PollMessagesRequest {
 
 export interface PollMessagesResponse {
   messages: Message[];
+}
+
+// --- Federation types ---
+
+export interface GossipRequest {
+  protocol_version: number;
+  machine: string;
+  tailscale_ip: string;
+  peers: Peer[];
+}
+
+export interface ForwardMessageRequest {
+  protocol_version: number;
+  from_id: PeerId;
+  to_id: PeerId;
+  text: string;
+  from_machine: string;
 }
