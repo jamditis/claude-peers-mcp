@@ -1,7 +1,15 @@
 # install-a4000-broker-task.ps1 — register the broker as a Windows scheduled task
-# that runs at user logon, so it's always up without needing a persistent terminal.
+# that starts at user logon and KEEPS RUNNING after the user logs out.
 #
-# Usage (run as the user who'll use Claude Code, in elevated PowerShell):
+# Uses LogonType S4U (Service-for-User): runs as the current user without
+# storing a password, and continues after logoff. S4U has no network
+# credentials, but the broker doesn't need them — it only listens on a local
+# TCP port and reaches siblings by Tailscale IP.
+#
+# Must be run in an elevated PowerShell window (registering an S4U task
+# requires admin rights).
+#
+# Usage:
 #   .\install-a4000-broker-task.ps1
 #
 # This is OPTIONAL — install-a4000.ps1 leaves the broker as a manual-start
@@ -15,6 +23,11 @@ $BROKER = Join-Path $env:USERPROFILE "claude-peers-mcp\broker.ts"
 if (-not (Test-Path $BUN)) { throw "Bun not found at $BUN — run install-a4000.ps1 first" }
 if (-not (Test-Path $BROKER)) { throw "broker.ts not found at $BROKER — run install-a4000.ps1 first" }
 
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    throw "Must be run in an elevated PowerShell window. Registering an S4U scheduled task requires admin rights."
+}
+
 $action = New-ScheduledTaskAction -Execute $BUN -Argument "`"$BROKER`""
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $settings = New-ScheduledTaskSettingsSet `
@@ -22,7 +35,8 @@ $settings = New-ScheduledTaskSettingsSet `
     -DontStopIfGoingOnBatteries `
     -StartWhenAvailable `
     -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1)
-$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+# S4U keeps the task alive after the user logs out — Interactive would not.
+$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType S4U -RunLevel Limited
 
 Register-ScheduledTask `
     -TaskName "claude-peers-broker" `
