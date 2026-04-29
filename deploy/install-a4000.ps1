@@ -8,13 +8,17 @@
 #   irm https://raw.githubusercontent.com/jamditis/claude-peers-mcp/main/deploy/install-host-d.ps1 | iex
 #
 # What it does (in order):
+#   0. Verifies preconditions: git available, running elevated
 #   1. Installs Bun if missing
 #   2. Clones jamditis/claude-peers-mcp if missing
 #   3. Runs `bun install`
 #   4. Copies deploy/configs/host-d.json to %USERPROFILE%\.claude-peers.json
-#   5. Adds Windows Firewall rule for inbound TCP 7899 (sibling gossip)
+#   5. Adds Windows Firewall rule for inbound TCP 7899, restricted to sibling IPs
 #   6. Registers the MCP server with Claude Code
 #   7. Prints next steps to start the broker (manual for now; Task Scheduler later)
+#
+# Must be run in an elevated PowerShell window (step 5 needs admin rights to
+# create the firewall rule).
 
 $ErrorActionPreference = "Stop"
 
@@ -25,6 +29,17 @@ $BUN_BIN = Join-Path $env:USERPROFILE ".bun\bin\bun.exe"
 
 Write-Host "===== claude-peers host-d install =====" -ForegroundColor Cyan
 Write-Host ""
+
+# 0. Preconditions: git installed, elevated shell
+Write-Host "[0/7] Checking preconditions..." -ForegroundColor Yellow
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    throw "git not found in PATH. Install it first (e.g. ``winget install --id Git.Git -e``) and re-run this script."
+}
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    throw "Must be run in an elevated PowerShell window (right-click PowerShell -> Run as administrator). Step 5 (firewall rule) requires admin rights."
+}
+Write-Host "      git available, running elevated" -ForegroundColor Green
 
 # 1. Install Bun if missing
 if (-not (Test-Path $BUN_BIN)) {
@@ -75,12 +90,21 @@ $existing = Get-NetFirewallRule -DisplayName "claude-peers-broker" -ErrorAction 
 if ($existing) {
     Write-Host "      Rule already exists — skipping" -ForegroundColor Green
 } else {
+    # Derive sibling IPs from the same config the broker uses for its allowlist,
+    # so the firewall rule and the broker stay in sync.
+    $cfg = Get-Content $SOURCE_CONFIG -Raw | ConvertFrom-Json
+    $siblingIps = @($cfg.siblings | ForEach-Object { ([Uri]$_.url).Host }) |
+        Where-Object { $_ -and $_ -ne $cfg.tailscale_ip }
+    if ($siblingIps.Count -eq 0) {
+        throw "No sibling IPs parsed from $SOURCE_CONFIG — refusing to open firewall with no remote-address restriction."
+    }
     New-NetFirewallRule `
         -DisplayName "claude-peers-broker" `
-        -Description "Inbound gossip from sibling brokers (claude-peers MCP)" `
+        -Description "Inbound gossip from sibling brokers (claude-peers MCP). Restricted to sibling Tailscale IPs." `
         -Direction Inbound -Protocol TCP -LocalPort 7899 `
+        -RemoteAddress $siblingIps `
         -Action Allow -Profile Any | Out-Null
-    Write-Host "      Rule added" -ForegroundColor Green
+    Write-Host "      Rule added (RemoteAddress = $($siblingIps -join ', '))" -ForegroundColor Green
 }
 
 # 6. Register MCP with Claude Code
@@ -89,9 +113,10 @@ Write-Host "[6/7] Registering MCP server with Claude Code..." -ForegroundColor Y
 $claudeCmd = Get-Command claude -ErrorAction SilentlyContinue
 if (-not $claudeCmd) {
     Write-Host "      WARNING: 'claude' CLI not in PATH. Skip registration; do it manually:" -ForegroundColor Yellow
-    Write-Host "      claude mcp add --scope user --transport stdio claude-peers -- bun `"$SERVER_TS`""
+    Write-Host "      claude mcp add --scope user --transport stdio claude-peers -- `"$BUN_BIN`" `"$SERVER_TS`""
 } else {
-    & claude mcp add --scope user --transport stdio claude-peers -- bun "$SERVER_TS"
+    # Use absolute $BUN_BIN — bun may not be on PATH yet in a fresh shell.
+    & claude mcp add --scope user --transport stdio claude-peers -- "$BUN_BIN" "$SERVER_TS"
     Write-Host "      Registered" -ForegroundColor Green
 }
 
