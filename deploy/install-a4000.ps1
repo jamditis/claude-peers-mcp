@@ -84,28 +84,34 @@ if (Test-Path $CONFIG_TARGET) {
 Copy-Item $SOURCE_CONFIG $CONFIG_TARGET -Force
 Write-Host "[4/7] Config installed to $CONFIG_TARGET" -ForegroundColor Green
 
-# 5. Open Windows Firewall for inbound TCP 7899 from sibling brokers
-Write-Host "[5/7] Adding Windows Firewall rule for inbound TCP 7899..." -ForegroundColor Yellow
+# 5. Reconcile Windows Firewall rule for inbound TCP 7899 from sibling brokers.
+# Always remove + recreate so re-runs apply current sibling list and any
+# stricter settings — skipping when the rule exists would leave stale (or
+# over-broad) rules from older script versions in place.
+Write-Host "[5/7] Reconciling Windows Firewall rule for inbound TCP 7899..." -ForegroundColor Yellow
+
+# Derive sibling IPs from the same config the broker uses for its allowlist,
+# so the firewall rule and the broker stay in sync.
+$cfg = Get-Content $SOURCE_CONFIG -Raw | ConvertFrom-Json
+$siblingIps = @($cfg.siblings | ForEach-Object { ([Uri]$_.url).Host }) |
+    Where-Object { $_ -and $_ -ne $cfg.tailscale_ip }
+if ($siblingIps.Count -eq 0) {
+    throw "No sibling IPs parsed from $SOURCE_CONFIG — refusing to open firewall with no remote-address restriction."
+}
+
 $existing = Get-NetFirewallRule -DisplayName "claude-peers-broker" -ErrorAction SilentlyContinue
 if ($existing) {
-    Write-Host "      Rule already exists — skipping" -ForegroundColor Green
-} else {
-    # Derive sibling IPs from the same config the broker uses for its allowlist,
-    # so the firewall rule and the broker stay in sync.
-    $cfg = Get-Content $SOURCE_CONFIG -Raw | ConvertFrom-Json
-    $siblingIps = @($cfg.siblings | ForEach-Object { ([Uri]$_.url).Host }) |
-        Where-Object { $_ -and $_ -ne $cfg.tailscale_ip }
-    if ($siblingIps.Count -eq 0) {
-        throw "No sibling IPs parsed from $SOURCE_CONFIG — refusing to open firewall with no remote-address restriction."
-    }
-    New-NetFirewallRule `
-        -DisplayName "claude-peers-broker" `
-        -Description "Inbound gossip from sibling brokers (claude-peers MCP). Restricted to sibling Tailscale IPs." `
-        -Direction Inbound -Protocol TCP -LocalPort 7899 `
-        -RemoteAddress $siblingIps `
-        -Action Allow -Profile Any | Out-Null
-    Write-Host "      Rule added (RemoteAddress = $($siblingIps -join ', '))" -ForegroundColor Green
+    Remove-NetFirewallRule -DisplayName "claude-peers-broker"
+    Write-Host "      Removed existing rule(s) for reconciliation" -ForegroundColor Yellow
 }
+
+New-NetFirewallRule `
+    -DisplayName "claude-peers-broker" `
+    -Description "Inbound gossip from sibling brokers (claude-peers MCP). Restricted to sibling Tailscale IPs." `
+    -Direction Inbound -Protocol TCP -LocalPort 7899 `
+    -RemoteAddress $siblingIps `
+    -Action Allow -Profile Any | Out-Null
+Write-Host "      Rule applied (RemoteAddress = $($siblingIps -join ', '))" -ForegroundColor Green
 
 # 6. Register MCP with Claude Code
 $SERVER_TS = Join-Path $REPO_PATH "server.ts"
