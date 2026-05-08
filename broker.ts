@@ -20,6 +20,7 @@ const PROTOCOL_VERSION = 1;
 const GOSSIP_INTERVAL_MS = 5_000;
 const CLEANUP_INTERVAL_MS = 15_000;
 const REMOTE_TTL_MS = 30_000;
+const GOSSIP_SUMMARY_INTERVAL_MS = 5 * 60_000;
 
 // --- Exported testable functions (no side effects) ---
 
@@ -66,6 +67,60 @@ export function resolveTargetBroker(
   if (!remote) return null;
   const sibling = siblings.find(s => s.machine === remote.machine);
   return sibling?.url ?? null;
+}
+
+export interface GossipFailureState {
+  firstFailureAt: number;
+  lastSummaryAt: number;
+  failureCount: number;
+}
+
+export interface GossipLogResult {
+  state: GossipFailureState | null;
+  logLine: string | null;
+}
+
+function formatGossipDuration(ms: number): string {
+  if (ms < 60_000) return `${Math.floor(ms / 1000)}s`;
+  if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m`;
+  return `${(ms / 3_600_000).toFixed(1)}h`;
+}
+
+export function recordGossipResult(
+  prev: GossipFailureState | null,
+  succeeded: boolean,
+  errorMessage: string,
+  machine: string,
+  now: number,
+  summaryIntervalMs: number,
+): GossipLogResult {
+  if (succeeded) {
+    if (prev === null) return { state: null, logLine: null };
+    const duration = formatGossipDuration(now - prev.firstFailureAt);
+    const noun = prev.failureCount === 1 ? "failure" : "failures";
+    return {
+      state: null,
+      logLine: `Gossip to ${machine} recovered after ${prev.failureCount} ${noun} over ${duration}`,
+    };
+  }
+  if (prev === null) {
+    return {
+      state: { firstFailureAt: now, lastSummaryAt: now, failureCount: 1 },
+      logLine: `Gossip to ${machine} failed: ${errorMessage}`,
+    };
+  }
+  const newCount = prev.failureCount + 1;
+  if (now - prev.lastSummaryAt >= summaryIntervalMs) {
+    const duration = formatGossipDuration(now - prev.firstFailureAt);
+    return {
+      state: { ...prev, failureCount: newCount, lastSummaryAt: now },
+      logLine: `Gossip to ${machine} still failing: ${newCount} failures over ${duration} (latest: ${errorMessage})`,
+    };
+  }
+  return {
+    state: { ...prev, failureCount: newCount },
+    logLine: null,
+  };
 }
 
 // --- Main: only runs when executed directly (not imported by tests) ---
@@ -251,11 +306,15 @@ if (import.meta.main) {
   }
 
   // --- Gossip loop ---
+  const gossipFailureStates = new Map<string, GossipFailureState>();
+
   async function gossipToSiblings(peerList?: Peer[]) {
     const peers = peerList ?? (selectAllPeers.all() as Peer[]).filter(p => {
       try { process.kill(p.pid, 0); return true; } catch { return false; }
     });
     for (const sibling of config.siblings) {
+      let succeeded = false;
+      let errorMessage = "";
       try {
         await fetch(`${sibling.url}/gossip`, {
           method: "POST",
@@ -266,9 +325,15 @@ if (import.meta.main) {
           } satisfies GossipRequest),
           signal: AbortSignal.timeout(3000),
         });
+        succeeded = true;
       } catch (e) {
-        console.error(`[claude-peers broker] Gossip to ${sibling.machine} failed: ${e instanceof Error ? e.message : String(e)}`);
+        errorMessage = e instanceof Error ? e.message : String(e);
       }
+      const prev = gossipFailureStates.get(sibling.machine) ?? null;
+      const result = recordGossipResult(prev, succeeded, errorMessage, sibling.machine, Date.now(), GOSSIP_SUMMARY_INTERVAL_MS);
+      if (result.state === null) gossipFailureStates.delete(sibling.machine);
+      else gossipFailureStates.set(sibling.machine, result.state);
+      if (result.logLine !== null) console.error(`[claude-peers broker] ${result.logLine}`);
     }
   }
 
