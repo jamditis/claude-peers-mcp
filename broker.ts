@@ -73,7 +73,6 @@ export interface GossipFailureState {
   firstFailureAt: number;
   lastSummaryAt: number;
   failureCount: number;
-  lastErrorMessage: string;
 }
 
 export interface GossipLogResult {
@@ -82,8 +81,8 @@ export interface GossipLogResult {
 }
 
 function formatGossipDuration(ms: number): string {
-  if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
-  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
+  if (ms < 60_000) return `${Math.floor(ms / 1000)}s`;
+  if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m`;
   return `${(ms / 3_600_000).toFixed(1)}h`;
 }
 
@@ -106,7 +105,7 @@ export function recordGossipResult(
   }
   if (prev === null) {
     return {
-      state: { firstFailureAt: now, lastSummaryAt: now, failureCount: 1, lastErrorMessage: errorMessage },
+      state: { firstFailureAt: now, lastSummaryAt: now, failureCount: 1 },
       logLine: `Gossip to ${machine} failed: ${errorMessage}`,
     };
   }
@@ -114,12 +113,12 @@ export function recordGossipResult(
   if (now - prev.lastSummaryAt >= summaryIntervalMs) {
     const duration = formatGossipDuration(now - prev.firstFailureAt);
     return {
-      state: { ...prev, failureCount: newCount, lastSummaryAt: now, lastErrorMessage: errorMessage },
+      state: { ...prev, failureCount: newCount, lastSummaryAt: now },
       logLine: `Gossip to ${machine} still failing: ${newCount} failures over ${duration} (latest: ${errorMessage})`,
     };
   }
   return {
-    state: { ...prev, failureCount: newCount, lastErrorMessage: errorMessage },
+    state: { ...prev, failureCount: newCount },
     logLine: null,
   };
 }
