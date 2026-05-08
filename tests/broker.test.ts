@@ -7,6 +7,7 @@ import {
   isAllowedIp,
   mergeGossipPeers,
   pruneRemotePeers,
+  recordGossipResult,
   resolveTargetBroker,
 } from "../broker.ts";
 
@@ -130,6 +131,103 @@ describe("pruneRemotePeers", () => {
     const remaining = db.query("SELECT * FROM remote_peers").all() as any[];
     expect(remaining).toHaveLength(1);
     expect(remaining[0].id).toBe("leg-fresh222");
+  });
+});
+
+describe("recordGossipResult", () => {
+  const SUMMARY_INTERVAL_MS = 5 * 60 * 1000;
+  const T0 = 1_000_000_000_000;
+
+  it("healthy stays silent", () => {
+    const result = recordGossipResult(null, true, "", "officejawn", T0, SUMMARY_INTERVAL_MS);
+    expect(result.state).toBeNull();
+    expect(result.logLine).toBeNull();
+  });
+
+  it("first failure logs immediately and initializes state", () => {
+    const result = recordGossipResult(null, false, "The operation timed out.", "legion2025", T0, SUMMARY_INTERVAL_MS);
+    expect(result.state).toEqual({
+      firstFailureAt: T0,
+      lastSummaryAt: T0,
+      failureCount: 1,
+    });
+    expect(result.logLine).toBe("Gossip to legion2025 failed: The operation timed out.");
+  });
+
+  it("continuing failure within summary interval is silent", () => {
+    const prev = { firstFailureAt: T0, lastSummaryAt: T0, failureCount: 1 };
+    const result = recordGossipResult(prev, false, "timeout", "legion2025", T0 + 5_000, SUMMARY_INTERVAL_MS);
+    expect(result.state).toEqual({
+      firstFailureAt: T0,
+      lastSummaryAt: T0,
+      failureCount: 2,
+    });
+    expect(result.logLine).toBeNull();
+  });
+
+  it("continuing failure past summary interval logs a summary and updates lastSummaryAt", () => {
+    const prev = { firstFailureAt: T0, lastSummaryAt: T0, failureCount: 60 };
+    const result = recordGossipResult(prev, false, "timeout", "legion2025", T0 + SUMMARY_INTERVAL_MS, SUMMARY_INTERVAL_MS);
+    expect(result.state?.lastSummaryAt).toBe(T0 + SUMMARY_INTERVAL_MS);
+    expect(result.state?.failureCount).toBe(61);
+    expect(result.logLine).toBe("Gossip to legion2025 still failing: 61 failures over 5m (latest: timeout)");
+  });
+
+  it("recovery logs and clears state", () => {
+    const prev = { firstFailureAt: T0, lastSummaryAt: T0, failureCount: 60 };
+    const result = recordGossipResult(prev, true, "", "legion2025", T0 + 5 * 60_000, SUMMARY_INTERVAL_MS);
+    expect(result.state).toBeNull();
+    expect(result.logLine).toBe("Gossip to legion2025 recovered after 60 failures over 5m");
+  });
+
+  it("recovery after a single failure pluralizes correctly", () => {
+    const prev = { firstFailureAt: T0, lastSummaryAt: T0, failureCount: 1 };
+    const result = recordGossipResult(prev, true, "", "officejawn", T0 + 5_000, SUMMARY_INTERVAL_MS);
+    expect(result.logLine).toBe("Gossip to officejawn recovered after 1 failure over 5s");
+  });
+
+  it("formats sub-minute durations in seconds", () => {
+    const prev = { firstFailureAt: T0, lastSummaryAt: T0, failureCount: 5 };
+    const result = recordGossipResult(prev, true, "", "officejawn", T0 + 30_000, SUMMARY_INTERVAL_MS);
+    expect(result.logLine).toContain("over 30s");
+  });
+
+  it("formats sub-hour durations in minutes", () => {
+    const prev = { firstFailureAt: T0, lastSummaryAt: T0, failureCount: 50 };
+    const result = recordGossipResult(prev, true, "", "officejawn", T0 + 47 * 60_000, SUMMARY_INTERVAL_MS);
+    expect(result.logLine).toContain("over 47m");
+  });
+
+  it("formats multi-hour durations in hours with one decimal", () => {
+    const prev = { firstFailureAt: T0, lastSummaryAt: T0, failureCount: 999 };
+    const result = recordGossipResult(prev, true, "", "officejawn", T0 + 90 * 60_000, SUMMARY_INTERVAL_MS);
+    expect(result.logLine).toContain("over 1.5h");
+  });
+
+  it("formats just-under-a-minute as Xs, never rounding up to 60s", () => {
+    const prev = { firstFailureAt: T0, lastSummaryAt: T0, failureCount: 5 };
+    const result = recordGossipResult(prev, true, "", "officejawn", T0 + 59_999, SUMMARY_INTERVAL_MS);
+    expect(result.logLine).toContain("over 59s");
+    expect(result.logLine).not.toContain("over 60s");
+  });
+
+  it("formats just-under-an-hour as Xm, never rounding up to 60m", () => {
+    const prev = { firstFailureAt: T0, lastSummaryAt: T0, failureCount: 5 };
+    const result = recordGossipResult(prev, true, "", "officejawn", T0 + 3_599_999, SUMMARY_INTERVAL_MS);
+    expect(result.logLine).toContain("over 59m");
+    expect(result.logLine).not.toContain("over 60m");
+  });
+
+  it("formats exactly-one-minute as 1m (boundary into minute branch)", () => {
+    const prev = { firstFailureAt: T0, lastSummaryAt: T0, failureCount: 5 };
+    const result = recordGossipResult(prev, true, "", "officejawn", T0 + 60_000, SUMMARY_INTERVAL_MS);
+    expect(result.logLine).toContain("over 1m");
+  });
+
+  it("formats exactly-one-hour as 1.0h (boundary into hour branch)", () => {
+    const prev = { firstFailureAt: T0, lastSummaryAt: T0, failureCount: 5 };
+    const result = recordGossipResult(prev, true, "", "officejawn", T0 + 3_600_000, SUMMARY_INTERVAL_MS);
+    expect(result.logLine).toContain("over 1.0h");
   });
 });
 
