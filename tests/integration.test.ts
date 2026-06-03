@@ -630,3 +630,83 @@ describe("same-pid re-register during in-flight delivery defers old-peer deletio
     expect(after.some((p) => p.id === reg2.id)).toBe(true);
   }, 15_000);
 });
+
+// Shutdown (retire / idle self-exit) must drain an in-flight cross-machine forward, not
+// only tmux deliveries. handleSendMessage awaits fetch(sibling/forward-message); if the
+// shutdown predicate ignores that send, a concurrent retire (an upgrade handshake or
+// SIGTERM) stops the server and process.exit(0)s mid-forward, so the message can be lost
+// before it reaches the sibling. The broker must stay up draining while the forward runs.
+describe("retire waits for an in-flight remote forward", () => {
+  const PORT = 17912;
+  const STUB_PORT = 17913;
+  let proc: any;
+  let stub: any;
+  let marker: string;
+
+  beforeAll(async () => {
+    marker = join(mkdtempSync(join(tmpdir(), "fwd-inflight-")), "hit");
+    // A sibling stub that parks the /forward-message request forever (the broker's own 5s
+    // AbortSignal bounds it). It touches a marker the instant the forward lands so the test
+    // can confirm the send is in flight before triggering retire — no arbitrary sleep. Other
+    // paths (the broker's periodic gossip) get a fast ok so they do not pile up parked.
+    stub = Bun.serve({
+      port: STUB_PORT,
+      fetch(req) {
+        if (new URL(req.url).pathname === "/forward-message") {
+          writeFileSync(marker, "1");
+          return new Promise<Response>(() => {}); // never resolves
+        }
+        return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
+      },
+    });
+
+    await Bun.write("/tmp/config-fwd.json", JSON.stringify({
+      machine: "fwd-s", tailscale_ip: "127.0.0.1", port: PORT, id_prefix: "fws",
+      siblings: [{ machine: "hang-m", url: `http://127.0.0.1:${STUB_PORT}` }],
+      allowed_ips: ["127.0.0.1"],
+    }));
+    try { unlinkSync("/tmp/broker-fwd.db"); } catch {}
+    proc = Bun.spawn(["bun", "broker.ts"], {
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-fwd.json", CLAUDE_PEERS_DB: "/tmp/broker-fwd.db" },
+      stdout: "ignore", stderr: "inherit",
+    });
+    for (let i = 0; i < 20; i++) { try { if ((await fetch(`http://127.0.0.1:${PORT}/health`)).ok) break; } catch {} await new Promise((r) => setTimeout(r, 300)); }
+  });
+
+  afterAll(() => {
+    proc?.kill();
+    stub?.stop(true);
+    try { unlinkSync("/tmp/broker-fwd.db"); } catch {}
+    try { unlinkSync("/tmp/config-fwd.json"); } catch {}
+  });
+
+  it("stays up draining while a forward to a sibling is in flight", async () => {
+    // Teach the broker about a remote peer on the hanging sibling so a send to it forwards
+    // there instead of resolving locally.
+    await brokerFetch(PORT, "/gossip", {
+      protocol_version: 2, machine: "hang-m", tailscale_ip: "127.0.0.1",
+      peers: [{ id: "hang-peer0", pid: 999999, cwd: "/tmp/h", git_root: null, tty: null,
+        summary: "", registered_at: new Date().toISOString() }],
+    });
+
+    // Fire the send WITHOUT awaiting: it parks inside handleSendMessage on the forward fetch.
+    const sendPromise = brokerFetch(PORT, "/send-message", {
+      from_id: "fws-sender0", to_id: "hang-peer0", text: "in flight",
+    }).catch(() => {});
+
+    // Wait until the stub confirms the forward is in flight, then retire.
+    for (let i = 0; i < 60 && !existsSync(marker); i++) await new Promise((r) => setTimeout(r, 50));
+    expect(existsSync(marker)).toBe(true);
+    await brokerFetch(PORT, "/retire", {});
+
+    // ~900ms after retire the forward is still parked (bounded only by its 5s abort). A broker
+    // that counts in-flight forwards is still in its drain loop and answers /health; the
+    // unfixed broker — which waited only on tmux deliveries — has already exited.
+    await new Promise((r) => setTimeout(r, 900));
+    let upDuringDrain = false;
+    try { upDuringDrain = (await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(300) })).ok; } catch {}
+    expect(upDuringDrain).toBe(true);
+
+    await sendPromise;
+  }, 20_000);
+});

@@ -255,6 +255,17 @@ if (import.meta.main) {
   // Deliveries currently being attempted. Read by the retire-drain (Task 9) and the
   // empty-broker self-exit (Task 14) so the broker never exits mid-delivery.
   let inFlightDeliveries = 0;
+  // Outbound cross-machine /forward-message sends in progress. A forward is delivery work
+  // the same way a tmux inject is, so the shutdown predicate must count it too — otherwise
+  // retire / idle self-exit would stop the server and exit while handleSendMessage is still
+  // awaiting the forward fetch, dropping the message before it reaches the sibling. A forward
+  // that would land does so in well under the retire drain deadline; one still parked at the
+  // deadline is bounded by its own 5s abort and would fail to "unreachable" regardless, so the
+  // deadline need not stretch to cover it.
+  let inFlightForwards = 0;
+  function hasWorkInFlight(): boolean {
+    return inFlightDeliveries > 0 || inFlightForwards > 0;
+  }
   let retiring = false;
   let httpServer: ReturnType<typeof Bun.serve> | null = null;
 
@@ -278,7 +289,7 @@ if (import.meta.main) {
     // suffice — TCP writes only flush between macrotasks, not between microtasks.
     await new Promise((r) => setTimeout(r, 50));
     const deadline = Date.now() + 3_000;
-    while (inFlightDeliveries > 0 && Date.now() < deadline) {
+    while (hasWorkInFlight() && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 50));
     }
     clearInterval(gossipTimer);
@@ -433,6 +444,10 @@ if (import.meta.main) {
     }
     const siblingUrl = resolveTargetBroker(db, body.to_id, config.siblings);
     if (!siblingUrl) return { ok: false, error: `Peer ${body.to_id} not found` };
+    // Mark the forward in flight so a concurrent retire / idle self-exit drains it before
+    // exiting (see hasWorkInFlight); the finally clears it whether the fetch resolves, rejects,
+    // or aborts.
+    inFlightForwards++;
     try {
       const res = await fetch(`${siblingUrl}/forward-message`, {
         method: "POST",
@@ -449,6 +464,8 @@ if (import.meta.main) {
       return { ok: true, routed: "remote" };
     } catch {
       return { ok: false, error: "Remote broker unreachable" };
+    } finally {
+      inFlightForwards--;
     }
   }
 
@@ -557,7 +574,7 @@ if (import.meta.main) {
   // window) checks coarsely while a sub-second test window checks promptly.
   function maybeIdleExit(): void {
     if (IDLE_EXIT_MS <= 0 || retiring) return;
-    if (inFlightDeliveries > 0) return;
+    if (hasWorkInFlight()) return;
     if ((selectAllPeers.all() as unknown[]).length > 0) return;
     if (Date.now() - lastActivityAt <= IDLE_EXIT_MS) return;
     console.error("[claude-peers broker] idle with no peers; exiting");
