@@ -112,13 +112,17 @@ export function resolveTmuxTarget(
   return { pane, socket };
 }
 
-// Strip C0 control characters (except tab and newline) from peer-controlled fields.
-// Critically this removes ESC (0x1b), which neutralizes the bracketed-paste END
-// sequence: without it, a peer whose text contained the PASTE_END bytes could close
-// the paste wrap early and have the trailing bytes land as live keystrokes in the
-// recipient's session. Newlines are kept so a multi-line message still pastes as one.
+// Strip C0 AND C1 control characters (except tab and newline) from peer-controlled
+// fields. Critically this removes ESC (0x1b), which neutralizes the bracketed-paste
+// END sequence: without it, a peer whose text contained the PASTE_END bytes could
+// close the paste wrap early and have the trailing bytes land as live keystrokes in
+// the recipient's session. The C1 range (0x80-0x9f) is stripped for the same reason:
+// 0x9b is the single-byte CSI (equivalent to ESC '['), so an 8-bit-clean terminal
+// would read "\x9b201~" as the paste-END sequence just as it reads "\x1b[201~" —
+// UTF-8 encoding preserves U+009B end to end, so the ESC-only strip alone is bypassable.
+// Newlines are kept so a multi-line message still pastes as one.
 function stripControl(s: string): string {
-  return s.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
+  return s.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
 }
 
 /** Build the bracketed-paste-wrapped peer line. A single trailing Enter submits it. */

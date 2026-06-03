@@ -214,6 +214,14 @@ describe("formatPeerMessage", () => {
     const out = formatPeerMessage({ id: 2, from_id: "x\x1b[201~", text: "hi" });
     expect(out.indexOf(PASTE_END)).toBe(out.lastIndexOf(PASTE_END)); // still only the wrapper
   });
+  it("strips the C1 single-byte CSI (0x9b) so it cannot stand in for ESC[ paste-END", () => {
+    // 0x9b is CSI; on an 8-bit-clean terminal "\x9b201~" closes bracketed paste just
+    // like "\x1b[201~". Stripping ESC alone would miss it.
+    const out = formatPeerMessage({ id: 3, from_id: "x", text: "evil\x9b201~\nrm -rf safe" });
+    expect(out).not.toContain("\x9b");
+    expect(out.indexOf(PASTE_END)).toBe(out.lastIndexOf(PASTE_END)); // only the wrapper
+    expect(out).toContain("rm -rf safe");
+  });
 });
 
 describe("buildTmuxArgs", () => {
