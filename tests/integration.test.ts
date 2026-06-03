@@ -275,6 +275,54 @@ describe("tmux delivery and floor", () => {
   });
 });
 
+// The invariant the whole feature exists to protect: a push that tmux rejects must
+// never mark the message delivered. It stays queued and stays retrievable. This
+// reproduces the original silent-consume bug and must stay green forever.
+describe("silent-consume regression", () => {
+  const PORT = 17907;
+  let proc: any;
+  let dir: string;
+  let logFile: string;
+
+  beforeAll(async () => {
+    // A stub tmux that reports a version (so the broker sees tmux as available and
+    // attempts the push) but fails every send-keys. This drives the real failure
+    // path — push tried, push rejected — rather than the trivial tmux-absent path.
+    dir = mkdtempSync(join(tmpdir(), "fail-tmux-"));
+    logFile = join(dir, "calls.log");
+    const stub = join(dir, "tmux");
+    writeFileSync(stub, `#!/usr/bin/env bash\nif [ "$1" = "-V" ]; then echo "tmux 3.4"; exit 0; fi\nprintf '%s\\0' "$@" >> "${logFile}"\nexit 1\n`);
+    chmodSync(stub, 0o755);
+    await Bun.write("/tmp/config-reg.json", JSON.stringify({
+      machine: "reg-a", tailscale_ip: "127.0.0.1", port: PORT, id_prefix: "rga", siblings: [], allowed_ips: ["127.0.0.1"],
+    }));
+    try { unlinkSync("/tmp/broker-reg.db"); } catch {}
+    proc = Bun.spawn(["bun", "broker.ts"], {
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-reg.json", CLAUDE_PEERS_DB: "/tmp/broker-reg.db", PATH: `${dir}:${process.env.PATH}` },
+      stdout: "ignore", stderr: "inherit",
+    });
+    for (let i = 0; i < 20; i++) { try { if ((await fetch(`http://127.0.0.1:${PORT}/health`)).ok) break; } catch {} await new Promise((r) => setTimeout(r, 300)); }
+  });
+  afterAll(() => { proc?.kill(); try { unlinkSync("/tmp/broker-reg.db"); } catch {} try { unlinkSync("/tmp/config-reg.json"); } catch {} });
+
+  it("a failing tmux push never marks the message delivered", async () => {
+    const reg = await brokerFetch(PORT, "/register", {
+      pid: process.pid, cwd: "/tmp/reg1", git_root: null, tty: null, summary: "",
+      machine: "reg-a", tailscale_ip: "127.0.0.1", tmux_pane: "%4", tmux_socket: null,
+    }) as any;
+    const send = await brokerFetch(PORT, "/send-message", { from_id: "rga-x", to_id: reg.id, text: "must not vanish" }) as any;
+    expect(send.delivery).toBe("queued"); // push failed => not accepted
+    // The push was actually attempted (not short-circuited by an absent tmux).
+    const log = readFileSync(logFile, "utf-8");
+    expect(log).toContain("%4");
+    expect(log).toContain("must not vanish");
+    // And the message is still retrievable — it was NOT silently consumed.
+    const poll = await brokerFetch(PORT, "/poll-messages", { id: reg.id }) as any;
+    expect(poll.messages).toHaveLength(1);
+    expect(poll.messages[0].text).toBe("must not vanish");
+  });
+});
+
 describe("broker version handshake", () => {
   const PORT = 17906;
   let proc: any;
