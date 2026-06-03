@@ -198,6 +198,30 @@ if (import.meta.main) {
   // deliverNext (further down) is what populates them.
   const activeRowIds = new Set<number>();
   const recipientsInFlight = new Set<string>();
+  // Peer ids whose removal is deferred because a delivery to them is in flight. The
+  // delivery's lease must resolve first (see removePeerOrDefer); deliverNext's finally
+  // drains this set the instant the lease frees.
+  const pendingPeerDeletes = new Set<string>();
+
+  // Delete a peer's row and all its undelivered mail. A peer id is ephemeral (a fresh
+  // generatePeerId per session, never reused), so once the session is gone (unregister)
+  // or replaced (same-pid re-register) its undelivered mail is addressed to an id nothing
+  // will ever poll — removing it is the documented model, not message loss.
+  function deletePeerAndMail(id: string): void {
+    deleteUndeliveredForPeer.run(id);
+    deletePeer.run(id);
+  }
+
+  // Remove a peer now, or defer until its in-flight delivery's lease resolves. Deleting the
+  // peer row mid-delivery strands the attempt: peerStillLive() would fail against the missing
+  // row, releaseToQueued would requeue under a deleted id, and nothing could drain that row
+  // before the 24h prune. Both teardown paths (graceful /unregister and same-pid re-register)
+  // route through here so the active-lease invariant is total. cleanStalePeers is a backstop
+  // for the dead-pid case; the deferred delete itself is drained by deliverNext's finally.
+  function removePeerOrDefer(id: string): void {
+    if (recipientsInFlight.has(id)) pendingPeerDeletes.add(id);
+    else deletePeerAndMail(id);
+  }
 
   // --- Clean dead peers ---
   function cleanStalePeers() {
@@ -333,6 +357,13 @@ if (import.meta.main) {
       activeRowIds.delete(row.id);
       recipientsInFlight.delete(toId);
       inFlightDeliveries--;
+      // The lease has resolved (confirmed or requeued above). If a teardown deferred this
+      // peer's removal while we held the lease, do it now — synchronously, so no concurrent
+      // handler can observe the peer between the lease freeing and the delete.
+      if (pendingPeerDeletes.has(toId)) {
+        pendingPeerDeletes.delete(toId);
+        deletePeerAndMail(toId);
+      }
     }
   }
 
@@ -349,16 +380,12 @@ if (import.meta.main) {
     const id = generatePeerId(config.id_prefix);
     const now = new Date().toISOString();
     const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
-    if (existing) {
-      // Same-pid re-register replaces the old peer row, but never delete its
-      // undelivered mail while a delivery attempt still owns the lease: the head
-      // row may be in 'delivering' with a tmux send-keys in flight, and dropping
-      // it here turns the eventual confirmDelivered/releaseToQueued into no-ops —
-      // the message is lost. Same recipientsInFlight guard the other deletion
-      // sites use. The peer row itself is always replaced (the pid is re-binding).
-      if (!recipientsInFlight.has(existing.id)) deleteUndeliveredForPeer.run(existing.id);
-      deletePeer.run(existing.id);
-    }
+    // A same-pid re-register supersedes the old peer row. Remove it — but defer while a
+    // delivery to the old id is in flight, or deleting the row now would orphan that
+    // attempt's message under a dead id (the same race the /unregister path guards; both
+    // route through removePeerOrDefer). The new peer row is inserted below regardless. The
+    // old id's mail is dropped, not carried over — the new session polls under its own id.
+    if (existing) removePeerOrDefer(existing.id);
     const pane = body.tmux_pane && /^%\d+$/.test(body.tmux_pane) ? body.tmux_pane : null;
     const socket = body.tmux_socket && body.tmux_socket.startsWith("/") ? body.tmux_socket : null;
     const kind = pane ? "tmux" : "none";
@@ -631,23 +658,13 @@ if (import.meta.main) {
           case "/send-message": return Response.json(await handleSendMessage(body));
           case "/poll-messages": return Response.json(handlePollMessages(body));
           case "/unregister":
-            // A peer id is ephemeral (a fresh generatePeerId per session), so a session's
-            // undelivered mail is addressed to an id no future session will ever poll. On a
-            // graceful exit we delete it: keeping it would not make it deliverable, only leave
-            // an unreachable row to age out. That deletion is the documented model.
-            //
-            // But not while a delivery to this peer is in flight. The head row is 'delivering'
-            // under an active lease, and deleting the *peer* row (even while sparing the message
-            // row) strands the attempt's resolution: peerStillLive() would reject, releaseToQueued
-            // would requeue the row under a now-deleted id, and nothing could ever drain it before
-            // the 24h prune. So defer the whole unregister while mid-delivery — peer row included —
-            // exactly as cleanStalePeers does. The in-flight attempt resolves against a peer that
-            // still exists (confirm, or requeue), and cleanStalePeers reaps the peer and its rows
-            // on its next sweep once the pid probes dead. list-peers already filters dead pids, so
-            // the session still disappears from listings immediately either way.
-            if (recipientsInFlight.has(body.id)) return Response.json({ ok: true });
-            deleteUndeliveredForPeer.run(body.id);
-            deletePeer.run(body.id);
+            // Remove the departing peer and its now-unreachable mail. A peer id is ephemeral
+            // (a fresh id per session, never reused), so a graceful exit's undelivered mail is
+            // addressed to an id nothing will poll again — deleting it is the documented model,
+            // not loss. Routed through removePeerOrDefer so an in-flight delivery resolves
+            // against a peer that still exists instead of orphaning its row; list-peers filters
+            // dead pids, so the session disappears from listings immediately regardless.
+            removePeerOrDefer(body.id);
             return Response.json({ ok: true });
           case "/gossip": return Response.json(handleGossip(body));
           case "/forward-message": return Response.json(await handleForwardMessage(body));

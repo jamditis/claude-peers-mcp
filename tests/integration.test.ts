@@ -536,3 +536,97 @@ describe("unregister during in-flight delivery defers peer deletion", () => {
     }
   }, 15_000);
 });
+
+// Same orphan race as unregister, but via the other teardown path: a same-pid re-register
+// supersedes the old peer row. If it deletes that row while a delivery to the old id is in
+// flight, the lease resolves against a missing peer and the message orphans under a dead id.
+// The fix defers the old peer's removal (removePeerOrDefer) until the lease frees. The fifo
+// stub holds the delivery in flight while the re-register lands, deterministically.
+describe("same-pid re-register during in-flight delivery defers old-peer deletion", () => {
+  const PORT = 17911;
+  let proc: any;
+  let dir: string;
+  let fifo: string;
+  let marker: string;
+
+  beforeAll(async () => {
+    dir = mkdtempSync(join(tmpdir(), "block-tmux-rereg-"));
+    fifo = join(dir, "gate.fifo");
+    marker = join(dir, "started");
+    Bun.spawnSync(["mkfifo", fifo]);
+    const stub = join(dir, "tmux");
+    writeFileSync(stub,
+      `#!/usr/bin/env bash\n` +
+      `if [ "$1" = "-V" ]; then echo "tmux 3.4"; exit 0; fi\n` +
+      `echo started > "${marker}"\n` +
+      `cat "${fifo}" > /dev/null\n` +
+      `exit 0\n`);
+    chmodSync(stub, 0o755);
+    await Bun.write(join(dir, "config.json"), JSON.stringify({
+      machine: "rereg-a", tailscale_ip: "127.0.0.1", port: PORT,
+      id_prefix: "rra", siblings: [], allowed_ips: ["127.0.0.1"],
+    }));
+    proc = Bun.spawn(["bun", "broker.ts"], {
+      env: {
+        ...process.env,
+        CLAUDE_PEERS_CONFIG: join(dir, "config.json"),
+        CLAUDE_PEERS_DB: join(dir, "broker.db"),
+        PATH: `${dir}:${process.env.PATH}`, // stub tmux wins
+      },
+      stdout: "ignore", stderr: "inherit",
+    });
+    for (let i = 0; i < 20; i++) {
+      try { if ((await fetch(`http://127.0.0.1:${PORT}/health`)).ok) break; } catch {}
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  });
+
+  afterAll(() => {
+    proc?.kill();
+  });
+
+  it("keeps the old peer addressable until the in-flight lease resolves, then reaps it", async () => {
+    const reg1 = await brokerFetch(PORT, "/register", {
+      pid: process.pid, cwd: "/tmp/rr1", git_root: null, tty: null, summary: "",
+      machine: "rereg-a", tailscale_ip: "127.0.0.1", tmux_pane: "%5", tmux_socket: null,
+    }) as any;
+
+    // In-flight delivery to the first id, parked on the fifo.
+    const sendPromise = brokerFetch(PORT, "/send-message", {
+      from_id: "rra-sender0", to_id: reg1.id, text: "in flight",
+    });
+
+    let reg2: any;
+    try {
+      for (let i = 0; i < 60 && !existsSync(marker); i++) await new Promise((r) => setTimeout(r, 50));
+      expect(existsSync(marker)).toBe(true);
+
+      // Same pid re-registers mid-delivery. Without the fix the old peer row is deleted here
+      // and the in-flight message orphans; with it the old id stays addressable (deferred).
+      reg2 = await brokerFetch(PORT, "/register", {
+        pid: process.pid, cwd: "/tmp/rr1", git_root: null, tty: null, summary: "",
+        machine: "rereg-a", tailscale_ip: "127.0.0.1", tmux_pane: "%6", tmux_socket: null,
+      }) as any;
+      expect(reg2.id).not.toBe(reg1.id); // a genuinely new session id
+
+      const during = await brokerFetch(PORT, "/list-peers", {
+        scope: "machine", cwd: "/tmp/rr1", git_root: null,
+      }) as any[];
+      expect(during.some((p) => p.id === reg1.id)).toBe(true); // old id deferred, still present
+      expect(during.some((p) => p.id === reg2.id)).toBe(true); // new id registered
+    } finally {
+      if (existsSync(marker)) {
+        writeFileSync(fifo, "go");
+        await sendPromise.catch(() => {});
+      }
+    }
+
+    // Lease resolved: the deferred old peer is reaped promptly (deliverNext's finally), while
+    // the new session remains. No row is left orphaned under the dead old id.
+    const after = await brokerFetch(PORT, "/list-peers", {
+      scope: "machine", cwd: "/tmp/rr1", git_root: null,
+    }) as any[];
+    expect(after.some((p) => p.id === reg1.id)).toBe(false);
+    expect(after.some((p) => p.id === reg2.id)).toBe(true);
+  }, 15_000);
+});
