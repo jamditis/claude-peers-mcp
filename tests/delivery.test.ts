@@ -2,6 +2,10 @@ import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
 import { unlinkSync } from "fs";
 import { ensureMessagesTable, migrateMessagesSchema } from "../delivery.ts";
+import {
+  generateLeaseToken, claimForDelivery, confirmDelivered,
+  releaseToQueued, resetDeliveringOnStart, reclaimIfExpired,
+} from "../delivery.ts";
 
 const DB = "/tmp/test-delivery-migration.db";
 
@@ -73,5 +77,93 @@ describe("migrateMessagesSchema", () => {
     const row = db.query("SELECT delivery_state FROM messages").get() as { delivery_state: string };
     expect(row.delivery_state).toBe("delivered");
     db.close();
+  });
+});
+
+const LDB = "/tmp/test-delivery-lease.db";
+
+function seededDb(): Database {
+  try { unlinkSync(LDB); } catch {}
+  const db = new Database(LDB);
+  ensureMessagesTable(db);
+  return db;
+}
+function insert(db: Database, toId: string): number {
+  db.run("INSERT INTO messages (from_id,to_id,text,sent_at) VALUES ('a',?,?,?)",
+    [toId, "m", new Date().toISOString()]);
+  return (db.query("SELECT last_insert_rowid() AS id").get() as { id: number }).id;
+}
+function state(db: Database, id: number) {
+  return db.query("SELECT delivery_state, lease_token, lease_expires_at FROM messages WHERE id=?").get(id) as any;
+}
+
+describe("lease state machine", () => {
+  let db: Database;
+  beforeEach(() => { db = seededDb(); });
+  afterEach(() => { db.close(); try { unlinkSync(LDB); } catch {} });
+
+  it("a queued row is claimable once", () => {
+    const id = insert(db, "b");
+    expect(claimForDelivery(db, id, 1000, 5000, "tok1")).toBe(true);
+    expect(claimForDelivery(db, id, 1000, 5000, "tok2")).toBe(false);
+    expect(state(db, id).delivery_state).toBe("delivering");
+    expect(state(db, id).lease_token).toBe("tok1");
+  });
+
+  it("confirm requires the matching token", () => {
+    const id = insert(db, "b");
+    claimForDelivery(db, id, 1000, 5000, "tok1");
+    expect(confirmDelivered(db, id, "wrong")).toBe(false);
+    expect(state(db, id).delivery_state).toBe("delivering");
+    expect(confirmDelivered(db, id, "tok1")).toBe(true);
+    expect(state(db, id).delivery_state).toBe("delivered");
+  });
+
+  it("releaseToQueued only releases the holder's row", () => {
+    const id = insert(db, "b");
+    claimForDelivery(db, id, 1000, 5000, "tok1");
+    releaseToQueued(db, id, "wrong");
+    expect(state(db, id).delivery_state).toBe("delivering");
+    releaseToQueued(db, id, "tok1");
+    expect(state(db, id).delivery_state).toBe("queued");
+    expect(state(db, id).lease_token).toBeNull();
+  });
+
+  it("reclaimIfExpired reclaims only a past-due delivering row", () => {
+    const id = insert(db, "b");
+    claimForDelivery(db, id, 1000, 5000, "tok1"); // expires at 6000
+    expect(reclaimIfExpired(db, id, 5000)).toBe(false); // not yet expired
+    expect(reclaimIfExpired(db, id, 7000)).toBe(true);  // expired
+    expect(state(db, id).delivery_state).toBe("queued");
+  });
+
+  it("resetDeliveringOnStart requeues every delivering row", () => {
+    const a = insert(db, "b"); const c = insert(db, "b");
+    claimForDelivery(db, a, 1000, 5000, "t1");
+    claimForDelivery(db, c, 1000, 5000, "t2");
+    expect(resetDeliveringOnStart(db)).toBe(2);
+    expect(state(db, a).delivery_state).toBe("queued");
+    expect(state(db, c).delivery_state).toBe("queued");
+  });
+
+  // The invariant this whole state machine exists to protect: a stale token from a
+  // timed-out attempt must never flip a row that has since been re-leased.
+  it("a stale confirmation after expiry and re-claim is a no-op", () => {
+    const id = insert(db, "b");
+    claimForDelivery(db, id, 1000, 5000, "tok1"); // expires at 6000
+    expect(reclaimIfExpired(db, id, 7000)).toBe(true);
+    expect(claimForDelivery(db, id, 7000, 5000, "tok2")).toBe(true);
+    expect(confirmDelivered(db, id, "tok1")).toBe(false); // stale token loses
+    expect(state(db, id).delivery_state).toBe("delivering");
+    expect(state(db, id).lease_token).toBe("tok2");
+    expect(confirmDelivered(db, id, "tok2")).toBe(true); // current holder wins
+    expect(state(db, id).delivery_state).toBe("delivered");
+  });
+
+  it("reclaimIfExpired fires at exactly the lease deadline (<=)", () => {
+    const id = insert(db, "b");
+    claimForDelivery(db, id, 1000, 5000, "tok1"); // expires at 6000
+    expect(reclaimIfExpired(db, id, 6000)).toBe(true); // boundary is inclusive
+    expect(state(db, id).delivery_state).toBe("queued");
   });
 });
