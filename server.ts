@@ -26,6 +26,7 @@ import type {
   PollMessagesResponse,
   Message,
 } from "./shared/types.ts";
+import { PROTOCOL_VERSION as REQUIRED_BROKER_PROTOCOL } from "./shared/types.ts";
 import {
   getGitBranch,
   getRecentFiles,
@@ -66,10 +67,32 @@ async function isBrokerAlive(): Promise<boolean> {
   }
 }
 
+async function brokerProtocolVersion(): Promise<number | null> {
+  try {
+    const res = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(2000) });
+    if (!res.ok) return null;
+    const h = await res.json() as { protocol_version?: number };
+    return typeof h.protocol_version === "number" ? h.protocol_version : null;
+  } catch { return null; }
+}
+
 async function ensureBroker(): Promise<void> {
   if (await isBrokerAlive()) {
-    log("Broker already running");
-    return;
+    const ver = await brokerProtocolVersion();
+    if (ver !== null && ver >= REQUIRED_BROKER_PROTOCOL) {
+      log("Broker already running");
+      return;
+    }
+    log(`Stale broker (protocol ${ver ?? "?"} < ${REQUIRED_BROKER_PROTOCOL}); retiring it`);
+    try {
+      await fetch(`${BROKER_URL}/retire`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}", signal: AbortSignal.timeout(2000) });
+    } catch { /* it may exit before responding */ }
+    let freed = false;
+    for (let i = 0; i < 25; i++) {
+      await new Promise((r) => setTimeout(r, 200));
+      if (!(await isBrokerAlive())) { freed = true; break; }
+    }
+    if (!freed) throw new Error("A stale claude-peers broker is running; run `bun cli.ts kill-broker` and retry.");
   }
 
   log("Starting broker daemon...");

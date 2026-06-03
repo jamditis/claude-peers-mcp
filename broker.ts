@@ -206,6 +206,24 @@ if (import.meta.main) {
   // Deliveries currently being attempted. Read by the retire-drain (Task 9) and the
   // empty-broker self-exit (Task 14) so the broker never exits mid-delivery.
   let inFlightDeliveries = 0;
+  let retiring = false;
+  let httpServer: ReturnType<typeof Bun.serve> | null = null;
+
+  async function retire(): Promise<void> {
+    retiring = true; // new register/send/forward now refused
+    // Yield the microtask queue so the /retire response can be flushed before we stop.
+    await new Promise((r) => setTimeout(r, 50));
+    const deadline = Date.now() + 3_000;
+    while (inFlightDeliveries > 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    clearInterval(gossipTimer);
+    clearInterval(cleanupTimer);
+    try { await gossipToSiblings([]); } catch {}
+    httpServer?.stop(true);
+    db.close();
+    process.exit(0);
+  }
   let tmuxPresent: boolean | null = null;
   function tmuxAvailable(): boolean {
     if (tmuxPresent === null) {
@@ -451,7 +469,7 @@ if (import.meta.main) {
   process.on("SIGTERM", shutdown);
 
   // --- HTTP Server ---
-  Bun.serve({
+  httpServer = Bun.serve({
     port: PORT,
     hostname: "0.0.0.0",
     async fetch(req, server) {
@@ -470,6 +488,7 @@ if (import.meta.main) {
           return Response.json({
             status: "ok", peers: (selectAllPeers.all() as any[]).length,
             machine: config.machine, remote_peer_count: (selectAllRemotePeers.all() as any[]).length,
+            protocol_version: PROTOCOL_VERSION,
           });
         }
         return new Response("claude-peers broker (federated)", { status: 200 });
@@ -477,6 +496,9 @@ if (import.meta.main) {
 
       try {
         const body = await req.json();
+        if (retiring && (path === "/register" || path === "/send-message" || path === "/forward-message")) {
+          return Response.json({ ok: false, error: "broker retiring" }, { status: 503 });
+        }
         switch (path) {
           case "/register": {
             const fromLoopback = isLoopback(clientIp);
@@ -517,6 +539,7 @@ if (import.meta.main) {
             return Response.json({ ok: true });
           case "/gossip": return Response.json(handleGossip(body));
           case "/forward-message": return Response.json(await handleForwardMessage(body));
+          case "/retire": { void retire(); return Response.json({ ok: true }); }
           default: return Response.json({ error: "not found" }, { status: 404 });
         }
       } catch (e) {

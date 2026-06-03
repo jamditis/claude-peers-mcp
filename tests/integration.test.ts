@@ -274,3 +274,41 @@ describe("tmux delivery and floor", () => {
     expect(poll.messages[0].text).toBe("floor me");
   });
 });
+
+describe("broker version handshake", () => {
+  const PORT = 17906;
+  let proc: any;
+  const cfg = { machine: "ver-a", tailscale_ip: "127.0.0.1", port: PORT, id_prefix: "vra", siblings: [], allowed_ips: ["127.0.0.1"] };
+
+  beforeAll(async () => {
+    await Bun.write("/tmp/config-ver.json", JSON.stringify(cfg));
+    try { unlinkSync("/tmp/broker-ver.db"); } catch {}
+    proc = Bun.spawn(["bun", "broker.ts"], {
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-ver.json", CLAUDE_PEERS_DB: "/tmp/broker-ver.db" },
+      stdout: "ignore", stderr: "inherit",
+    });
+    for (let i = 0; i < 20; i++) { try { if ((await fetch(`http://127.0.0.1:${PORT}/health`)).ok) break; } catch {} await new Promise((r) => setTimeout(r, 300)); }
+  });
+  afterAll(() => { proc?.kill(); try { unlinkSync("/tmp/broker-ver.db"); } catch {} try { unlinkSync("/tmp/config-ver.json"); } catch {} });
+
+  it("reports protocol_version on /health", async () => {
+    const h = await (await fetch(`http://127.0.0.1:${PORT}/health`)).json() as any;
+    expect(h.protocol_version).toBe(2);
+  });
+
+  it("retire drains and exits even with a peer registered", async () => {
+    await brokerFetch(PORT, "/register", {
+      pid: process.pid, cwd: "/tmp/v1", git_root: null, tty: null, summary: "",
+      machine: "ver-a", tailscale_ip: "127.0.0.1", tmux_pane: null, tmux_socket: null,
+    });
+    const r = await brokerFetch(PORT, "/retire", {}) as any;
+    expect(r.ok).toBe(true);
+    let down = false;
+    for (let i = 0; i < 20; i++) {
+      try { await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(300) }); }
+      catch { down = true; break; }
+      await new Promise((res) => setTimeout(res, 200));
+    }
+    expect(down).toBe(true);
+  });
+});
