@@ -13,10 +13,16 @@ import type {
   RegisterRequest, RegisterResponse, HeartbeatRequest,
   SetSummaryRequest, ListPeersRequest, SendMessageRequest,
   PollMessagesRequest, PollMessagesResponse, Peer, Message,
-  GossipRequest, ForwardMessageRequest,
+  GossipRequest, ForwardMessageRequest, SendResult,
 } from "./shared/types.ts";
+import {
+  ensureMessagesTable, migrateMessagesSchema, resetDeliveringOnStart,
+  generateLeaseToken, claimForDelivery, confirmDelivered, releaseToQueued,
+  reclaimIfExpired, nextDeliverable, formatPeerMessage,
+  deliverViaTmux, type TmuxSpawn,
+} from "./delivery.ts";
+import { PROTOCOL_VERSION } from "./shared/types.ts";
 
-const PROTOCOL_VERSION = 1;
 const GOSSIP_INTERVAL_MS = 5_000;
 const CLEANUP_INTERVAL_MS = 15_000;
 const REMOTE_TTL_MS = 30_000;
@@ -138,8 +144,14 @@ if (import.meta.main) {
   db.run(`CREATE TABLE IF NOT EXISTS peers (
     id TEXT PRIMARY KEY, pid INTEGER NOT NULL, machine TEXT NOT NULL,
     tailscale_ip TEXT NOT NULL, cwd TEXT NOT NULL, git_root TEXT, tty TEXT,
-    summary TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL, last_seen TEXT NOT NULL
+    summary TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL, last_seen TEXT NOT NULL,
+    tmux_pane TEXT, tmux_socket TEXT, delivery_kind TEXT NOT NULL DEFAULT 'none'
   )`);
+  // Upgrade a legacy peers table that predates the delivery columns.
+  for (const [col, type] of [["tmux_pane","TEXT"],["tmux_socket","TEXT"],["delivery_kind","TEXT NOT NULL DEFAULT 'none'"]] as const) {
+    const present = (db.query("PRAGMA table_info(peers)").all() as { name: string }[]).some((c) => c.name === col);
+    if (!present) db.run(`ALTER TABLE peers ADD COLUMN ${col} ${type}`);
+  }
 
   db.run(`CREATE TABLE IF NOT EXISTS remote_peers (
     id TEXT PRIMARY KEY, machine TEXT NOT NULL, tailscale_ip TEXT NOT NULL,
@@ -147,15 +159,15 @@ if (import.meta.main) {
     summary TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL, last_seen TEXT NOT NULL
   )`);
 
-  db.run(`CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT NOT NULL, to_id TEXT NOT NULL,
-    text TEXT NOT NULL, sent_at TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0
-  )`);
+  ensureMessagesTable(db);
+  migrateMessagesSchema(db);
+  const requeued = resetDeliveringOnStart(db);
+  if (requeued > 0) console.error(`[claude-peers broker] requeued ${requeued} orphaned delivering row(s) on start`);
 
   // --- Prepared statements ---
   const insertPeer = db.prepare(`
-    INSERT INTO peers (id, pid, machine, tailscale_ip, cwd, git_root, tty, summary, registered_at, last_seen)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO peers (id, pid, machine, tailscale_ip, cwd, git_root, tty, summary, registered_at, last_seen, tmux_pane, tmux_socket, delivery_kind)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const updateLastSeen = db.prepare("UPDATE peers SET last_seen = ? WHERE id = ?");
   const updateSummary = db.prepare("UPDATE peers SET summary = ? WHERE id = ?");
@@ -165,14 +177,16 @@ if (import.meta.main) {
   const selectPeersByGitRoot = db.prepare("SELECT * FROM peers WHERE git_root = ?");
   const selectAllRemotePeers = db.prepare("SELECT * FROM remote_peers");
   const insertMessage = db.prepare(
-    "INSERT INTO messages (from_id, to_id, text, sent_at, delivered) VALUES (?, ?, ?, ?, 0)"
+    "INSERT INTO messages (from_id, to_id, text, sent_at) VALUES (?, ?, ?, ?)"
   );
-  const selectUndelivered = db.prepare(
-    "SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC"
+  const selectQueued = db.prepare(
+    "SELECT * FROM messages WHERE to_id = ? AND delivery_state = 'queued' ORDER BY id ASC"
   );
-  const markDelivered = db.prepare("UPDATE messages SET delivered = 1 WHERE id = ?");
+  const markPolled = db.prepare(
+    "UPDATE messages SET delivery_state = 'delivered', lease_expires_at = NULL, lease_token = NULL WHERE id = ? AND delivery_state = 'queued'"
+  );
   const deleteUndeliveredForPeer = db.prepare(
-    "DELETE FROM messages WHERE to_id = ? AND delivered = 0"
+    "DELETE FROM messages WHERE to_id = ? AND delivery_state != 'delivered'"
   );
 
   // --- Clean stale peers ---
@@ -185,14 +199,85 @@ if (import.meta.main) {
   }
   cleanStalePeers();
 
+  // --- Delivery context ---
+  const LEASE_MS = 5_000;        // > the 2s tmux attempt timeout
+  const TMUX_TIMEOUT_MS = 2_000;
+  const MAX_HEARTBEAT_DRAIN = 50; // upper bound on pushes drained per heartbeat
+  // Deliveries currently being attempted. Read by the retire-drain (Task 9) and the
+  // empty-broker self-exit (Task 14) so the broker never exits mid-delivery.
+  let inFlightDeliveries = 0;
+  let tmuxPresent: boolean | null = null;
+  function tmuxAvailable(): boolean {
+    if (tmuxPresent === null) {
+      try { tmuxPresent = Bun.spawnSync(["tmux", "-V"]).exitCode === 0; }
+      catch { tmuxPresent = false; }
+    }
+    return tmuxPresent;
+  }
+
+  const realTmuxSpawn: TmuxSpawn = async (args) => {
+    const proc = Bun.spawn(args, { stdout: "ignore", stderr: "ignore" });
+    const timer = setTimeout(() => { try { proc.kill(); } catch {} }, TMUX_TIMEOUT_MS);
+    try { const exitCode = await proc.exited; return { exitCode }; }
+    finally { clearTimeout(timer); }
+  };
+
+  // In-memory delivery guards (this process only).
+  const activeRowIds = new Set<number>();
+  const recipientsInFlight = new Set<string>();
+
+  function peerDelivery(toId: string): { kind: string; pane: string | null; socket: string | null } | null {
+    return db.query("SELECT delivery_kind AS kind, tmux_pane AS pane, tmux_socket AS socket FROM peers WHERE id = ?")
+      .get(toId) as { kind: string; pane: string | null; socket: string | null } | null;
+  }
+
+  // Attempt to deliver the recipient's head-of-line row. Serial per recipient.
+  // Returns the delivery disposition for an immediately-attempted send, or null
+  // when nothing was attempted (blocked / no backend / already in flight).
+  async function deliverNext(toId: string): Promise<"injected" | "accepted" | "queued" | null> {
+    if (recipientsInFlight.has(toId)) return null;
+    const now = Date.now();
+    const row = nextDeliverable(db, toId, now, activeRowIds);
+    if (!row) return null;
+    const target = peerDelivery(toId);
+    if (!target || target.kind !== "tmux" || !target.pane || !tmuxAvailable()) return "queued";
+
+    if (row.delivery_state === "delivering") {
+      if (!reclaimIfExpired(db, row.id, now)) return null; // someone else owns it
+    }
+    const token = generateLeaseToken();
+    if (!claimForDelivery(db, row.id, now, LEASE_MS, token)) return null;
+
+    recipientsInFlight.add(toId);
+    activeRowIds.add(row.id);
+    inFlightDeliveries++;
+    try {
+      const text = formatPeerMessage(row);
+      const ok = await deliverViaTmux(target.pane, target.socket, text, realTmuxSpawn);
+      if (ok && confirmDelivered(db, row.id, token)) return "accepted";
+      releaseToQueued(db, row.id, token);
+      return "queued";
+    } catch {
+      releaseToQueued(db, row.id, token);
+      return "queued";
+    } finally {
+      activeRowIds.delete(row.id);
+      recipientsInFlight.delete(toId);
+      inFlightDeliveries--;
+    }
+  }
+
   // --- Request handlers ---
   function handleRegister(body: RegisterRequest): RegisterResponse {
     const id = generatePeerId(config.id_prefix);
     const now = new Date().toISOString();
     const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
     if (existing) { deleteUndeliveredForPeer.run(existing.id); deletePeer.run(existing.id); }
+    const pane = body.tmux_pane && /^%\d+$/.test(body.tmux_pane) ? body.tmux_pane : null;
+    const socket = body.tmux_socket && body.tmux_socket.startsWith("/") ? body.tmux_socket : null;
+    const kind = pane ? "tmux" : "none";
     insertPeer.run(id, body.pid, config.machine, config.tailscale_ip,
-      body.cwd, body.git_root, body.tty, body.summary, now, now);
+      body.cwd, body.git_root, body.tty, body.summary, now, now, pane, socket, kind);
     return { id };
   }
 
@@ -227,11 +312,12 @@ if (import.meta.main) {
     return allPeers;
   }
 
-  async function handleSendMessage(body: SendMessageRequest): Promise<{ ok: boolean; error?: string; routed?: string }> {
+  async function handleSendMessage(body: SendMessageRequest): Promise<SendResult> {
     const localTarget = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id);
     if (localTarget) {
       insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
-      return { ok: true, routed: "local" };
+      const disposition = (await deliverNext(body.to_id)) ?? "queued";
+      return { ok: true, routed: "local", delivery: disposition };
     }
     const siblingUrl = resolveTargetBroker(db, body.to_id, config.siblings);
     if (!siblingUrl) return { ok: false, error: `Peer ${body.to_id} not found` };
@@ -254,7 +340,7 @@ if (import.meta.main) {
     }
   }
 
-  function handleForwardMessage(body: ForwardMessageRequest): { ok: boolean } {
+  async function handleForwardMessage(body: ForwardMessageRequest): Promise<{ ok: boolean }> {
     if (body.protocol_version !== PROTOCOL_VERSION) {
       console.error(`[claude-peers broker] Warning: received protocol_version ${body.protocol_version}, expected ${PROTOCOL_VERSION}`);
     }
@@ -264,6 +350,9 @@ if (import.meta.main) {
       return { ok: false };
     }
     insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
+    // floor_remote_forwards leaves a forwarded message queued for pull-only retrieval;
+    // by default a forward auto-injects into the recipient's backend like a local send.
+    if (!config.floor_remote_forwards) await deliverNext(body.to_id);
     return { ok: true };
   }
 
@@ -288,20 +377,21 @@ if (import.meta.main) {
   }
 
   function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
-    const messages = selectUndelivered.all(body.id) as Message[];
-    for (const msg of messages) markDelivered.run(msg.id);
+    const messages = selectQueued.all(body.id) as Message[];
+    for (const msg of messages) markPolled.run(msg.id);
     return { messages };
   }
 
-  // Peek: return undelivered messages WITHOUT marking them delivered
+  // Peek: return queued messages WITHOUT marking them delivered
   function handlePeekMessages(body: PollMessagesRequest): PollMessagesResponse {
-    const messages = selectUndelivered.all(body.id) as Message[];
+    const messages = selectQueued.all(body.id) as Message[];
     return { messages };
   }
 
-  // Ack: mark specific message IDs as delivered
+  // Ack: mark queued message IDs delivered (no-op on rows already delivering/delivered).
+  // Vestigial alongside peek; the dead push path is removed in a later task.
   function handleAckMessages(body: { ids: number[] }): { ok: boolean } {
-    for (const id of body.ids) markDelivered.run(id);
+    for (const id of body.ids) markPolled.run(id);
     return { ok: true };
   }
 
@@ -389,9 +479,23 @@ if (import.meta.main) {
         const body = await req.json();
         switch (path) {
           case "/register": return Response.json(handleRegister(body));
-          case "/heartbeat":
+          case "/heartbeat": {
             updateLastSeen.run(new Date().toISOString(), body.id);
+            // Drain this recipient's queued backlog in id order (serial per recipient),
+            // continuing only while each attempt delivers. A non-delivery (no backend,
+            // or a failed/blocked head-of-line) stops the drain: under FIFO nothing
+            // behind a blocked head can go first, and stopping avoids re-spawning
+            // against a failing pane on every iteration.
+            let drained = 0;
+            for (; drained < MAX_HEARTBEAT_DRAIN; drained++) {
+              const d = await deliverNext(body.id);
+              if (d !== "accepted" && d !== "injected") break;
+            }
+            if (drained === MAX_HEARTBEAT_DRAIN) {
+              console.error(`[claude-peers broker] heartbeat drain hit the ${MAX_HEARTBEAT_DRAIN}-message cap for ${body.id}; backlog continues next heartbeat`);
+            }
             return Response.json({ ok: true });
+          }
           case "/set-summary":
             updateSummary.run(body.summary, body.id);
             return Response.json({ ok: true });
@@ -405,7 +509,7 @@ if (import.meta.main) {
             deletePeer.run(body.id);
             return Response.json({ ok: true });
           case "/gossip": return Response.json(handleGossip(body));
-          case "/forward-message": return Response.json(handleForwardMessage(body));
+          case "/forward-message": return Response.json(await handleForwardMessage(body));
           default: return Response.json({ error: "not found" }, { status: 404 });
         }
       } catch (e) {
