@@ -1,6 +1,19 @@
 // tests/integration.test.ts
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
-import { unlinkSync } from "fs";
+import { unlinkSync, mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+
+// Create a directory holding a fake `tmux` executable that records its argv and
+// exits 0, so the broker's tmux backend is deterministic without a real tmux.
+function makeStubTmux(): { dir: string; logFile: string } {
+  const dir = mkdtempSync(join(tmpdir(), "stub-tmux-"));
+  const logFile = join(dir, "tmux.log");
+  const stub = join(dir, "tmux");
+  writeFileSync(stub, `#!/usr/bin/env bash\nprintf '%s\\0' "$@" >> "${logFile}"\nexit 0\n`);
+  chmodSync(stub, 0o755);
+  return { dir, logFile };
+}
 
 const BROKER_A_PORT = 17899;
 const BROKER_B_PORT = 17900;
@@ -194,3 +207,70 @@ describe("two-broker federation", () => {
     expect(remoteAfter).toHaveLength(0);
   });
 }, { timeout: 30_000 });
+
+describe("tmux delivery and floor", () => {
+  const PORT = 17905;
+  let proc: any;
+  let stub: { dir: string; logFile: string };
+
+  const cfg = {
+    machine: "del-a", tailscale_ip: "127.0.0.1", port: PORT,
+    id_prefix: "dla", siblings: [], allowed_ips: ["127.0.0.1"],
+  };
+
+  beforeAll(async () => {
+    stub = makeStubTmux();
+    await Bun.write("/tmp/config-del.json", JSON.stringify(cfg));
+    try { unlinkSync("/tmp/broker-del.db"); } catch {}
+    proc = Bun.spawn(["bun", "broker.ts"], {
+      env: {
+        ...process.env,
+        CLAUDE_PEERS_CONFIG: "/tmp/config-del.json",
+        CLAUDE_PEERS_DB: "/tmp/broker-del.db",
+        PATH: `${stub.dir}:${process.env.PATH}`, // stub tmux wins
+      },
+      stdout: "ignore", stderr: "inherit",
+    });
+    for (let i = 0; i < 20; i++) {
+      try { if ((await fetch(`http://127.0.0.1:${PORT}/health`)).ok) break; } catch {}
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  });
+
+  afterAll(() => {
+    proc?.kill();
+    try { unlinkSync("/tmp/broker-del.db"); } catch {}
+    try { unlinkSync("/tmp/config-del.json"); } catch {}
+  });
+
+  it("delivers to a tmux peer and marks accepted", async () => {
+    const reg = await brokerFetch(PORT, "/register", {
+      pid: process.pid, cwd: "/tmp/d1", git_root: null, tty: null, summary: "",
+      machine: "del-a", tailscale_ip: "127.0.0.1", tmux_pane: "%9", tmux_socket: null,
+    }) as any;
+    const send = await brokerFetch(PORT, "/send-message", {
+      from_id: "dla-sender0", to_id: reg.id, text: "hello tmux",
+    }) as any;
+    expect(send.ok).toBe(true);
+    expect(send.delivery).toBe("accepted");
+    const poll = await brokerFetch(PORT, "/poll-messages", { id: reg.id }) as any;
+    expect(poll.messages).toHaveLength(0);
+    const log = readFileSync(stub.logFile, "utf-8");
+    expect(log).toContain("%9");
+    expect(log).toContain("hello tmux");
+  });
+
+  it("leaves a none peer queued and retrievable via check_messages", async () => {
+    const reg = await brokerFetch(PORT, "/register", {
+      pid: process.pid, cwd: "/tmp/d2", git_root: null, tty: null, summary: "",
+      machine: "del-a", tailscale_ip: "127.0.0.1", tmux_pane: null, tmux_socket: null,
+    }) as any;
+    const send = await brokerFetch(PORT, "/send-message", {
+      from_id: "dla-sender0", to_id: reg.id, text: "floor me",
+    }) as any;
+    expect(send.delivery).toBe("queued");
+    const poll = await brokerFetch(PORT, "/poll-messages", { id: reg.id }) as any;
+    expect(poll.messages).toHaveLength(1);
+    expect(poll.messages[0].text).toBe("floor me");
+  });
+});
