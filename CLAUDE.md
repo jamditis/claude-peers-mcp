@@ -14,7 +14,7 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 - `server.ts` — MCP stdio server, one per Claude Code instance. Registers with the broker, reporting its own tmux pane as a delivery target, and exposes the tools. No channel push — delivery is broker-side.
 - `delivery.ts` — Pure, testable delivery logic (lease state machine, tmux target resolution, bracketed-paste formatting + C0 stripping, ordered next-deliverable selection, liveness probe, retention prune). `broker.ts` composes these; tests import them directly.
 - `shared/types.ts` — Shared types for the broker API, including `PROTOCOL_VERSION` and the `delivery_state` schema.
-- `shared/config.ts` — Config loader. Notable: `floor_remote_forwards` (default false) leaves cross-machine forwards queued for `check_messages` instead of pushing them into the local pane.
+- `shared/config.ts` — Config loader. Notable: `floor_remote_forwards` (default true, secure-by-default) leaves cross-machine forwards queued for `check_messages` instead of pushing them into the local pane; set it `false` to opt in to cross-node push. Local same-machine peers always push.
 - `shared/summarize.ts` — Auto-summary generation via gpt-5.4-nano.
 - `cli.ts` — CLI utility for inspecting broker state.
 

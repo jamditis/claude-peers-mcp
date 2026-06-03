@@ -349,7 +349,16 @@ if (import.meta.main) {
     const id = generatePeerId(config.id_prefix);
     const now = new Date().toISOString();
     const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
-    if (existing) { deleteUndeliveredForPeer.run(existing.id); deletePeer.run(existing.id); }
+    if (existing) {
+      // Same-pid re-register replaces the old peer row, but never delete its
+      // undelivered mail while a delivery attempt still owns the lease: the head
+      // row may be in 'delivering' with a tmux send-keys in flight, and dropping
+      // it here turns the eventual confirmDelivered/releaseToQueued into no-ops —
+      // the message is lost. Same recipientsInFlight guard the other deletion
+      // sites use. The peer row itself is always replaced (the pid is re-binding).
+      if (!recipientsInFlight.has(existing.id)) deleteUndeliveredForPeer.run(existing.id);
+      deletePeer.run(existing.id);
+    }
     const pane = body.tmux_pane && /^%\d+$/.test(body.tmux_pane) ? body.tmux_pane : null;
     const socket = body.tmux_socket && body.tmux_socket.startsWith("/") ? body.tmux_socket : null;
     const kind = pane ? "tmux" : "none";
