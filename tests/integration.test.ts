@@ -360,3 +360,17 @@ describe("broker version handshake", () => {
     expect(down).toBe(true);
   });
 });
+
+describe("dead push path removed", () => {
+  it("server.ts has no poll loop, channel push, or CLAUDE_PEERS_CHANNEL", () => {
+    const src = readFileSync("server.ts", "utf-8");
+    expect(src).not.toContain("pollAndPushMessages");
+    expect(src).not.toContain("CLAUDE_PEERS_CHANNEL");
+    expect(src).not.toContain("notifications/claude/channel");
+  });
+  it("broker.ts no longer serves /peek-messages or /ack-messages", () => {
+    const src = readFileSync("broker.ts", "utf-8");
+    expect(src).not.toContain("/peek-messages");
+    expect(src).not.toContain("/ack-messages");
+  });
+});
