@@ -118,7 +118,7 @@ bun cli.ts kill-broker       # stop the broker
 | `CLAUDE_PEERS_IDLE_EXIT_MS` | `0` (disabled)       | If > 0, an idle broker with no peers self-exits after this many ms. The auto-launched broker sets 10 min so it reaps itself; a supervised (systemd) broker leaves it 0 so it never restart-loops. |
 | `OPENAI_API_KEY`            | —                    | Enables auto-summary via gpt-5.4-nano                              |
 
-**`floor_remote_forwards`** (config-file boolean, default `false`): when `true`, a message forwarded from a sibling broker on another machine is left queued for `check_messages` rather than pushed into your live session. Local peers can still push; only cross-machine forwards are floored. Use it if you don't want remote machines typing into your panes.
+**`floor_remote_forwards`** (config-file boolean, default `true`): a message forwarded from a sibling broker on another machine is left queued for `check_messages` rather than pushed into your live session. Local same-machine peers still push into panes; only cross-machine forwards are floored. This is the secure default — a remote machine cannot auto-paste into your live session unless you opt in. To enable cross-node push, set it `false` explicitly. Federation traffic is authenticated only by the source-IP allowlist, so push-by-default would let any allowlisted sibling type a peer-attributed line into every local pane; per-message authentication is tracked as a follow-up before that default is safe.
 
 ## Requirements
 
