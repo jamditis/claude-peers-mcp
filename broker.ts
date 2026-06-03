@@ -413,19 +413,6 @@ if (import.meta.main) {
     return { messages };
   }
 
-  // Peek: return queued messages WITHOUT marking them delivered
-  function handlePeekMessages(body: PollMessagesRequest): PollMessagesResponse {
-    const messages = selectQueued.all(body.id) as Message[];
-    return { messages };
-  }
-
-  // Ack: mark queued message IDs delivered (no-op on rows already delivering/delivered).
-  // Vestigial alongside peek; the dead push path is removed in a later task.
-  function handleAckMessages(body: { ids: number[] }): { ok: boolean } {
-    for (const id of body.ids) markPolled.run(id);
-    return { ok: true };
-  }
-
   // --- Gossip loop ---
   const gossipFailureStates = new Map<string, GossipFailureState>();
 
@@ -549,8 +536,6 @@ if (import.meta.main) {
           case "/list-peers": return Response.json(handleListPeers(body));
           case "/send-message": return Response.json(await handleSendMessage(body));
           case "/poll-messages": return Response.json(handlePollMessages(body));
-          case "/peek-messages": return Response.json(handlePeekMessages(body));
-          case "/ack-messages": return Response.json(handleAckMessages(body));
           case "/unregister":
             deleteUndeliveredForPeer.run(body.id);
             deletePeer.run(body.id);
