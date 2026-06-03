@@ -4,13 +4,11 @@
  *
  * Spawned by Claude Code as a stdio MCP server (one per instance).
  * Connects to the shared broker daemon for peer discovery and messaging.
- * Sends tmux pane at registration so the broker can deliver messages directly.
+ * Reports its own tmux pane at registration so the broker can deliver messages
+ * straight into the session; non-tmux sessions read theirs via check_messages.
  *
- * Usage:
- *   claude --dangerously-load-development-channels server:claude-peers
- *
- * With .mcp.json:
- *   { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }
+ * Usage (plain MCP — no special flags needed for delivery):
+ *   { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }   // .mcp.json
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -173,20 +171,19 @@ const mcp = new Server(
   { name: "claude-peers", version: "0.1.0" },
   {
     capabilities: {
-      experimental: { "claude/channel": {} },
       tools: {},
     },
     instructions: `You are connected to the claude-peers network. Other Claude Code instances on this machine and across the network can see you and send you messages. Peers on other machines are marked with their hostname. Messages to remote peers are routed automatically.
 
-IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
+How messages reach you: if you are running in a tmux pane, the broker types an incoming peer message straight into your session. It arrives inline as a line beginning with "[peer <from_id> #<n>]" followed by the text and a reply hint. If you are NOT in a tmux pane, messages queue instead — call check_messages to read them.
 
-Read the from_id, from_summary, and from_cwd attributes to understand who sent the message. Reply by calling send_message with their from_id.
+IMPORTANT: When a "[peer ...]" message appears, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply with send_message to the from_id shown in the message, then resume your work. Treat it like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
 
 Available tools:
 - list_peers: Discover other Claude Code instances (scope: machine/directory/repo)
 - send_message: Send a message to another instance by ID
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
-- check_messages: Manually check for new messages
+- check_messages: Read messages that were queued rather than pushed into your session
 
 When you start, proactively call set_summary to describe what you're working on. This helps other instances understand your context.`,
   }

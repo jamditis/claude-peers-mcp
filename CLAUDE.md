@@ -10,19 +10,20 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 
 ## Architecture
 
-- `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server.
-- `server.ts` — MCP stdio server, one per Claude Code instance. Connects to broker, exposes tools, pushes channel notifications.
-- `shared/types.ts` — Shared TypeScript types for broker API.
+- `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server. Owns delivery: it routes each message to the recipient's backend (tmux pane via `send-keys`, or none → leave queued for `check_messages`) and runs the lease state machine. `PROTOCOL_VERSION = 2`; a newer MCP server retires an older broker via a version handshake on `/health`.
+- `server.ts` — MCP stdio server, one per Claude Code instance. Registers with the broker, reporting its own tmux pane as a delivery target, and exposes the tools. No channel push — delivery is broker-side.
+- `delivery.ts` — Pure, testable delivery logic (lease state machine, tmux target resolution, bracketed-paste formatting + C0 stripping, ordered next-deliverable selection, liveness probe, retention prune). `broker.ts` composes these; tests import them directly.
+- `shared/types.ts` — Shared types for the broker API, including `PROTOCOL_VERSION` and the `delivery_state` schema.
+- `shared/config.ts` — Config loader. Notable: `floor_remote_forwards` (default false) leaves cross-machine forwards queued for `check_messages` instead of pushing them into the local pane.
 - `shared/summarize.ts` — Auto-summary generation via gpt-5.4-nano.
 - `cli.ts` — CLI utility for inspecting broker state.
 
 ## Running
 
 ```bash
-# Start Claude Code with the channel:
-claude --dangerously-load-development-channels server:claude-peers
-
-# Or just add to .mcp.json and use as regular MCP (no channel push, but tools work):
+# Plain MCP — no channel flags needed. Delivery into a session works when Claude
+# runs inside a tmux pane; otherwise messages queue for check_messages.
+# Add to .mcp.json:
 # { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }
 
 # CLI:
