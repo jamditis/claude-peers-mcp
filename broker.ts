@@ -18,7 +18,7 @@ import type {
 import {
   ensureMessagesTable, migrateMessagesSchema, resetDeliveringOnStart,
   generateLeaseToken, claimForDelivery, confirmDelivered, releaseToQueued,
-  reclaimIfExpired, nextDeliverable, formatPeerMessage,
+  reclaimIfExpired, nextDeliverable, formatPeerMessage, releasableQueuedPrefix,
   deliverViaTmux, isLoopback, isFederationRoute, isPidDead, pidProbe, pruneMessages, type TmuxSpawn,
 } from "./delivery.ts";
 import { PROTOCOL_VERSION } from "./shared/types.ts";
@@ -181,8 +181,10 @@ if (import.meta.main) {
   const insertMessage = db.prepare(
     "INSERT INTO messages (from_id, to_id, text, sent_at) VALUES (?, ?, ?, ?)"
   );
-  const selectQueued = db.prepare(
-    "SELECT * FROM messages WHERE to_id = ? AND delivery_state = 'queued' ORDER BY id ASC"
+  // Poll reads pending (queued OR delivering) in id order so it can stop at an in-flight head
+  // and never release a younger message ahead of an older one a tmux send still owns.
+  const selectPendingForPoll = db.prepare(
+    "SELECT * FROM messages WHERE to_id = ? AND delivery_state IN ('queued','delivering') ORDER BY id ASC"
   );
   const markPolled = db.prepare(
     "UPDATE messages SET delivery_state = 'delivered', lease_expires_at = NULL, lease_token = NULL WHERE id = ? AND delivery_state = 'queued'"
@@ -284,6 +286,14 @@ if (import.meta.main) {
       .get(toId) as { kind: string; pane: string | null; socket: string | null } | null;
   }
 
+  // True only if the recipient is still registered and its pid still probes alive. Used to
+  // re-verify liveness after the tmux send (the lease was claimed before the await), since a
+  // 0 exit from send-keys does not prove a live peer consumed the text.
+  function peerStillLive(toId: string): boolean {
+    const p = db.query("SELECT pid FROM peers WHERE id = ?").get(toId) as { pid: number } | null;
+    return p !== null && !isPidDead(pidProbe(p.pid));
+  }
+
   // Attempt to deliver the recipient's head-of-line row. Serial per recipient.
   // Returns the delivery disposition for an immediately-attempted send, or null
   // when nothing was attempted (blocked / no backend / already in flight).
@@ -307,7 +317,13 @@ if (import.meta.main) {
     try {
       const text = formatPeerMessage(row);
       const ok = await deliverViaTmux(target.pane, target.socket, text, realTmuxSpawn);
-      if (ok && confirmDelivered(db, row.id, token)) return "accepted";
+      // A 0 exit from send-keys is not proof a live peer consumed the text: the recipient can
+      // die after the lease is claimed (before or during the await), leaving a pane that
+      // outlived the Claude process — now a bare shell — that still accepts keystrokes and exits
+      // 0. Re-probe liveness before confirming so a death (or a graceful unregister) mid-send is
+      // not masked as a delivery. If the peer is gone, leave the row queued; cleanStalePeers
+      // drops it honestly when it reaps the dead pid, and retention prune bounds an orphan.
+      if (ok && peerStillLive(toId) && confirmDelivered(db, row.id, token)) return "accepted";
       releaseToQueued(db, row.id, token);
       return "queued";
     } catch {
@@ -439,8 +455,17 @@ if (import.meta.main) {
   }
 
   function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
-    const messages = selectQueued.all(body.id) as Message[];
-    for (const msg of messages) markPolled.run(msg.id);
+    // Release queued mail in id order, but stop at the first 'delivering' row. That row is
+    // older pending mail a tmux send still owns and may requeue on failure; releasing the
+    // queued rows behind it would let the caller observe message n+1 before message n, breaking
+    // the head-of-line ordering this delivery model guarantees. Only a contiguous queued prefix
+    // whose older pending rows are all already delivered is safe to hand out. This handler runs
+    // synchronously (no await), so the rows cannot change underneath the loop.
+    const pending = selectPendingForPoll.all(body.id) as Message[];
+    const messages: Message[] = [];
+    for (const msg of releasableQueuedPrefix(pending)) {
+      if (markPolled.run(msg.id).changes === 1) messages.push(msg);
+    }
     return { messages };
   }
 
