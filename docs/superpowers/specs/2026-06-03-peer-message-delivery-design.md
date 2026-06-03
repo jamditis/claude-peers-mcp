@@ -70,6 +70,13 @@ path is effectively always off.
   hardcoded via env, there is no headless support, and `send-keys` exit 0 only
   proves tmux accepted the keystrokes — not that Claude was at its prompt rather
   than a shell/permission/modal state.
+- **Verified locally (2026-06-03).** On a throwaway private-socket tmux session,
+  `$TMUX_PANE` is inherited through two process hops (pane shell → child →
+  grandchild), so the MCP server — a stdio grandchild of the pane — sees the
+  session's own pane id; and a single chained `tmux send-keys -l <text> ; send-keys
+  Enter` lands the text in a foreground program's stdin. `$TMUX` parsed at the first
+  comma yields the socket path. A private `-S` socket isolates the test from the
+  default tmux server.
 - **The SDK streaming-input mode gives an acked, queued user message, but only for
   a session the caller spawned.** `claude --input-format stream-json
   --output-format stream-json --replay-user-messages`: the caller writes a
@@ -145,33 +152,54 @@ broker resolves the recipient's backend from its own local registration data.
 ### Per-message delivery state and lease
 
 To make concurrent send-time injection, heartbeat flush, and `check_messages`
-safe, every message row carries a delivery state and a lease:
+safe, every message row carries a delivery state and a single-owner lease:
 
 - `delivery_state TEXT NOT NULL DEFAULT 'queued'` — one of `queued`, `delivering`,
   `delivered`.
 - `lease_expires_at INTEGER` (epoch ms, nullable) — set when a row enters
   `delivering`.
+- `lease_token TEXT` (nullable) — a fresh nonce minted on each claim; it names the
+  attempt that owns the row.
 
-Claiming a row for delivery is a single conditional update inside one
-transaction:
+Claiming a row for delivery is a single conditional update inside one transaction:
 
 ```
 UPDATE messages
-   SET delivery_state = 'delivering', lease_expires_at = :now + :lease_ms
+   SET delivery_state = 'delivering', lease_expires_at = :now + :lease_ms,
+       lease_token = :token
  WHERE id = :id AND delivery_state = 'queued'
 ```
 
-Only the writer whose update affected a row proceeds to inject it. On success the
-row goes to `delivered`; on failure it returns to `queued` (lease cleared) for the
-next heartbeat. A `delivering` row whose `lease_expires_at` is in the past is
-reclaimable (covers a broker that crashed mid-delivery). `check_messages`
-(`/poll-messages`) returns and acks only `queued` rows whose lease is not active,
-so it never races a concurrent injection of the same row.
+Only the writer whose update affected a row proceeds to deliver it, holding
+`:token`. On success the row goes to `delivered`; on failure it returns to `queued`
+(lease and token cleared) for the next heartbeat.
 
-Migration: the existing `delivered INTEGER DEFAULT 0` column maps to
-`delivery_state` (`1` → `delivered`, `0` → `queued`); `delivered` may be kept as a
-generated/derived mirror for existing reads or dropped once callers move to
-`delivery_state`.
+Three rules keep the lease from racing an in-flight attempt:
+
+- **Lease outlives the attempt.** `:lease_ms` is strictly greater than the maximum
+  backend attempt timeout (tmux 2s; the launcher ack timeout), so a slow-but-live
+  attempt never has its row reclaimed mid-flight.
+- **The owner guards reclaim.** The broker keeps an in-memory set of row ids it is
+  actively attempting. A `delivering` row is reclaimable by heartbeat only when its
+  `lease_expires_at` is in the past *and* it is not in that set — so the process that
+  owns an attempt is the only one that can reclaim its own row early.
+- **The token gates the ack.** A confirmation (`/ack-message`, or a launcher replay
+  match) moves a row to `delivered` only with
+  `WHERE id = ? AND delivery_state = 'delivering' AND lease_token = ?`. A late ack or
+  replay from a timed-out earlier attempt finds a mismatched (or cleared) token and
+  no-ops, so it can never flip a re-leased row.
+
+`check_messages` (`/poll-messages`) returns and acks only `queued` rows, so it never
+races a concurrent injection of a `delivering` row.
+
+### Migration to delivery_state
+
+`delivery_state` is the single source of truth. On broker start (one-shot,
+idempotent): add `delivery_state`, `lease_expires_at`, `lease_token`; backfill
+`delivery_state` from the old `delivered` column (`1` → `delivered`, else `queued`);
+then drop `delivered`. Every read and write uses `delivery_state` from that point —
+no reader is left interpreting the old column, so a `delivering` row is never
+mistaken for undelivered and surfaced or pruned by accident.
 
 ### The never-ack invariant
 
@@ -180,6 +208,9 @@ A message reaches `delivered` only when one of these confirms it:
 - the launcher reports a stream-json replay ACK, or
 - `tmux send-keys` returns exit code 0 (accepted by pane, best-effort), or
 - `check_messages` (`/poll-messages`) reads it.
+
+Each of the first two confirmations counts only for the attempt holding the row's
+current `lease_token` (see the lease rules), so a stale confirmation cannot ack.
 
 A delivery that cannot be confirmed never sets `delivered` — it returns to
 `queued`. Acking on an unconfirmed push is exactly what made the original
@@ -214,10 +245,15 @@ confirmations above.
   (`GET /deliveries?session=<id>`, server-sent events; reconnect with backoff on
   drop). This stream is a plain HTTP connection held by a non-Claude process, so
   it consumes no Claude tokens — it is the free, broker-side wait Joe approved.
-- On a delivery event: write one stream-json `user` message to the child's stdin,
-  read the replayed `user` event from the child's stdout as the ACK, then
-  `POST /ack-message` to the broker with the message id. If the replay does not
-  arrive within a timeout, do not ack; the broker re-leases the row.
+- At most one in-flight launcher delivery per session at a time: the broker emits
+  the next event only after the prior one is acked or times out. On a delivery event
+  `{ id, lease_token, text }`: write one stream-json `user` message to the child's
+  stdin whose text carries the `#<id>` tag, read the replayed `user` event from the
+  child's stdout, correlate it to the in-flight delivery by that `#<id>` tag (a
+  startup or reconnect replay with no in-flight delivery is ignored), then
+  `POST /ack-message { id, lease_token }`. If the replay does not arrive within a
+  timeout, do not ack; the broker re-leases the row under a new token, so a stale
+  replay arriving later matches nothing in flight.
 - Reaps the child on exit (`await proc.exited`), deregisters from the broker, and
   closes the delivery stream. One child per launcher; no extra spawns per message.
 
@@ -239,12 +275,20 @@ confirmations above.
   - `tmuxAvailable()` — probe `tmux -V` once per broker and cache the result. When
     tmux is absent (typical on Windows), the tmux backend is skipped without
     spawning, so a misconfigured peer can never trigger repeated failed spawns.
-- `handleSendMessage` / `handleForwardMessage`: after insert, claim the row via the
-  lease and attempt the recipient's backend; mark `delivered` only on confirmation;
-  return `{ ok, routed, delivery: "injected" | "accepted" | "queued" }`.
-- `/deliveries` (new): per-session SSE stream the launcher subscribes to.
-  `/ack-message` (new): launcher confirms a message id, moving its row to
-  `delivered`.
+- `handleSendMessage` / `handleForwardMessage`: after insert, attempt immediate
+  delivery only when the new row is the oldest deliverable (`queued` or `delivering`)
+  row for that recipient; otherwise leave it `queued` for the ordered heartbeat drain
+  so a later send cannot overtake an older blocked message. When it does attempt, it
+  claims the row via the lease, delivers through the recipient's backend, marks
+  `delivered` only on confirmation, and returns
+  `{ ok, routed, delivery: "injected" | "accepted" | "queued" }`.
+- `/deliveries` (new): per-session, capability-gated SSE stream the launcher
+  subscribes to; the broker emits one `{ id, lease_token, text }` event at a time per
+  session. The stream is non-durable — while a launcher is disconnected the broker
+  buffers nothing; pending rows stay `queued` and are re-emitted by the heartbeat
+  drain on reconnect, so the stream is never treated as a reliable replay log.
+- `/ack-message` (new): capability-gated; moves a row to `delivered` only on a
+  matching `(id, lease_token)`. A token mismatch no-ops.
 - `/heartbeat`: flush `queued` (unleased) messages to their backend, **one
   injection per stored message** (no coalescing in v1 — each stored message becomes
   one injected user message so the receiver can reply to each), in `id` ASC order,
@@ -262,6 +306,10 @@ confirmations above.
   pane/socket/launcher fields (see below).
 - Add a `SendResult` type:
   `{ ok: boolean; error?: string; routed?: "local" | "remote"; delivery?: "injected" | "accepted" | "queued" }`.
+- `RegisterResponse` returns the session's capability `token`. Add an
+  `AckMessageRequest` type
+  `{ id: number; lease_token: string; token: string }` — the message id, the row's
+  delivery lease token, and the session capability token.
 - `GossipRequest` peers and `ForwardMessageRequest` carry identity and routing
   fields only (id, machine, summary, pid, cwd) — **not** `tmux_pane`,
   `tmux_socket`, or launcher data. Backend resolution is strictly local to the
@@ -317,6 +365,16 @@ ESC[200~[peer <from_id> #<id>] <text>  (reply: send_message to_id="<from_id>")ES
   another machine. Same-user local peers are fully trusted: a same-user process can
   register a pane the broker will inject into, which is acceptable under the
   single-user-per-machine assumption and is documented as such.
+- Bind control-plane calls to the session that owns them with a per-session
+  capability token. At first registration over loopback the broker mints a token and
+  returns it to that session's MCP server (or launcher); the token is then required
+  on `/deliveries`, `/ack-message`, and any later registration that carries pane or
+  launcher coordinates. This stops a different local process from hijacking a
+  delivery stream or spoofing an ack — a spoofed ack would forge a `delivered` and
+  reopen the silent-consume failure. It binds calls to a session; it is not a defense
+  against a hostile same-user process that can read another process's token, which
+  stays out of scope under the single-user-per-machine assumption (strong local or
+  remote auth is tracked in issue #4).
 - Cross-machine traffic keeps the existing IP allowlist. The allowlist is a
   network-location check, not authentication — any process on an allowed host can
   reach `/forward-message` and `/gossip`. Strengthening that boundary (shared
@@ -392,16 +450,27 @@ works on Windows and macOS too.
   hint), `deliverViaTmux` (single chained-keystroke spawn with array args via an
   injected spawn, delivered only on exit 0, child reaped, timeout path).
 - Unit: the lease state machine — a `queued` row claimed by one writer cannot be
-  claimed by a second (the conditional update affects zero rows the second time);
-  an expired `delivering` lease is reclaimable; `check_messages` skips a leased row;
-  a failed push returns the row to `queued`.
+  claimed by a second (the conditional update affects zero rows the second time); an
+  expired `delivering` lease is reclaimable only when not in the active-attempt set;
+  the lease duration exceeds the max backend timeout; an ack with a stale or
+  mismatched `lease_token` no-ops; reclaiming mints a fresh token so a late
+  replay/ack from the prior attempt cannot flip the row; `check_messages` skips a
+  `delivering` row; a failed push returns the row to `queued`.
+- Unit: send-time ordering — when an older `queued`/`delivering` row exists for a
+  recipient, a newly sent message is left queued (not injected ahead of it) and the
+  heartbeat drain delivers in `id` order.
+- Unit: capability — `/deliveries` and `/ack-message` reject a missing or wrong
+  token; a pane-carrying re-registration without the session token is refused.
 - Unit: `handleSendMessage` marks delivered on confirmation and leaves queued on
   failure; heartbeat flush drains in `id` order, one injection per message, stops on
   first failure, skips leased rows.
-- Launcher: `deliverViaLauncher` resolves only after the launcher acks; a launcher
-  ack moves the row to `delivered`; a launcher timeout returns it to `queued`; the
-  child is spawned once and reaped on exit. (stream-json framing and replay parsing
-  tested against a fake child process.)
+- Launcher: `deliverViaLauncher` resolves only after the launcher acks with the
+  matching `(id, lease_token)`; a launcher ack moves the row to `delivered`; a
+  launcher timeout returns it to `queued`; only one delivery is in flight per session
+  at a time; a replayed `user` event is correlated to its delivery by the `#<id>` tag
+  (a startup/reconnect replay with no in-flight delivery is ignored); the child is
+  spawned once and reaped on exit. (stream-json framing and replay parsing tested
+  against a fake child process.)
 - Integration: extend the existing two-broker harness — inject to a fake tmux
   target and assert `accepted`; deliver to a fake launcher session and assert
   `injected` after its ack; a `none` peer yields `queued` and stays retrievable via
