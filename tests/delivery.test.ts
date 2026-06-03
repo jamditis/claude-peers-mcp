@@ -8,7 +8,7 @@ import {
 } from "../delivery.ts";
 import { resolveTmuxTarget, formatPeerMessage, PASTE_START, PASTE_END } from "../delivery.ts";
 import { deliverViaTmux, buildTmuxArgs, type TmuxSpawn } from "../delivery.ts";
-import { nextDeliverable, isLoopback, isPidDead, pruneMessages } from "../delivery.ts";
+import { nextDeliverable, isLoopback, isFederationRoute, isPidDead, pruneMessages } from "../delivery.ts";
 
 const DB = "/tmp/test-delivery-migration.db";
 
@@ -310,6 +310,22 @@ describe("isLoopback", () => {
     // broker.ts falls back to "unknown" when server.requestIP returns null;
     // a request with no socket address must never count as loopback.
     expect(isLoopback("unknown")).toBe(false);
+  });
+});
+
+describe("isFederationRoute", () => {
+  it("exempts only the two federation routes from the loopback gate", () => {
+    expect(isFederationRoute("/gossip")).toBe(true);
+    expect(isFederationRoute("/forward-message")).toBe(true);
+  });
+  it("treats every control-plane route as loopback-only (not federation)", () => {
+    // These all drive a local session — a remote allowlisted sibling must never reach them.
+    // /send-message and /heartbeat type into a local tmux pane; /register asserts a delivery
+    // target; /poll-messages drains a queue; /retire kills the broker.
+    for (const path of ["/register", "/heartbeat", "/set-summary", "/list-peers",
+      "/send-message", "/poll-messages", "/unregister", "/retire", "/health", "/unknown", "/"]) {
+      expect(isFederationRoute(path)).toBe(false);
+    }
   });
 });
 

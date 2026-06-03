@@ -19,14 +19,13 @@ import {
   ensureMessagesTable, migrateMessagesSchema, resetDeliveringOnStart,
   generateLeaseToken, claimForDelivery, confirmDelivered, releaseToQueued,
   reclaimIfExpired, nextDeliverable, formatPeerMessage,
-  deliverViaTmux, isLoopback, isPidDead, pidProbe, pruneMessages, type TmuxSpawn,
+  deliverViaTmux, isLoopback, isFederationRoute, isPidDead, pidProbe, pruneMessages, type TmuxSpawn,
 } from "./delivery.ts";
 import { PROTOCOL_VERSION } from "./shared/types.ts";
 
 const GOSSIP_INTERVAL_MS = 5_000;
 const CLEANUP_INTERVAL_MS = 15_000;
 const REMOTE_TTL_MS = 30_000;
-const STALE_PEER_MS = 45_000;       // 3x heartbeat — a live session always heartbeats
 const DELIVERED_TTL_MS = 60_000;
 const QUEUED_MAX_AGE_MS = 24 * 60 * 60_000; // lossy backstop
 const GOSSIP_SUMMARY_INTERVAL_MS = 5 * 60_000;
@@ -198,20 +197,22 @@ if (import.meta.main) {
   const activeRowIds = new Set<number>();
   const recipientsInFlight = new Set<string>();
 
-  // --- Clean stale peers ---
+  // --- Clean dead peers ---
   function cleanStalePeers() {
-    const peers = db.query("SELECT id, pid, last_seen FROM peers").all() as { id: string; pid: number; last_seen: string }[];
-    const staleCutoff = new Date(Date.now() - STALE_PEER_MS).toISOString();
+    const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
     for (const peer of peers) {
-      const dead = isPidDead(pidProbe(peer.pid));
-      const stale = peer.last_seen < staleCutoff;
-      if (!dead && !stale) continue;
+      // The pid probe is the only authoritative deadness signal (ESRCH alone — a foreign live
+      // pid gives EPERM and is NOT dead). A heartbeat gap never deletes a peer: a live but
+      // briefly stalled session (machine sleep, load spike, a wedged event loop) would
+      // otherwise lose its queued mail permanently and vanish from listings with no way to
+      // re-register. Mail for a genuinely abandoned-but-alive peer ages out via the
+      // queued-max-age backstop below, not on a transient gap.
+      if (!isPidDead(pidProbe(peer.pid))) continue;
       // Never delete a recipient's rows while one of its messages is mid-delivery:
       // deliverNext awaits the tmux spawn, and deleting the 'delivering' row out from
       // under it would corrupt the lease and could drop a message the pane already
       // received. Defer this peer to the next sweep, after the attempt finishes.
       if (recipientsInFlight.has(peer.id)) continue;
-      // Deregistration is the message-deletion trigger (not the probe itself).
       deleteUndeliveredForPeer.run(peer.id);
       deletePeer.run(peer.id);
     }
@@ -550,6 +551,18 @@ if (import.meta.main) {
         return new Response("claude-peers broker (federated)", { status: 200 });
       }
 
+      // Control plane is loopback-only; the federation allowlist authorizes only /gossip and
+      // /forward-message. Every other POST drives a local session (registers delivery targets,
+      // injects into a tmux pane via deliverNext, drains a queue, retires the broker), so a
+      // remote allowlisted sibling must not reach it directly — it reaches local peers only
+      // through /forward-message, which this broker originates after resolving the target.
+      // Gate before parsing the body and before bumping the idle window: an unauthorized
+      // request is neither trusted input nor real traffic.
+      if (!isFederationRoute(path) && !isLoopback(clientIp)) {
+        console.error(`[claude-peers broker] rejected non-loopback control-plane ${path} from ${clientIp}`);
+        return Response.json({ error: "forbidden" }, { status: 403 });
+      }
+
       try {
         const body = await req.json();
         lastActivityAt = Date.now(); // any POST is real traffic; refreshes the idle window
@@ -560,14 +573,9 @@ if (import.meta.main) {
           return Response.json({ ok: false, error: "broker retiring" }, { status: 503 });
         }
         switch (path) {
-          case "/register": {
-            const fromLoopback = isLoopback(clientIp);
-            const safeBody = fromLoopback ? body : { ...body, tmux_pane: null, tmux_socket: null };
-            if (!fromLoopback && (body.tmux_pane || body.tmux_socket)) {
-              console.error(`[claude-peers broker] dropping pane coordinates from non-loopback register (${clientIp})`);
-            }
-            return Response.json(handleRegister(safeBody));
-          }
+          case "/register":
+            // Loopback-only (gated above), so the pane/socket coordinates are trusted here.
+            return Response.json(handleRegister(body));
           case "/heartbeat": {
             updateLastSeen.run(new Date().toISOString(), body.id);
             // Drain this recipient's queued backlog in id order (serial per recipient),
@@ -598,10 +606,8 @@ if (import.meta.main) {
           case "/gossip": return Response.json(handleGossip(body));
           case "/forward-message": return Response.json(await handleForwardMessage(body));
           case "/retire": {
-            // Privileged admin op: only a local caller may retire the broker. The allowlist
-            // can include remote federation siblings, so without this a remote allowlisted
-            // host could kill the broker (a DoS on the sessions it serves).
-            if (!isLoopback(clientIp)) return Response.json({ error: "forbidden" }, { status: 403 });
+            // Loopback-gated above with the rest of the control plane: only a local caller may
+            // retire the broker, so a remote allowlisted sibling cannot DoS the sessions it serves.
             void retire();
             return Response.json({ ok: true });
           }
