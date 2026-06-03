@@ -7,6 +7,7 @@ import {
   releaseToQueued, resetDeliveringOnStart, reclaimIfExpired,
 } from "../delivery.ts";
 import { resolveTmuxTarget, formatPeerMessage, PASTE_START, PASTE_END } from "../delivery.ts";
+import { deliverViaTmux, buildTmuxArgs, type TmuxSpawn } from "../delivery.ts";
 
 const DB = "/tmp/test-delivery-migration.db";
 
@@ -211,5 +212,34 @@ describe("formatPeerMessage", () => {
   it("strips control bytes from from_id too", () => {
     const out = formatPeerMessage({ id: 2, from_id: "x\x1b[201~", text: "hi" });
     expect(out.indexOf(PASTE_END)).toBe(out.lastIndexOf(PASTE_END)); // still only the wrapper
+  });
+});
+
+describe("buildTmuxArgs", () => {
+  it("chains both send-keys in one tmux invocation, with -S when socketed", () => {
+    expect(buildTmuxArgs("%2", "/tmp/sock", "TXT")).toEqual([
+      "tmux", "-S", "/tmp/sock", "send-keys", "-t", "%2", "-l", "TXT",
+      ";", "send-keys", "-t", "%2", "Enter",
+    ]);
+  });
+  it("omits -S when there is no socket", () => {
+    expect(buildTmuxArgs("%2", null, "TXT")).toEqual([
+      "tmux", "send-keys", "-t", "%2", "-l", "TXT", ";", "send-keys", "-t", "%2", "Enter",
+    ]);
+  });
+});
+
+describe("deliverViaTmux", () => {
+  it("returns true on exit 0", async () => {
+    const spawn: TmuxSpawn = async () => ({ exitCode: 0 });
+    expect(await deliverViaTmux("%1", null, "hi", spawn)).toBe(true);
+  });
+  it("returns false on non-zero exit", async () => {
+    const spawn: TmuxSpawn = async () => ({ exitCode: 1 });
+    expect(await deliverViaTmux("%1", null, "hi", spawn)).toBe(false);
+  });
+  it("returns false when the spawn throws (timeout/abort)", async () => {
+    const spawn: TmuxSpawn = async () => { throw new Error("timed out"); };
+    expect(await deliverViaTmux("%1", null, "hi", spawn)).toBe(false);
   });
 });

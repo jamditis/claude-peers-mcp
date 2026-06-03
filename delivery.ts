@@ -128,3 +128,30 @@ export function formatPeerMessage(msg: { id: number; from_id: string; text: stri
   const body = `[peer ${from} #${msg.id}] ${text}  (reply: send_message to_id="${from}")`;
   return `${PASTE_START}${body}${PASTE_END}`;
 }
+
+export type TmuxSpawn = (args: string[]) => Promise<{ exitCode: number }>;
+
+/** Build the argv for one tmux process that types the text then presses Enter. */
+export function buildTmuxArgs(pane: string, socket: string | null, text: string): string[] {
+  const args = ["tmux"];
+  if (socket) args.push("-S", socket);
+  args.push("send-keys", "-t", pane, "-l", text, ";", "send-keys", "-t", pane, "Enter");
+  return args;
+}
+
+/** Inject text into a pane via one tmux spawn. Success iff tmux exits 0. */
+export async function deliverViaTmux(
+  pane: string, socket: string | null, text: string, spawn: TmuxSpawn,
+): Promise<boolean> {
+  try {
+    const { exitCode } = await spawn(buildTmuxArgs(pane, socket, text));
+    return exitCode === 0;
+  } catch (e) {
+    // A non-zero exit is handled above; reaching here means the spawn itself
+    // rejected (a bug or environment fault, not a normal failed delivery). The
+    // message still stays queued — never silently dropped — but the fault is
+    // logged so it does not vanish, unlike the ordinary non-zero-exit miss.
+    console.error(`[claude-peers broker] tmux delivery spawn error for pane ${pane}:`, e);
+    return false;
+  }
+}
