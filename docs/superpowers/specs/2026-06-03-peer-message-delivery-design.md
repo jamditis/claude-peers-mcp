@@ -305,6 +305,31 @@ no `IF [NOT] EXISTS` and a second start would otherwise throw:
   sees the finished schema or no-ops on the pragma guard — it never observes a
   half-migrated state. (SQLite serializes writers; it will not corrupt the file.)
 
+### Broker version handshake (upgrade activation)
+
+The migration and crash-recovery only run when a **new** broker process wins the
+bind race. But `ensureBroker` (server.ts) connects to *any* healthy broker already
+on the port, so after a code upgrade an old detached broker (pre-M1 schema, no tmux
+delivery, no startup reset) can keep serving and the new code would silently talk
+to it — M1 would appear to do nothing until a manual `kill-broker`. The schema
+migrated, but the running process did not.
+
+To make an upgrade self-activating:
+
+- Bump the existing `PROTOCOL_VERSION` constant (currently `1`) for M1's
+  `delivery_state` schema and delivery backends, and report it on `/health`
+  (`{ ok, protocol_version }`).
+- `ensureBroker` checks the running broker's `protocol_version`. If it is older than
+  the version this server requires, the server sends a loopback `/retire` to the old
+  broker, which sets a flag to exit at its next idle check — reusing the self-exit
+  machinery (drain in-flight deliveries, then exit) so no message is dropped. The
+  server then waits for the port to free and relaunches a current broker.
+- If the old broker does not retire within a short timeout, the server **fails
+  closed** with a clear message ("a stale claude-peers broker is running; run
+  `bun cli.ts kill-broker`") rather than proceeding against an incompatible daemon.
+- A newer broker than the server (downgrade) is left alone; the server logs and
+  uses it, since a newer broker is a superset.
+
 ### The never-ack invariant
 
 In M1 a message reaches `delivered` only when one of these confirms it:
@@ -451,15 +476,22 @@ ESC[200~[peer <from_id> #<id>] <text>  (reply: send_message to_id="<from_id>")ES
   tracked in issue #4.
 - Cross-machine traffic keeps the existing IP allowlist. The allowlist is a
   network-location check, not authentication — any process on an allowed host can
-  reach `/forward-message` and `/gossip`. This redesign raises the impact of that
-  gap: a forged `/forward-message` previously sat queued until the recipient chose
-  to `check_messages`, whereas event-driven delivery now auto-injects it as a
-  peer-attributed user line into a live session. Any process on an allowlisted host
-  can therefore push attacker-chosen, arbitrarily-attributed text in front of a
-  running Claude. The shared-secret/mTLS work in issue #4 should land before or
-  alongside enabling cross-machine auto-injection by default; until then,
-  cross-machine forwards could be gated to the `check_messages` floor (no
-  auto-inject) to keep the deferred-auth surface at its pre-redesign level.
+  reach `/forward-message` and `/gossip`. **M1 decision (2026-06-03): a forwarded
+  cross-machine message auto-injects, the same as a local one** — the recipient
+  broker resolves its own backend and pushes. This is the headline feature for a
+  multi-node fleet (peers across machines getting messages on their own), and the
+  allowlist is the trust boundary the system already relies on for `/forward-message`.
+  The accepted risk, documented here rather than claimed away: this redesign raises
+  the impact of the allowlist gap from "a forged forward sits queued until the
+  recipient calls `check_messages`" to "a forged forward is injected as a
+  peer-attributed user line in front of a running Claude," so a compromised process
+  on an allowlisted host can push attacker-chosen, arbitrarily-attributed text into
+  a live session. This is acceptable under the trusted-fleet, single-user-per-machine
+  model. Issue #4 (shared secret / mTLS) is the **hardening**, not a prerequisite. A
+  config flag (`floor_remote_forwards`, default off) lets a deployment opt into
+  floor-only cross-machine behavior — forwards stay `queued` and surface via
+  `check_messages` — without code changes, for anyone who does not accept the
+  trusted-fleet assumption.
 
 ## Resource hygiene and cross-platform safety
 
@@ -515,14 +547,22 @@ M2.
 ### Memory and storage
 
 - A periodic prune runs inside the existing cleanup timer: delete `delivered`
-  messages older than a short TTL, and drop `queued` messages older than a max age.
-  The `queued`-row prune is gated on recipient liveness: only drop a `queued` row
-  whose recipient peer has been deregistered (ESRCH sweep) or whose session
-  unregistered — a `queued` row for a still-live but temporarily-disconnected peer
-  is kept until it reconnects. Growth stays bounded because a dead recipient's
-  messages are removed on unregister. If a hard wall-clock cap is later added as a
-  backstop, it must log each dropped row and the spec must state it is lossy (a
-  still-live peer offline longer than the cap can lose aged messages).
+  messages older than a short TTL, and bound `queued`-row growth. The pid probe
+  alone cannot bound storage — an `EPERM` peer is intentionally kept and Windows pid
+  liveness is unverified, so a crashed session that never unregisters would
+  otherwise retain its peer row and queued messages forever. The bound therefore
+  rests on a **heartbeat-staleness expiry**, not the pid probe: a local peer whose
+  `last_seen` is older than a staleness window (a small multiple of the 15s
+  heartbeat interval) is presumed gone, deregistered, and its `queued` messages
+  become prunable. This is non-lossy for a live session — every backend-eligible M1
+  session (tmux and `none`) heartbeats every 15s from its MCP server, so a missing
+  heartbeat genuinely means the session is gone, not merely busy. (The
+  temporarily-disconnected-but-live case belongs to the M2 launcher, which carries
+  its own heartbeat producer.)
+- A hard wall-clock max-age cap on `queued` rows is the final backstop for any
+  pathological case the staleness expiry misses. It is lossy by definition, so it
+  logs each dropped row, and the spec states plainly that a peer offline longer than
+  the cap can lose aged messages. `check_messages` remains the floor up to that cap.
 - `gossipFailureStates` is bounded by sibling count. Removing the message poll loop
   also removes its per-session timer.
 
