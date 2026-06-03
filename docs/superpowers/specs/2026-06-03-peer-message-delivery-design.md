@@ -321,9 +321,16 @@ To make an upgrade self-activating:
   (`{ ok, protocol_version }`).
 - `ensureBroker` checks the running broker's `protocol_version`. If it is older than
   the version this server requires, the server sends a loopback `/retire` to the old
-  broker, which sets a flag to exit at its next idle check — reusing the self-exit
-  machinery (drain in-flight deliveries, then exit) so no message is dropped. The
-  server then waits for the port to free and relaunches a current broker.
+  broker. Retirement is a **distinct mode, not idle self-exit**: idle self-exit
+  refuses to fire while peers are live (zero-peers + 10-min idle), which is exactly
+  the upgrade case, so it cannot be reused here. On `/retire` the old broker stops
+  accepting new registrations and sends/forwards, drains any in-flight (`delivering`)
+  attempts with a short bounded wait, then exits **even with peers still
+  registered**. No message is dropped: `queued` rows persist in the shared SQLite DB
+  that the incoming broker opens, and the incoming broker's startup crash-recovery
+  resets any still-`delivering` row back to `queued`. Live peers re-register with the
+  new broker on their next 15s heartbeat. The server waits for the port to free and
+  relaunches a current broker.
 - If the old broker does not retire within a short timeout, the server **fails
   closed** with a clear message ("a stale claude-peers broker is running; run
   `bun cli.ts kill-broker`") rather than proceeding against an incompatible daemon.
