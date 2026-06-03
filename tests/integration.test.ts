@@ -446,3 +446,93 @@ describe("empty-broker self-exit", () => {
     }
   }, 15_000);
 });
+
+// A recipient's own /unregister must not tear down a delivery already in flight to it.
+// If it deletes the peer row while a tmux send-keys is mid-spawn, the lease resolves
+// against a now-missing peer: peerStillLive() rejects, releaseToQueued() requeues the
+// row under the deleted id, and nothing — no heartbeat, no check_messages — can ever
+// drain it until the 24h prune. So the whole unregister defers while mid-delivery; the
+// peer stays addressable until the lease resolves, then cleanStalePeers reaps it once
+// the pid probes dead. A tmux stub that parks on a fifo makes the in-flight window
+// deterministic (marker file + fifo handshake — no sleeps, no timing guesses).
+describe("unregister during in-flight delivery defers peer deletion", () => {
+  const PORT = 17910;
+  let proc: any;
+  let dir: string;
+  let fifo: string;
+  let marker: string;
+
+  beforeAll(async () => {
+    dir = mkdtempSync(join(tmpdir(), "block-tmux-"));
+    fifo = join(dir, "gate.fifo");
+    marker = join(dir, "started");
+    Bun.spawnSync(["mkfifo", fifo]);
+    const stub = join(dir, "tmux");
+    // -V answers the availability probe and returns at once. The real send-keys
+    // invocation signals it started (marker), then blocks reading the fifo until the
+    // test releases it — holding the delivery in flight for as long as the test wants.
+    writeFileSync(stub,
+      `#!/usr/bin/env bash\n` +
+      `if [ "$1" = "-V" ]; then echo "tmux 3.4"; exit 0; fi\n` +
+      `echo started > "${marker}"\n` +
+      `cat "${fifo}" > /dev/null\n` +
+      `exit 0\n`);
+    chmodSync(stub, 0o755);
+    await Bun.write(join(dir, "config.json"), JSON.stringify({
+      machine: "unreg-a", tailscale_ip: "127.0.0.1", port: PORT,
+      id_prefix: "ura", siblings: [], allowed_ips: ["127.0.0.1"],
+    }));
+    proc = Bun.spawn(["bun", "broker.ts"], {
+      env: {
+        ...process.env,
+        CLAUDE_PEERS_CONFIG: join(dir, "config.json"),
+        CLAUDE_PEERS_DB: join(dir, "broker.db"),
+        PATH: `${dir}:${process.env.PATH}`, // stub tmux wins
+      },
+      stdout: "ignore", stderr: "inherit",
+    });
+    for (let i = 0; i < 20; i++) {
+      try { if ((await fetch(`http://127.0.0.1:${PORT}/health`)).ok) break; } catch {}
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  });
+
+  afterAll(() => {
+    proc?.kill();
+  });
+
+  it("keeps the peer registered while a delivery to it is in flight", async () => {
+    // pid = this live process so list-peers does not filter the peer for being dead.
+    const reg = await brokerFetch(PORT, "/register", {
+      pid: process.pid, cwd: "/tmp/u1", git_root: null, tty: null, summary: "",
+      machine: "unreg-a", tailscale_ip: "127.0.0.1", tmux_pane: "%5", tmux_socket: null,
+    }) as any;
+
+    // Fire the send WITHOUT awaiting: the broker claims the lease, spawns the stub, and
+    // parks on the fifo — the delivery is now in flight and /send-message stays pending.
+    const sendPromise = brokerFetch(PORT, "/send-message", {
+      from_id: "ura-sender0", to_id: reg.id, text: "in flight",
+    });
+
+    try {
+      // Wait for the stub to signal start: a deterministic "now in flight" edge.
+      for (let i = 0; i < 60 && !existsSync(marker); i++) await new Promise((r) => setTimeout(r, 50));
+      expect(existsSync(marker)).toBe(true);
+
+      // Recipient unregisters mid-delivery. The fix defers and keeps the peer; without
+      // it deletePeer ran unconditionally and the peer would be gone here.
+      await brokerFetch(PORT, "/unregister", { id: reg.id });
+
+      const peers = await brokerFetch(PORT, "/list-peers", {
+        scope: "machine", cwd: "/tmp/u1", git_root: null,
+      }) as any[];
+      expect(peers.some((p) => p.id === reg.id)).toBe(true);
+    } finally {
+      // Release the parked delivery so the broker is not left holding it for teardown.
+      if (existsSync(marker)) {
+        writeFileSync(fifo, "go");
+        await sendPromise.catch(() => {});
+      }
+    }
+  }, 15_000);
+});

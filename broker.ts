@@ -631,14 +631,22 @@ if (import.meta.main) {
           case "/send-message": return Response.json(await handleSendMessage(body));
           case "/poll-messages": return Response.json(handlePollMessages(body));
           case "/unregister":
-            // A delivery in flight to this peer holds an active lease on its 'delivering' row;
-            // deleting that row here would pull it out from under the lease, corrupting the
-            // state machine and risking a dropped message the pane already received. Skip the
-            // message sweep while mid-delivery (cleanStalePeers uses the same guard) — the
-            // in-flight attempt resolves its own row, and any other queued rows for this
-            // now-departed peer age out via retention prune. The peer row goes either way, so
-            // the session disappears from listings immediately on a graceful exit.
-            if (!recipientsInFlight.has(body.id)) deleteUndeliveredForPeer.run(body.id);
+            // A peer id is ephemeral (a fresh generatePeerId per session), so a session's
+            // undelivered mail is addressed to an id no future session will ever poll. On a
+            // graceful exit we delete it: keeping it would not make it deliverable, only leave
+            // an unreachable row to age out. That deletion is the documented model.
+            //
+            // But not while a delivery to this peer is in flight. The head row is 'delivering'
+            // under an active lease, and deleting the *peer* row (even while sparing the message
+            // row) strands the attempt's resolution: peerStillLive() would reject, releaseToQueued
+            // would requeue the row under a now-deleted id, and nothing could ever drain it before
+            // the 24h prune. So defer the whole unregister while mid-delivery — peer row included —
+            // exactly as cleanStalePeers does. The in-flight attempt resolves against a peer that
+            // still exists (confirm, or requeue), and cleanStalePeers reaps the peer and its rows
+            // on its next sweep once the pid probes dead. list-peers already filters dead pids, so
+            // the session still disappears from listings immediately either way.
+            if (recipientsInFlight.has(body.id)) return Response.json({ ok: true });
+            deleteUndeliveredForPeer.run(body.id);
             deletePeer.run(body.id);
             return Response.json({ ok: true });
           case "/gossip": return Response.json(handleGossip(body));
