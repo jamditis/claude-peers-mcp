@@ -6,6 +6,7 @@ import {
   generateLeaseToken, claimForDelivery, confirmDelivered,
   releaseToQueued, resetDeliveringOnStart, reclaimIfExpired,
 } from "../delivery.ts";
+import { resolveTmuxTarget, formatPeerMessage, PASTE_START, PASTE_END } from "../delivery.ts";
 
 const DB = "/tmp/test-delivery-migration.db";
 
@@ -165,5 +166,50 @@ describe("lease state machine", () => {
     claimForDelivery(db, id, 1000, 5000, "tok1"); // expires at 6000
     expect(reclaimIfExpired(db, id, 6000)).toBe(true); // boundary is inclusive
     expect(state(db, id).delivery_state).toBe("queued");
+  });
+});
+
+describe("resolveTmuxTarget", () => {
+  it("accepts a valid pane and socket", () => {
+    expect(resolveTmuxTarget({ TMUX_PANE: "%3", TMUX: "/tmp/tmux-1000/default,1234,0" }))
+      .toEqual({ pane: "%3", socket: "/tmp/tmux-1000/default" });
+  });
+  it("returns null for a missing or malformed pane", () => {
+    expect(resolveTmuxTarget({})).toBeNull();
+    expect(resolveTmuxTarget({ TMUX_PANE: "3" })).toBeNull();
+    expect(resolveTmuxTarget({ TMUX_PANE: "%3; rm -rf" })).toBeNull();
+  });
+  it("drops a non-absolute socket but keeps the pane", () => {
+    expect(resolveTmuxTarget({ TMUX_PANE: "%0", TMUX: "relative,1,0" }))
+      .toEqual({ pane: "%0", socket: null });
+  });
+});
+
+describe("formatPeerMessage", () => {
+  it("wraps in bracketed paste with the id tag and reply hint", () => {
+    const out = formatPeerMessage({ id: 7, from_id: "ofj-abc", text: "ping" });
+    expect(out.startsWith(PASTE_START)).toBe(true);
+    expect(out.endsWith(PASTE_END)).toBe(true);
+    expect(out).toContain("[peer ofj-abc #7] ping");
+    expect(out).toContain('(reply: send_message to_id="ofj-abc")');
+  });
+  it("keeps embedded newlines inside the paste wrap", () => {
+    const out = formatPeerMessage({ id: 1, from_id: "x", text: "a\nb" });
+    expect(out).toContain("a\nb");
+    expect(out.indexOf("\n")).toBeGreaterThan(out.indexOf(PASTE_START));
+  });
+  it("strips control bytes so peer text cannot break out of the paste wrap", () => {
+    // A peer that smuggles the PASTE_END sequence + a newline could otherwise close
+    // the paste early and have the tail land as live keystrokes in the recipient.
+    const out = formatPeerMessage({ id: 1, from_id: "x", text: "evil\x1b[201~\nrm -rf safe" });
+    // The only PASTE_END left is the wrapper at the very end — none smuggled via text.
+    expect(out.indexOf(PASTE_END)).toBe(out.lastIndexOf(PASTE_END));
+    expect(out.endsWith(PASTE_END)).toBe(true);
+    expect(out).not.toContain("\x1b[201~\n"); // the breakout sequence is gone
+    expect(out).toContain("rm -rf safe");     // text survives, defanged not deleted
+  });
+  it("strips control bytes from from_id too", () => {
+    const out = formatPeerMessage({ id: 2, from_id: "x\x1b[201~", text: "hi" });
+    expect(out.indexOf(PASTE_END)).toBe(out.lastIndexOf(PASTE_END)); // still only the wrapper
   });
 });

@@ -94,3 +94,37 @@ export function resetDeliveringOnStart(db: Database): number {
   );
   return res.changes;
 }
+
+export const PASTE_START = "\x1b[200~";
+export const PASTE_END = "\x1b[201~";
+
+/** Validate a session's own $TMUX/$TMUX_PANE into a delivery target, or null. */
+export function resolveTmuxTarget(
+  env: { TMUX?: string | null; TMUX_PANE?: string | null },
+): { pane: string; socket: string | null } | null {
+  const pane = env.TMUX_PANE ?? "";
+  if (!/^%\d+$/.test(pane)) return null;
+  let socket: string | null = null;
+  if (env.TMUX) {
+    const candidate = env.TMUX.split(",")[0];
+    if (candidate && candidate.startsWith("/")) socket = candidate;
+  }
+  return { pane, socket };
+}
+
+// Strip C0 control characters (except tab and newline) from peer-controlled fields.
+// Critically this removes ESC (0x1b), which neutralizes the bracketed-paste END
+// sequence: without it, a peer whose text contained the PASTE_END bytes could close
+// the paste wrap early and have the trailing bytes land as live keystrokes in the
+// recipient's session. Newlines are kept so a multi-line message still pastes as one.
+function stripControl(s: string): string {
+  return s.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
+}
+
+/** Build the bracketed-paste-wrapped peer line. A single trailing Enter submits it. */
+export function formatPeerMessage(msg: { id: number; from_id: string; text: string }): string {
+  const from = stripControl(msg.from_id);
+  const text = stripControl(msg.text);
+  const body = `[peer ${from} #${msg.id}] ${text}  (reply: send_message to_id="${from}")`;
+  return `${PASTE_START}${body}${PASTE_END}`;
+}
