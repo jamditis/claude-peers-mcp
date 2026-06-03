@@ -187,3 +187,35 @@ export function isLoopback(ip: string): boolean {
   const n = ip.startsWith("::ffff:") ? ip.slice(7) : ip;
   return n === "127.0.0.1" || n === "::1";
 }
+
+/**
+ * Decide deadness from a process-existence probe. Only ESRCH (no such process)
+ * counts as dead; EPERM/EACCES means alive-but-foreign and must NOT be treated as
+ * dead. The probe is injected so tests can supply the error code.
+ */
+export function isPidDead(probe: (e: Error) => void): boolean {
+  try { probe(new Error("probe")); return false; }
+  catch (e: any) { return e?.code === "ESRCH"; }
+}
+
+/** The standard probe: signal 0 to a pid. */
+export function pidProbe(pid: number): (e: Error) => void {
+  return () => { process.kill(pid, 0); };
+}
+
+/**
+ * Bound the messages table: delete delivered rows older than the ttl, and queued
+ * rows older than the lossy max-age backstop. Returns counts for logging. The
+ * primary bound is the heartbeat-staleness peer sweep (broker side); this is the
+ * final backstop.
+ */
+export function pruneMessages(
+  db: Database,
+  opts: { deliveredTtlMs: number; queuedMaxAgeMs: number; nowMs: number },
+): { deliveredPruned: number; queuedPruned: number } {
+  const deliveredCutoff = new Date(opts.nowMs - opts.deliveredTtlMs).toISOString();
+  const queuedCutoff = new Date(opts.nowMs - opts.queuedMaxAgeMs).toISOString();
+  const d = db.run("DELETE FROM messages WHERE delivery_state='delivered' AND sent_at < ?", [deliveredCutoff]);
+  const q = db.run("DELETE FROM messages WHERE delivery_state='queued' AND sent_at < ?", [queuedCutoff]);
+  return { deliveredPruned: d.changes, queuedPruned: q.changes };
+}

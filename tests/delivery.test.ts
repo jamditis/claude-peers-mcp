@@ -8,7 +8,7 @@ import {
 } from "../delivery.ts";
 import { resolveTmuxTarget, formatPeerMessage, PASTE_START, PASTE_END } from "../delivery.ts";
 import { deliverViaTmux, buildTmuxArgs, type TmuxSpawn } from "../delivery.ts";
-import { nextDeliverable, isLoopback } from "../delivery.ts";
+import { nextDeliverable, isLoopback, isPidDead, pruneMessages } from "../delivery.ts";
 
 const DB = "/tmp/test-delivery-migration.db";
 
@@ -302,5 +302,40 @@ describe("isLoopback", () => {
     // broker.ts falls back to "unknown" when server.requestIP returns null;
     // a request with no socket address must never count as loopback.
     expect(isLoopback("unknown")).toBe(false);
+  });
+});
+
+describe("isPidDead", () => {
+  it("treats ESRCH as dead", () => {
+    expect(isPidDead((e) => { (e as any).code = "ESRCH"; throw e; })).toBe(true);
+  });
+  it("treats EPERM (alive-but-foreign) as not dead", () => {
+    expect(isPidDead((e) => { (e as any).code = "EPERM"; throw e; })).toBe(false);
+  });
+  it("treats a clean probe as alive", () => {
+    expect(isPidDead(() => {})).toBe(false);
+  });
+});
+
+const PDB = "/tmp/test-delivery-prune.db";
+describe("pruneMessages", () => {
+  let db: Database;
+  beforeEach(() => { try { unlinkSync(PDB); } catch {} db = new Database(PDB); ensureMessagesTable(db); });
+  afterEach(() => { db.close(); try { unlinkSync(PDB); } catch {} });
+
+  it("removes delivered older than ttl and over-age queued, keeps fresh", () => {
+    const now = Date.now();
+    const old = new Date(now - 10 * 60_000).toISOString();
+    const fresh = new Date(now).toISOString();
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,delivery_state) VALUES ('a','b','old-del',?,'delivered')", [old]);
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,delivery_state) VALUES ('a','b','fresh-del',?,'delivered')", [fresh]);
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,delivery_state) VALUES ('a','b','old-q',?,'queued')", [old]);
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,delivery_state) VALUES ('a','b','fresh-q',?,'queued')", [fresh]);
+
+    const res = pruneMessages(db, { deliveredTtlMs: 60_000, queuedMaxAgeMs: 5 * 60_000, nowMs: now });
+    expect(res.deliveredPruned).toBe(1);
+    expect(res.queuedPruned).toBe(1);
+    const texts = (db.query("SELECT text FROM messages ORDER BY id").all() as any[]).map((r) => r.text);
+    expect(texts).toEqual(["fresh-del", "fresh-q"]);
   });
 });
