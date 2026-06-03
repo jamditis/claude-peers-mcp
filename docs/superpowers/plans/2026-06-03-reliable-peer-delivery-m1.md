@@ -710,9 +710,11 @@ describe("nextDeliverable", () => {
 
   it("does not jump a younger row ahead of an in-flight older one", () => {
     const a = ins(db, "b"); ins(db, "b");
-    claimForDelivery(db, a, 1000, 5000, "t1");          // a is delivering, live
-    expect(nextDeliverable(db, "b", 2000, new Set([a]))).toBeNull(); // active-set guards
-    expect(nextDeliverable(db, "b", 2000, new Set())).not.toBeNull(); // lease still live by clock? see next
+    claimForDelivery(db, a, 1000, 5000, "t1"); // a is delivering; lease expires at 6000
+    // A live attempt at the head of line blocks the whole recipient — the younger row
+    // never overtakes it. Either guard alone suffices, so prove each in isolation.
+    expect(nextDeliverable(db, "b", 7000, new Set([a]))).toBeNull(); // active set blocks even past lease expiry
+    expect(nextDeliverable(db, "b", 2000, new Set())).toBeNull();    // an unexpired lease blocks on its own
   });
 
   it("treats an expired, non-active delivering row as reclaimable (returns it)", () => {
@@ -730,7 +732,7 @@ describe("nextDeliverable", () => {
 });
 ```
 
-(The middle assertion `nextDeliverable(db, "b", 2000, new Set())` returns non-null because at clock 2000 the lease — expiring at 6000 — is still live, so the row is returned only as the head-of-line itself; the active-set form models the owner guarding its own row. The two forms together prove both guard conditions.)
+(A delivering row is "live" — and so blocks the recipient's head of line — when the broker is actively attempting it (`activeIds`) OR its lease has not yet expired. Hence the `||` in `nextDeliverable`: the two assertions above isolate each disjunct (active-with-expired-lease, and unexpired-lease-without-active), and the reclaimable test below proves the only returnable delivering case is expired AND not active. The `||` also keeps the consumer safe — returning a row whose lease is still live would let `reclaimIfExpired` fail and, in the active case, risk a second attempt on a row already in flight.)
 
 - [ ] **Step 2: Run to verify it fails**
 

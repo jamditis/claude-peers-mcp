@@ -8,6 +8,7 @@ import {
 } from "../delivery.ts";
 import { resolveTmuxTarget, formatPeerMessage, PASTE_START, PASTE_END } from "../delivery.ts";
 import { deliverViaTmux, buildTmuxArgs, type TmuxSpawn } from "../delivery.ts";
+import { nextDeliverable } from "../delivery.ts";
 
 const DB = "/tmp/test-delivery-migration.db";
 
@@ -241,5 +242,48 @@ describe("deliverViaTmux", () => {
   it("returns false when the spawn throws (timeout/abort)", async () => {
     const spawn: TmuxSpawn = async () => { throw new Error("timed out"); };
     expect(await deliverViaTmux("%1", null, "hi", spawn)).toBe(false);
+  });
+});
+
+const NDB = "/tmp/test-delivery-order.db";
+function orderDb(): Database {
+  try { unlinkSync(NDB); } catch {}
+  const db = new Database(NDB); ensureMessagesTable(db); return db;
+}
+function ins(db: Database, toId: string): number {
+  db.run("INSERT INTO messages (from_id,to_id,text,sent_at) VALUES ('a',?,?,?)", [toId, "m", new Date().toISOString()]);
+  return (db.query("SELECT last_insert_rowid() AS id").get() as { id: number }).id;
+}
+
+describe("nextDeliverable", () => {
+  let db: Database;
+  beforeEach(() => { db = orderDb(); });
+  afterEach(() => { db.close(); try { unlinkSync(NDB); } catch {} });
+
+  it("returns the oldest queued row for the recipient", () => {
+    const a = ins(db, "b"); ins(db, "b");
+    expect(nextDeliverable(db, "b", 1000, new Set())!.id).toBe(a);
+  });
+
+  it("does not jump a younger row ahead of an in-flight older one", () => {
+    const a = ins(db, "b"); ins(db, "b");
+    claimForDelivery(db, a, 1000, 5000, "t1"); // a is delivering; lease expires at 6000
+    // A live attempt at the head of line blocks the whole recipient — the younger row
+    // never overtakes it. Either guard alone suffices, so prove each in isolation.
+    expect(nextDeliverable(db, "b", 7000, new Set([a]))).toBeNull(); // active set blocks even past lease expiry
+    expect(nextDeliverable(db, "b", 2000, new Set())).toBeNull();    // an unexpired lease blocks on its own
+  });
+
+  it("treats an expired, non-active delivering row as reclaimable (returns it)", () => {
+    const a = ins(db, "b");
+    claimForDelivery(db, a, 1000, 5000, "t1"); // expires 6000
+    const row = nextDeliverable(db, "b", 7000, new Set());
+    expect(row!.id).toBe(a);
+    expect(row!.delivery_state).toBe("delivering"); // caller must reclaim before claiming
+  });
+
+  it("ignores other recipients", () => {
+    ins(db, "other");
+    expect(nextDeliverable(db, "b", 1000, new Set())).toBeNull();
   });
 });

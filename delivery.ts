@@ -155,3 +155,29 @@ export async function deliverViaTmux(
     return false;
   }
 }
+
+export interface DeliverableRow {
+  id: number; from_id: string; to_id: string; text: string; sent_at: string;
+  delivery_state: string; lease_expires_at: number | null; lease_token: string | null;
+}
+
+/**
+ * The oldest row for `toId` that may be delivered now, or null when the recipient's
+ * head-of-line row is an in-flight attempt that must not be jumped. A returned row in
+ * `delivering` state is reclaimable (expired + not active) — the caller reclaims it
+ * before claiming. `activeIds` is the broker's in-memory set of rows it is attempting.
+ */
+export function nextDeliverable(
+  db: Database, toId: string, nowMs: number, activeIds: Set<number>,
+): DeliverableRow | null {
+  // Only the head-of-line row matters: a younger message must never overtake an older
+  // one, so we fetch the single oldest queued-or-delivering row and decide on it alone.
+  // Column list mirrors DeliverableRow exactly — keep them in sync if the schema changes.
+  const row = db.query(
+    "SELECT id, from_id, to_id, text, sent_at, delivery_state, lease_expires_at, lease_token FROM messages WHERE to_id=? AND delivery_state IN ('queued','delivering') ORDER BY id ASC LIMIT 1",
+  ).get(toId) as DeliverableRow | null;
+  if (!row) return null;
+  if (row.delivery_state === "queued") return row;
+  const live = activeIds.has(row.id) || (row.lease_expires_at !== null && row.lease_expires_at > nowMs);
+  return live ? null : row;    // a live attempt blocks; expired + not active is reclaimable
+}
