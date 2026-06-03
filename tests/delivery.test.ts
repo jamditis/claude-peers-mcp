@@ -307,10 +307,10 @@ describe("isLoopback", () => {
 
 describe("isPidDead", () => {
   it("treats ESRCH as dead", () => {
-    expect(isPidDead((e) => { (e as any).code = "ESRCH"; throw e; })).toBe(true);
+    expect(isPidDead(() => { const e: any = new Error("gone"); e.code = "ESRCH"; throw e; })).toBe(true);
   });
   it("treats EPERM (alive-but-foreign) as not dead", () => {
-    expect(isPidDead((e) => { (e as any).code = "EPERM"; throw e; })).toBe(false);
+    expect(isPidDead(() => { const e: any = new Error("foreign"); e.code = "EPERM"; throw e; })).toBe(false);
   });
   it("treats a clean probe as alive", () => {
     expect(isPidDead(() => {})).toBe(false);
@@ -337,5 +337,16 @@ describe("pruneMessages", () => {
     expect(res.queuedPruned).toBe(1);
     const texts = (db.query("SELECT text FROM messages ORDER BY id").all() as any[]).map((r) => r.text);
     expect(texts).toEqual(["fresh-del", "fresh-q"]);
+  });
+
+  it("never prunes a delivering row, however old (it is an active lease)", () => {
+    const now = Date.now();
+    const old = new Date(now - 60 * 60_000).toISOString();
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,delivery_state) VALUES ('a','b','in-flight',?,'delivering')", [old]);
+    const res = pruneMessages(db, { deliveredTtlMs: 60_000, queuedMaxAgeMs: 5 * 60_000, nowMs: now });
+    expect(res.deliveredPruned).toBe(0);
+    expect(res.queuedPruned).toBe(0);
+    const texts = (db.query("SELECT text FROM messages").all() as any[]).map((r) => r.text);
+    expect(texts).toEqual(["in-flight"]);
   });
 });

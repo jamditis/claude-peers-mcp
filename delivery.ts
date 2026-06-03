@@ -189,17 +189,18 @@ export function isLoopback(ip: string): boolean {
 }
 
 /**
- * Decide deadness from a process-existence probe. Only ESRCH (no such process)
- * counts as dead; EPERM/EACCES means alive-but-foreign and must NOT be treated as
- * dead. The probe is injected so tests can supply the error code.
+ * Decide deadness from a process-existence probe. The probe throws if the process
+ * is gone; only ESRCH (no such process) counts as dead. EPERM/EACCES means
+ * alive-but-foreign and must NOT be treated as dead. The probe is injected so a
+ * test can throw an error carrying whatever code it wants to exercise.
  */
-export function isPidDead(probe: (e: Error) => void): boolean {
-  try { probe(new Error("probe")); return false; }
+export function isPidDead(probe: () => void): boolean {
+  try { probe(); return false; }
   catch (e: any) { return e?.code === "ESRCH"; }
 }
 
-/** The standard probe: signal 0 to a pid. */
-export function pidProbe(pid: number): (e: Error) => void {
+/** The standard probe: signal 0 to a pid. Throws (ESRCH) if the pid is gone. */
+export function pidProbe(pid: number): () => void {
   return () => { process.kill(pid, 0); };
 }
 
