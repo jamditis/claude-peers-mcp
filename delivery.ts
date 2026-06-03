@@ -181,3 +181,9 @@ export function nextDeliverable(
   const live = activeIds.has(row.id) || (row.lease_expires_at !== null && row.lease_expires_at > nowMs);
   return live ? null : row;    // a live attempt blocks; expired + not active is reclaimable
 }
+
+/** True for loopback source addresses (control-plane registration must be local). */
+export function isLoopback(ip: string): boolean {
+  const n = ip.startsWith("::ffff:") ? ip.slice(7) : ip;
+  return n === "127.0.0.1" || n === "::1";
+}

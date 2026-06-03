@@ -8,7 +8,7 @@ import {
 } from "../delivery.ts";
 import { resolveTmuxTarget, formatPeerMessage, PASTE_START, PASTE_END } from "../delivery.ts";
 import { deliverViaTmux, buildTmuxArgs, type TmuxSpawn } from "../delivery.ts";
-import { nextDeliverable } from "../delivery.ts";
+import { nextDeliverable, isLoopback } from "../delivery.ts";
 
 const DB = "/tmp/test-delivery-migration.db";
 
@@ -285,5 +285,17 @@ describe("nextDeliverable", () => {
   it("ignores other recipients", () => {
     ins(db, "other");
     expect(nextDeliverable(db, "b", 1000, new Set())).toBeNull();
+  });
+});
+
+describe("isLoopback", () => {
+  it("accepts loopback addresses", () => {
+    expect(isLoopback("127.0.0.1")).toBe(true);
+    expect(isLoopback("::1")).toBe(true);
+    expect(isLoopback("::ffff:127.0.0.1")).toBe(true);
+  });
+  it("rejects non-loopback", () => {
+    expect(isLoopback("100.64.0.2")).toBe(false);
+    expect(isLoopback("192.168.1.5")).toBe(false);
   });
 });

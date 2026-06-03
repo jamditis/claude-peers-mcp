@@ -19,7 +19,7 @@ import {
   ensureMessagesTable, migrateMessagesSchema, resetDeliveringOnStart,
   generateLeaseToken, claimForDelivery, confirmDelivered, releaseToQueued,
   reclaimIfExpired, nextDeliverable, formatPeerMessage,
-  deliverViaTmux, type TmuxSpawn,
+  deliverViaTmux, isLoopback, type TmuxSpawn,
 } from "./delivery.ts";
 import { PROTOCOL_VERSION } from "./shared/types.ts";
 
@@ -478,7 +478,14 @@ if (import.meta.main) {
       try {
         const body = await req.json();
         switch (path) {
-          case "/register": return Response.json(handleRegister(body));
+          case "/register": {
+            const fromLoopback = isLoopback(clientIp);
+            const safeBody = fromLoopback ? body : { ...body, tmux_pane: null, tmux_socket: null };
+            if (!fromLoopback && (body.tmux_pane || body.tmux_socket)) {
+              console.error(`[claude-peers broker] dropping pane coordinates from non-loopback register (${clientIp})`);
+            }
+            return Response.json(handleRegister(safeBody));
+          }
           case "/heartbeat": {
             updateLastSeen.run(new Date().toISOString(), body.id);
             // Drain this recipient's queued backlog in id order (serial per recipient),
