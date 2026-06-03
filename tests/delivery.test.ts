@@ -8,7 +8,7 @@ import {
 } from "../delivery.ts";
 import { resolveTmuxTarget, formatPeerMessage, PASTE_START, PASTE_END } from "../delivery.ts";
 import { deliverViaTmux, buildTmuxArgs, type TmuxSpawn } from "../delivery.ts";
-import { nextDeliverable, isLoopback, isFederationRoute, isPidDead, pruneMessages } from "../delivery.ts";
+import { nextDeliverable, isLoopback, isFederationRoute, isPidDead, pruneMessages, releasableQueuedPrefix } from "../delivery.ts";
 
 const DB = "/tmp/test-delivery-migration.db";
 
@@ -293,6 +293,27 @@ describe("nextDeliverable", () => {
   it("ignores other recipients", () => {
     ins(db, "other");
     expect(nextDeliverable(db, "b", 1000, new Set())).toBeNull();
+  });
+});
+
+describe("releasableQueuedPrefix", () => {
+  const row = (id: number, s: string) => ({ id, delivery_state: s });
+  it("releases all rows when nothing is in flight", () => {
+    const out = releasableQueuedPrefix([row(1, "queued"), row(2, "queued"), row(3, "queued")]);
+    expect(out.map((r) => r.id)).toEqual([1, 2, 3]);
+  });
+  it("releases nothing when the head is delivering", () => {
+    // The oldest pending row is mid-tmux-send; a poll must not hand out the younger queued
+    // rows behind it, or a requeue-on-failure would reorder them.
+    const out = releasableQueuedPrefix([row(1, "delivering"), row(2, "queued"), row(3, "queued")]);
+    expect(out).toHaveLength(0);
+  });
+  it("releases only the contiguous queued prefix before the first delivering row", () => {
+    const out = releasableQueuedPrefix([row(1, "queued"), row(2, "queued"), row(3, "delivering"), row(4, "queued")]);
+    expect(out.map((r) => r.id)).toEqual([1, 2]);
+  });
+  it("returns empty for no pending rows", () => {
+    expect(releasableQueuedPrefix([])).toHaveLength(0);
   });
 });
 

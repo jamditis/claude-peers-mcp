@@ -186,6 +186,22 @@ export function nextDeliverable(
   return live ? null : row;    // a live attempt blocks; expired + not active is reclaimable
 }
 
+/**
+ * The contiguous queued prefix a poll (check_messages) may release. `pending` is the
+ * recipient's queued-or-delivering rows in id order. Releasing stops at the first row that is
+ * not `queued`: a `delivering` row is older pending mail a tmux send still owns and may requeue
+ * on failure, so handing out the queued rows behind it would let the caller observe message n+1
+ * before message n. Only rows whose older pending neighbours are all already delivered are safe.
+ */
+export function releasableQueuedPrefix<T extends { delivery_state: string }>(pending: T[]): T[] {
+  const out: T[] = [];
+  for (const row of pending) {
+    if (row.delivery_state !== "queued") break;
+    out.push(row);
+  }
+  return out;
+}
+
 /** True for loopback source addresses (control-plane registration must be local). */
 export function isLoopback(ip: string): boolean {
   const n = ip.startsWith("::ffff:") ? ip.slice(7) : ip;
