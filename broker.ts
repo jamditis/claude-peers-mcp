@@ -19,13 +19,16 @@ import {
   ensureMessagesTable, migrateMessagesSchema, resetDeliveringOnStart,
   generateLeaseToken, claimForDelivery, confirmDelivered, releaseToQueued,
   reclaimIfExpired, nextDeliverable, formatPeerMessage,
-  deliverViaTmux, isLoopback, type TmuxSpawn,
+  deliverViaTmux, isLoopback, isPidDead, pidProbe, pruneMessages, type TmuxSpawn,
 } from "./delivery.ts";
 import { PROTOCOL_VERSION } from "./shared/types.ts";
 
 const GOSSIP_INTERVAL_MS = 5_000;
 const CLEANUP_INTERVAL_MS = 15_000;
 const REMOTE_TTL_MS = 30_000;
+const STALE_PEER_MS = 45_000;       // 3x heartbeat — a live session always heartbeats
+const DELIVERED_TTL_MS = 60_000;
+const QUEUED_MAX_AGE_MS = 24 * 60 * 60_000; // lossy backstop
 const GOSSIP_SUMMARY_INTERVAL_MS = 5 * 60_000;
 
 // --- Exported testable functions (no side effects) ---
@@ -191,11 +194,20 @@ if (import.meta.main) {
 
   // --- Clean stale peers ---
   function cleanStalePeers() {
-    const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
+    const peers = db.query("SELECT id, pid, last_seen FROM peers").all() as { id: string; pid: number; last_seen: string }[];
+    const staleCutoff = new Date(Date.now() - STALE_PEER_MS).toISOString();
     for (const peer of peers) {
-      try { process.kill(peer.pid, 0); } catch { deleteUndeliveredForPeer.run(peer.id); deletePeer.run(peer.id); }
+      const dead = isPidDead(pidProbe(peer.pid));
+      const stale = peer.last_seen < staleCutoff;
+      if (dead || stale) {
+        // Deregistration is the message-deletion trigger (not the probe itself).
+        deleteUndeliveredForPeer.run(peer.id);
+        deletePeer.run(peer.id);
+      }
     }
     pruneRemotePeers(db, REMOTE_TTL_MS);
+    const pruned = pruneMessages(db, { deliveredTtlMs: DELIVERED_TTL_MS, queuedMaxAgeMs: QUEUED_MAX_AGE_MS, nowMs: Date.now() });
+    if (pruned.queuedPruned > 0) console.error(`[claude-peers broker] dropped ${pruned.queuedPruned} over-age queued message(s) (lossy backstop)`);
   }
   cleanStalePeers();
 
@@ -317,9 +329,7 @@ if (import.meta.main) {
         localPeers = selectAllPeers.all() as Peer[];
     }
     localPeers = localPeers
-      .filter(p => {
-        try { process.kill(p.pid, 0); return true; } catch { deleteUndeliveredForPeer.run(p.id); deletePeer.run(p.id); return false; }
-      })
+      .filter(p => !isPidDead(pidProbe(p.pid)))
       .map(p => ({ ...p, is_remote: false }));
 
     let allPeers: Peer[];
