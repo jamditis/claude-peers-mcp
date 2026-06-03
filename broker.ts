@@ -251,6 +251,7 @@ if (import.meta.main) {
   // --- Delivery context ---
   const LEASE_MS = 5_000;        // > the 2s tmux attempt timeout
   const TMUX_TIMEOUT_MS = 2_000;
+  const FORWARD_TIMEOUT_MS = 5_000; // abort bound on an outbound cross-machine forward fetch
   const MAX_HEARTBEAT_DRAIN = 50; // upper bound on pushes drained per heartbeat
   // Deliveries currently being attempted. Read by the retire-drain (Task 9) and the
   // empty-broker self-exit (Task 14) so the broker never exits mid-delivery.
@@ -258,10 +259,10 @@ if (import.meta.main) {
   // Outbound cross-machine /forward-message sends in progress. A forward is delivery work
   // the same way a tmux inject is, so the shutdown predicate must count it too — otherwise
   // retire / idle self-exit would stop the server and exit while handleSendMessage is still
-  // awaiting the forward fetch, dropping the message before it reaches the sibling. A forward
-  // that would land does so in well under the retire drain deadline; one still parked at the
-  // deadline is bounded by its own 5s abort and would fail to "unreachable" regardless, so the
-  // deadline need not stretch to cover it.
+  // awaiting the forward fetch, dropping the message before it reaches the sibling. The retire
+  // drain deadline covers the full FORWARD_TIMEOUT_MS so a slow-but-successful forward (a busy
+  // sibling, a laggy link) is not cut off at the deadline while it would still have landed; a
+  // forward that never completes is bounded by its own abort and frees the counter then.
   let inFlightForwards = 0;
   function hasWorkInFlight(): boolean {
     return inFlightDeliveries > 0 || inFlightForwards > 0;
@@ -272,9 +273,10 @@ if (import.meta.main) {
   // Idle self-exit config (see maybeIdleExit). 0 / absent / non-numeric = disabled, so a
   // systemd-supervised broker (Restart=always) never self-exits into a restart loop; the
   // server.ts auto-launcher opts in with a positive value so an unmanaged broker reaps
-  // itself instead of leaking a process. lastActivityAt is bumped on every POST (real peer
-  // and control traffic); /health probes deliberately do not count, so a liveness poll
-  // cannot keep an otherwise-idle broker alive.
+  // itself instead of leaking a process. lastActivityAt is bumped only on local control-plane
+  // POSTs; /health probes (a GET) and sibling federation traffic (/gossip, /forward-message)
+  // deliberately do not count, so neither a liveness poll nor a chatty sibling can keep an
+  // otherwise locally-idle broker alive.
   const IDLE_EXIT_MS = (() => {
     const v = parseInt(process.env.CLAUDE_PEERS_IDLE_EXIT_MS ?? "0", 10);
     return Number.isFinite(v) && v > 0 ? v : 0;
@@ -288,7 +290,11 @@ if (import.meta.main) {
     // response before we stop the server. A microtask yield (Promise.resolve) would not
     // suffice — TCP writes only flush between macrotasks, not between microtasks.
     await new Promise((r) => setTimeout(r, 50));
-    const deadline = Date.now() + 3_000;
+    // Wait out the longest in-flight attempt before tearing down: a tmux send (2s) or a
+    // cross-machine forward (FORWARD_TIMEOUT_MS, the larger), plus a small margin for the
+    // attempt to settle and the next poll to observe the drained counter. The loop still
+    // exits early the moment hasWorkInFlight() clears, so a quiet broker retires at once.
+    const deadline = Date.now() + FORWARD_TIMEOUT_MS + 1_000;
     while (hasWorkInFlight() && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 50));
     }
@@ -456,7 +462,7 @@ if (import.meta.main) {
           protocol_version: PROTOCOL_VERSION, from_id: body.from_id,
           to_id: body.to_id, text: body.text, from_machine: config.machine,
         } satisfies ForwardMessageRequest),
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.timeout(FORWARD_TIMEOUT_MS),
       });
       if (!res.ok) return { ok: false, error: `Remote broker error: ${res.status}` };
       const result = await res.json() as { ok: boolean };
@@ -640,7 +646,11 @@ if (import.meta.main) {
 
       try {
         const body = await req.json();
-        lastActivityAt = Date.now(); // any POST is real traffic; refreshes the idle window
+        // Refresh the idle window only for local control-plane traffic, not sibling federation
+        // (/gossip, /forward-message). Self-exit reaps a broker with no LOCAL work; a federated
+        // broker otherwise gets its idle clock reset forever by a sibling's periodic gossip and
+        // never reaps itself. (/health is a GET handled above and never reaches here.)
+        if (!isFederationRoute(path)) lastActivityAt = Date.now();
         // While retiring, refuse every path that creates new persistent work or can
         // start a delivery — /heartbeat drives deliverNext, so it must be refused too,
         // or a heartbeat at a drain-loop yield could start a send the broker then exits under.
