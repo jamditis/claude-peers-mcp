@@ -298,4 +298,9 @@ describe("isLoopback", () => {
     expect(isLoopback("100.84.214.24")).toBe(false);
     expect(isLoopback("192.168.1.5")).toBe(false);
   });
+  it("rejects the broker's unknown-address sentinel", () => {
+    // broker.ts falls back to "unknown" when server.requestIP returns null;
+    // a request with no socket address must never count as loopback.
+    expect(isLoopback("unknown")).toBe(false);
+  });
 });
