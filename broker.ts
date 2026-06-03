@@ -512,18 +512,15 @@ if (import.meta.main) {
     : null;
 
   // --- Graceful shutdown ---
-  async function shutdown() {
-    if (retiring) return;            // a retire() in flight already owns teardown + exit
-    retiring = true;                 // stop new deliveries starting during our own teardown
-    clearInterval(gossipTimer);
-    clearInterval(cleanupTimer);
-    if (idleTimer) clearInterval(idleTimer);
-    await gossipToSiblings([]);
-    db.close();
-    process.exit(0);
-  }
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  // SIGINT/SIGTERM share the retire path: it drains in-flight deliveries (up to 3s) before
+  // closing the DB, so a tmux send-keys that is mid-spawn at signal time finishes and resolves
+  // its lease instead of being stranded in 'delivering'. A plain close mid-spawn would leave a
+  // row that only a future broker's resetDeliveringOnStart could requeue — and an unmanaged,
+  // idle-exiting broker may never restart, so the message would be invisible to check_messages
+  // indefinitely. retire() is idempotent, so a double signal (or a /retire already in flight)
+  // is a no-op.
+  process.on("SIGINT", () => { void retire(); });
+  process.on("SIGTERM", () => { void retire(); });
 
   // --- HTTP Server ---
   httpServer = Bun.serve({
@@ -600,7 +597,14 @@ if (import.meta.main) {
           case "/send-message": return Response.json(await handleSendMessage(body));
           case "/poll-messages": return Response.json(handlePollMessages(body));
           case "/unregister":
-            deleteUndeliveredForPeer.run(body.id);
+            // A delivery in flight to this peer holds an active lease on its 'delivering' row;
+            // deleting that row here would pull it out from under the lease, corrupting the
+            // state machine and risking a dropped message the pane already received. Skip the
+            // message sweep while mid-delivery (cleanStalePeers uses the same guard) — the
+            // in-flight attempt resolves its own row, and any other queued rows for this
+            // now-departed peer age out via retention prune. The peer row goes either way, so
+            // the session disappears from listings immediately on a graceful exit.
+            if (!recipientsInFlight.has(body.id)) deleteUndeliveredForPeer.run(body.id);
             deletePeer.run(body.id);
             return Response.json({ ok: true });
           case "/gossip": return Response.json(handleGossip(body));
