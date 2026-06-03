@@ -81,7 +81,9 @@ export interface SendResult {
   ok: boolean;
   error?: string;
   routed?: "local" | "remote";
-  delivery?: "injected" | "accepted" | "queued";
+  // "accepted" = pushed into the recipient's live session; "queued" = left for
+  // their next check_messages. (No "injected": only these two states occur in M1.)
+  delivery?: "accepted" | "queued";
 }
 
 export interface PollMessagesRequest {

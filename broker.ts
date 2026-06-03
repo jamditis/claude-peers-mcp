@@ -267,7 +267,7 @@ if (import.meta.main) {
   // Attempt to deliver the recipient's head-of-line row. Serial per recipient.
   // Returns the delivery disposition for an immediately-attempted send, or null
   // when nothing was attempted (blocked / no backend / already in flight).
-  async function deliverNext(toId: string): Promise<"injected" | "accepted" | "queued" | null> {
+  async function deliverNext(toId: string): Promise<"accepted" | "queued" | null> {
     if (recipientsInFlight.has(toId)) return null;
     const now = Date.now();
     const row = nextDeliverable(db, toId, now, activeRowIds);
@@ -523,7 +523,7 @@ if (import.meta.main) {
             let drained = 0;
             for (; drained < MAX_HEARTBEAT_DRAIN; drained++) {
               const d = await deliverNext(body.id);
-              if (d !== "accepted" && d !== "injected") break;
+              if (d !== "accepted") break; // only a successful inject continues the drain
             }
             if (drained === MAX_HEARTBEAT_DRAIN) {
               console.error(`[claude-peers broker] heartbeat drain hit the ${MAX_HEARTBEAT_DRAIN}-message cap for ${body.id}; backlog continues next heartbeat`);

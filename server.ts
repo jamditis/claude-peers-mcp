@@ -339,9 +339,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             isError: true,
           };
         }
-        const how = result.delivery === "accepted" ? " (pushed to their session)"
-                  : result.delivery === "injected" ? " (delivered)"
-                  : " (queued; they'll see it on their next check)";
+        const how = result.delivery === "accepted"
+          ? " (pushed to their session)"
+          : " (queued; they'll see it on their next check)";
         return {
           content: [{ type: "text" as const, text: `Message sent to peer ${to_id}${how}` }],
         };
