@@ -210,8 +210,11 @@ if (import.meta.main) {
   let httpServer: ReturnType<typeof Bun.serve> | null = null;
 
   async function retire(): Promise<void> {
-    retiring = true; // new register/send/forward now refused
-    // Yield the microtask queue so the /retire response can be flushed before we stop.
+    if (retiring) return;            // idempotent: a second /retire (or signal) is a no-op
+    retiring = true;                 // new register/send/forward/heartbeat now refused
+    // Yield to the I/O event loop (a macrotask boundary) so Bun can flush the /retire
+    // response before we stop the server. A microtask yield (Promise.resolve) would not
+    // suffice — TCP writes only flush between macrotasks, not between microtasks.
     await new Promise((r) => setTimeout(r, 50));
     const deadline = Date.now() + 3_000;
     while (inFlightDeliveries > 0 && Date.now() < deadline) {
@@ -459,6 +462,8 @@ if (import.meta.main) {
 
   // --- Graceful shutdown ---
   async function shutdown() {
+    if (retiring) return;            // a retire() in flight already owns teardown + exit
+    retiring = true;                 // stop new deliveries starting during our own teardown
     clearInterval(gossipTimer);
     clearInterval(cleanupTimer);
     await gossipToSiblings([]);
@@ -496,7 +501,10 @@ if (import.meta.main) {
 
       try {
         const body = await req.json();
-        if (retiring && (path === "/register" || path === "/send-message" || path === "/forward-message")) {
+        // While retiring, refuse every path that creates new persistent work or can
+        // start a delivery — /heartbeat drives deliverNext, so it must be refused too,
+        // or a heartbeat at a drain-loop yield could start a send the broker then exits under.
+        if (retiring && (path === "/register" || path === "/send-message" || path === "/forward-message" || path === "/heartbeat")) {
           return Response.json({ ok: false, error: "broker retiring" }, { status: 503 });
         }
         switch (path) {
@@ -539,7 +547,14 @@ if (import.meta.main) {
             return Response.json({ ok: true });
           case "/gossip": return Response.json(handleGossip(body));
           case "/forward-message": return Response.json(await handleForwardMessage(body));
-          case "/retire": { void retire(); return Response.json({ ok: true }); }
+          case "/retire": {
+            // Privileged admin op: only a local caller may retire the broker. The allowlist
+            // can include remote federation siblings, so without this a remote allowlisted
+            // host could kill the broker (a DoS on the sessions it serves).
+            if (!isLoopback(clientIp)) return Response.json({ error: "forbidden" }, { status: 403 });
+            void retire();
+            return Response.json({ ok: true });
+          }
           default: return Response.json({ error: "not found" }, { status: 404 });
         }
       } catch (e) {
