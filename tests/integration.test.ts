@@ -699,14 +699,82 @@ describe("retire waits for an in-flight remote forward", () => {
     expect(existsSync(marker)).toBe(true);
     await brokerFetch(PORT, "/retire", {});
 
-    // ~900ms after retire the forward is still parked (bounded only by its 5s abort). A broker
-    // that counts in-flight forwards is still in its drain loop and answers /health; the
-    // unfixed broker — which waited only on tmux deliveries — has already exited.
+    const stillUp = async () => {
+      try { return (await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(300) })).ok; }
+      catch { return false; }
+    };
+
+    // ~900ms after retire the forward is still parked (bounded only by its abort timeout). A
+    // broker that counts in-flight forwards is still in its drain loop and answers /health; a
+    // broker that waited only on tmux deliveries has already exited.
     await new Promise((r) => setTimeout(r, 900));
-    let upDuringDrain = false;
-    try { upDuringDrain = (await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(300) })).ok; } catch {}
-    expect(upDuringDrain).toBe(true);
+    expect(await stillUp()).toBe(true);
+
+    // ~4s in, past the old 3s drain deadline: the broker must STILL be draining, because the
+    // forward's own timeout is 5s and a slow-but-successful forward must not be cut off. A
+    // deadline that stopped at 3s would have exited by now and dropped a deliverable message.
+    await new Promise((r) => setTimeout(r, 3_100));
+    expect(await stillUp()).toBe(true);
 
     await sendPromise;
   }, 20_000);
+});
+
+// Idle self-exit (Task 14) reaps a broker with no LOCAL work. Sibling federation traffic
+// (/gossip, /forward-message) must not refresh the idle clock, or a federated broker with no
+// local peers would be kept alive forever by a sibling's periodic gossip and never reap itself.
+describe("federation traffic does not defeat idle self-exit", () => {
+  it("self-exits on the idle window despite a steady stream of sibling gossip", async () => {
+    const PORT = 17914;
+    await Bun.write("/tmp/config-fedidle.json", JSON.stringify({
+      machine: "fed-idle", tailscale_ip: "127.0.0.1", port: PORT, id_prefix: "fdi",
+      siblings: [], allowed_ips: ["127.0.0.1"],
+    }));
+    try { unlinkSync("/tmp/broker-fedidle.db"); } catch {}
+    const proc = Bun.spawn(["bun", "broker.ts"], {
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-fedidle.json",
+             CLAUDE_PEERS_DB: "/tmp/broker-fedidle.db", CLAUDE_PEERS_IDLE_EXIT_MS: "2500" },
+      stdout: "ignore", stderr: "ignore",
+    });
+    let gossiping = true;
+    try {
+      // Prove it launched (a broker that failed to start also refuses /health — a false pass).
+      let up = false;
+      for (let i = 0; i < 30; i++) {
+        try { if ((await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(300) })).ok) { up = true; break; } } catch {}
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      expect(up).toBe(true);
+
+      // Hammer it with sibling gossip faster than the idle window the whole time. Under the bug
+      // each /gossip refreshes lastActivityAt, so the broker never goes idle; with the fix the
+      // federation route does not count, so it reaps itself ~one idle window after startup.
+      (async () => {
+        while (gossiping) {
+          try {
+            await fetch(`http://127.0.0.1:${PORT}/gossip`, {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ protocol_version: 2, machine: "ghost-m", tailscale_ip: "127.0.0.1", peers: [] }),
+              signal: AbortSignal.timeout(300),
+            });
+          } catch {}
+          await new Promise((r) => setTimeout(r, 400));
+        }
+      })();
+
+      // Despite the gossip stream it must self-exit (no local peers, no local activity).
+      let down = false;
+      for (let i = 0; i < 40; i++) {
+        try { await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(300) }); }
+        catch { down = true; break; }
+        await new Promise((r) => setTimeout(r, 300));
+      }
+      expect(down).toBe(true);
+    } finally {
+      gossiping = false;
+      proc.kill();
+      try { unlinkSync("/tmp/broker-fedidle.db"); } catch {}
+      try { unlinkSync("/tmp/config-fedidle.json"); } catch {}
+    }
+  }, 25_000);
 });
