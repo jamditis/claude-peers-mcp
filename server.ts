@@ -97,6 +97,10 @@ async function ensureBroker(): Promise<void> {
   log("Starting broker daemon...");
   const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
     stdio: ["ignore", "ignore", "inherit"],
+    // Opt this auto-launched broker into idle self-exit so it reaps itself once every
+    // peer is gone (no daemon supervisor here, unlike the systemd unit). Respect an
+    // existing override. The broker treats <=0 as "never self-exit".
+    env: { ...process.env, CLAUDE_PEERS_IDLE_EXIT_MS: process.env.CLAUDE_PEERS_IDLE_EXIT_MS ?? "600000" },
     // Detach so the broker survives if this MCP server exits
     // On macOS/Linux, the broker will keep running
   });

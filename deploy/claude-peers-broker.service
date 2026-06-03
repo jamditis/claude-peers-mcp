@@ -10,6 +10,8 @@ ExecStart=/home/jamditis/.bun/bin/bun /home/jamditis/projects/claude-peers-mcp/b
 Restart=always
 RestartSec=5
 Environment=HOME=/home/jamditis
+# This broker is supervised; never let it self-exit when idle or it would restart-loop.
+Environment=CLAUDE_PEERS_IDLE_EXIT_MS=0
 
 [Install]
 WantedBy=multi-user.target
