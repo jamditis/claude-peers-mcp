@@ -32,3 +32,24 @@ describe("loadConfig", () => {
     expect(() => loadConfig(tmpPath)).toThrow();
   });
 });
+
+describe("floor_remote_forwards", () => {
+  it("defaults to false when absent", async () => {
+    const path = "/tmp/cfg-floor-absent.json";
+    await Bun.write(path, JSON.stringify({
+      machine: "m", tailscale_ip: "127.0.0.1", port: 19001,
+      id_prefix: "m", siblings: [], allowed_ips: ["127.0.0.1"],
+    }));
+    expect(loadConfig(path).floor_remote_forwards).toBe(false);
+  });
+
+  it("reads true when set", async () => {
+    const path = "/tmp/cfg-floor-true.json";
+    await Bun.write(path, JSON.stringify({
+      machine: "m", tailscale_ip: "127.0.0.1", port: 19002,
+      id_prefix: "m", siblings: [], allowed_ips: ["127.0.0.1"],
+      floor_remote_forwards: true,
+    }));
+    expect(loadConfig(path).floor_remote_forwards).toBe(true);
+  });
+});

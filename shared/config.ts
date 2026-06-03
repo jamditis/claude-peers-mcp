@@ -14,6 +14,7 @@ export interface PeersConfig {
   siblings: SiblingConfig[];
   allowed_ips: string[];
   db_path: string;
+  floor_remote_forwards: boolean;
 }
 
 const REQUIRED_FIELDS = ["machine", "tailscale_ip", "port", "id_prefix", "siblings", "allowed_ips"] as const;
@@ -49,6 +50,7 @@ export function loadConfig(path?: string): PeersConfig {
 
   // db_path from: env var > config file > default
   const db_path = process.env.CLAUDE_PEERS_DB ?? (obj.db_path as string | undefined) ?? DEFAULT_DB_PATH;
+  const floor_remote_forwards = obj.floor_remote_forwards === true;
 
-  return { ...obj, db_path } as PeersConfig;
+  return { ...obj, db_path, floor_remote_forwards } as PeersConfig;
 }
