@@ -192,6 +192,12 @@ if (import.meta.main) {
     "DELETE FROM messages WHERE to_id = ? AND delivery_state != 'delivered'"
   );
 
+  // In-memory delivery guards (this process only). Declared up here, before
+  // cleanStalePeers, so the sweep can skip a recipient that is mid-delivery;
+  // deliverNext (further down) is what populates them.
+  const activeRowIds = new Set<number>();
+  const recipientsInFlight = new Set<string>();
+
   // --- Clean stale peers ---
   function cleanStalePeers() {
     const peers = db.query("SELECT id, pid, last_seen FROM peers").all() as { id: string; pid: number; last_seen: string }[];
@@ -199,11 +205,15 @@ if (import.meta.main) {
     for (const peer of peers) {
       const dead = isPidDead(pidProbe(peer.pid));
       const stale = peer.last_seen < staleCutoff;
-      if (dead || stale) {
-        // Deregistration is the message-deletion trigger (not the probe itself).
-        deleteUndeliveredForPeer.run(peer.id);
-        deletePeer.run(peer.id);
-      }
+      if (!dead && !stale) continue;
+      // Never delete a recipient's rows while one of its messages is mid-delivery:
+      // deliverNext awaits the tmux spawn, and deleting the 'delivering' row out from
+      // under it would corrupt the lease and could drop a message the pane already
+      // received. Defer this peer to the next sweep, after the attempt finishes.
+      if (recipientsInFlight.has(peer.id)) continue;
+      // Deregistration is the message-deletion trigger (not the probe itself).
+      deleteUndeliveredForPeer.run(peer.id);
+      deletePeer.run(peer.id);
     }
     pruneRemotePeers(db, REMOTE_TTL_MS);
     const pruned = pruneMessages(db, { deliveredTtlMs: DELIVERED_TTL_MS, queuedMaxAgeMs: QUEUED_MAX_AGE_MS, nowMs: Date.now() });
@@ -268,10 +278,6 @@ if (import.meta.main) {
     finally { clearTimeout(timer); }
   };
 
-  // In-memory delivery guards (this process only).
-  const activeRowIds = new Set<number>();
-  const recipientsInFlight = new Set<string>();
-
   function peerDelivery(toId: string): { kind: string; pane: string | null; socket: string | null } | null {
     return db.query("SELECT delivery_kind AS kind, tmux_pane AS pane, tmux_socket AS socket FROM peers WHERE id = ?")
       .get(toId) as { kind: string; pane: string | null; socket: string | null } | null;
@@ -311,6 +317,14 @@ if (import.meta.main) {
       recipientsInFlight.delete(toId);
       inFlightDeliveries--;
     }
+  }
+
+  // After a successful inject, clear any backlog that a concurrent send deferred. While
+  // deliverNext awaits the tmux spawn, a second send to the same recipient hits the
+  // serial-per-recipient guard and is left queued; without this it would wait for the next
+  // heartbeat (seconds) to drain. Bounded by the same cap as the heartbeat drain.
+  async function drainAfterDelivery(toId: string): Promise<void> {
+    for (let n = 0; n < MAX_HEARTBEAT_DRAIN && (await deliverNext(toId)) === "accepted"; n++) {}
   }
 
   // --- Request handlers ---
@@ -361,6 +375,7 @@ if (import.meta.main) {
     if (localTarget) {
       insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
       const disposition = (await deliverNext(body.to_id)) ?? "queued";
+      if (disposition === "accepted") await drainAfterDelivery(body.to_id);
       return { ok: true, routed: "local", delivery: disposition };
     }
     const siblingUrl = resolveTargetBroker(db, body.to_id, config.siblings);
@@ -396,7 +411,9 @@ if (import.meta.main) {
     insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
     // floor_remote_forwards leaves a forwarded message queued for pull-only retrieval;
     // by default a forward auto-injects into the recipient's backend like a local send.
-    if (!config.floor_remote_forwards) await deliverNext(body.to_id);
+    if (!config.floor_remote_forwards && (await deliverNext(body.to_id)) === "accepted") {
+      await drainAfterDelivery(body.to_id);
+    }
     return { ok: true };
   }
 

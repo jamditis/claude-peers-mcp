@@ -81,9 +81,18 @@ async function ensureBroker(): Promise<void> {
       return;
     }
     log(`Stale broker (protocol ${ver ?? "?"} < ${REQUIRED_BROKER_PROTOCOL}); retiring it`);
+    let retireRefused = false;
     try {
-      await fetch(`${BROKER_URL}/retire`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}", signal: AbortSignal.timeout(2000) });
-    } catch { /* it may exit before responding */ }
+      const res = await fetch(`${BROKER_URL}/retire`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}", signal: AbortSignal.timeout(2000) });
+      // A protocol-1 broker has no /retire route and answers 404. Any non-ok status means the
+      // broker will not self-exit, so waiting out the drain loop below is pointless — fail fast
+      // with an accurate instruction instead of stalling 5s on a broker that cannot retire. A
+      // thrown fetch (broker exited mid-response) still falls through to the wait-and-see loop.
+      if (!res.ok) retireRefused = true;
+    } catch { /* it may exit before responding; confirm via the wait loop below */ }
+    if (retireRefused) {
+      throw new Error("The running claude-peers broker predates this version and cannot self-retire; run `bun cli.ts kill-broker` and retry.");
+    }
     let freed = false;
     for (let i = 0; i < 25; i++) {
       await new Promise((r) => setTimeout(r, 200));
