@@ -193,6 +193,19 @@ export function isLoopback(ip: string): boolean {
 }
 
 /**
+ * The only two routes a remote allowlisted sibling may reach. Every other route is control
+ * plane and must be loopback-only: it drives a local session — registers a delivery target,
+ * injects into a tmux pane, drains a queue, or retires the broker. The federation allowlist
+ * authorizes federation, not authority over local sessions; a remote peer reaches local
+ * sessions only through /forward-message, which the broker itself originates after resolving
+ * the target. Keep this list tiny and explicit: a new control-plane route is loopback-only by
+ * default precisely because it is absent here.
+ */
+export function isFederationRoute(path: string): boolean {
+  return path === "/gossip" || path === "/forward-message";
+}
+
+/**
  * Decide deadness from a process-existence probe. The probe throws if the process
  * is gone; only ESRCH (no such process) counts as dead. EPERM/EACCES means
  * alive-but-foreign and must NOT be treated as dead. The probe is injected so a
