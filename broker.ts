@@ -221,6 +221,18 @@ if (import.meta.main) {
   let retiring = false;
   let httpServer: ReturnType<typeof Bun.serve> | null = null;
 
+  // Idle self-exit config (see maybeIdleExit). 0 / absent / non-numeric = disabled, so a
+  // systemd-supervised broker (Restart=always) never self-exits into a restart loop; the
+  // server.ts auto-launcher opts in with a positive value so an unmanaged broker reaps
+  // itself instead of leaking a process. lastActivityAt is bumped on every POST (real peer
+  // and control traffic); /health probes deliberately do not count, so a liveness poll
+  // cannot keep an otherwise-idle broker alive.
+  const IDLE_EXIT_MS = (() => {
+    const v = parseInt(process.env.CLAUDE_PEERS_IDLE_EXIT_MS ?? "0", 10);
+    return Number.isFinite(v) && v > 0 ? v : 0;
+  })();
+  let lastActivityAt = Date.now();
+
   async function retire(): Promise<void> {
     if (retiring) return;            // idempotent: a second /retire (or signal) is a no-op
     retiring = true;                 // new register/send/forward/heartbeat now refused
@@ -234,6 +246,7 @@ if (import.meta.main) {
     }
     clearInterval(gossipTimer);
     clearInterval(cleanupTimer);
+    if (idleTimer) clearInterval(idleTimer);
     try { await gossipToSiblings([]); } catch {}
     httpServer?.stop(true);
     db.close();
@@ -457,12 +470,36 @@ if (import.meta.main) {
   }, GOSSIP_INTERVAL_MS);
   const cleanupTimer = setInterval(cleanStalePeers, CLEANUP_INTERVAL_MS);
 
+  // --- Idle self-exit (opt-in; see IDLE_EXIT_MS) ---
+  // Exits only when there are zero live peers, zero in-flight deliveries, and the idle
+  // window has elapsed since the last POST. Disabled (idleTimer null) when IDLE_EXIT_MS<=0.
+  // Runs on its own timer rather than piggybacking the 15s peer sweep so a short window is
+  // observable and reaping is timely; the cadence is clamped so production (a multi-minute
+  // window) checks coarsely while a sub-second test window checks promptly.
+  function maybeIdleExit(): void {
+    if (IDLE_EXIT_MS <= 0 || retiring) return;
+    if (inFlightDeliveries > 0) return;
+    if ((selectAllPeers.all() as unknown[]).length > 0) return;
+    if (Date.now() - lastActivityAt <= IDLE_EXIT_MS) return;
+    console.error("[claude-peers broker] idle with no peers; exiting");
+    clearInterval(gossipTimer);
+    clearInterval(cleanupTimer);
+    if (idleTimer) clearInterval(idleTimer);
+    try { httpServer?.stop(true); } catch {}
+    db.close();
+    process.exit(0);
+  }
+  const idleTimer = IDLE_EXIT_MS > 0
+    ? setInterval(maybeIdleExit, Math.max(1_000, Math.min(IDLE_EXIT_MS, CLEANUP_INTERVAL_MS)))
+    : null;
+
   // --- Graceful shutdown ---
   async function shutdown() {
     if (retiring) return;            // a retire() in flight already owns teardown + exit
     retiring = true;                 // stop new deliveries starting during our own teardown
     clearInterval(gossipTimer);
     clearInterval(cleanupTimer);
+    if (idleTimer) clearInterval(idleTimer);
     await gossipToSiblings([]);
     db.close();
     process.exit(0);
@@ -498,6 +535,7 @@ if (import.meta.main) {
 
       try {
         const body = await req.json();
+        lastActivityAt = Date.now(); // any POST is real traffic; refreshes the idle window
         // While retiring, refuse every path that creates new persistent work or can
         // start a delivery — /heartbeat drives deliverNext, so it must be refused too,
         // or a heartbeat at a drain-loop yield could start a send the broker then exits under.

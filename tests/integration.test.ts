@@ -374,3 +374,75 @@ describe("dead push path removed", () => {
     expect(src).not.toContain("/ack-messages");
   });
 });
+
+// Empty-broker self-exit (Task 14). Opt-in via a positive CLAUDE_PEERS_IDLE_EXIT_MS;
+// disabled by default so a Restart=always systemd unit never self-exits into a loop.
+describe("empty-broker self-exit", () => {
+  it("comes up, then self-exits after the idle window with no peers", async () => {
+    const PORT = 17908;
+    await Bun.write("/tmp/config-exit.json", JSON.stringify({
+      machine: "exit-a", tailscale_ip: "127.0.0.1", port: PORT, id_prefix: "exa",
+      siblings: [], allowed_ips: ["127.0.0.1"],
+    }));
+    try { unlinkSync("/tmp/broker-exit.db"); } catch {}
+    const proc = Bun.spawn(["bun", "broker.ts"], {
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-exit.json",
+             CLAUDE_PEERS_DB: "/tmp/broker-exit.db", CLAUDE_PEERS_IDLE_EXIT_MS: "2500" },
+      stdout: "ignore", stderr: "ignore",
+    });
+    try {
+      // Phase 1: prove the broker actually launched. Without this, a broker that
+      // failed to start looks identical to one that self-exited (both: /health
+      // refused), which is a false pass. /health does not count as activity, so
+      // these probes do not extend the idle window.
+      let up = false;
+      for (let i = 0; i < 30; i++) {
+        try { if ((await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(300) })).ok) { up = true; break; } } catch {}
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      expect(up).toBe(true);
+      // Phase 2: with no peers and no activity, it self-exits after the idle window.
+      let down = false;
+      for (let i = 0; i < 40; i++) {
+        try { await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(300) }); }
+        catch { down = true; break; }
+        await new Promise((r) => setTimeout(r, 300));
+      }
+      expect(down).toBe(true);
+    } finally {
+      proc.kill();
+      try { unlinkSync("/tmp/broker-exit.db"); } catch {}
+      try { unlinkSync("/tmp/config-exit.json"); } catch {}
+    }
+  }, 25_000);
+
+  it("stays up with CLAUDE_PEERS_IDLE_EXIT_MS=0 even when idle (systemd-safe default)", async () => {
+    const PORT = 17909;
+    await Bun.write("/tmp/config-noexit.json", JSON.stringify({
+      machine: "noexit-a", tailscale_ip: "127.0.0.1", port: PORT, id_prefix: "nxa",
+      siblings: [], allowed_ips: ["127.0.0.1"],
+    }));
+    try { unlinkSync("/tmp/broker-noexit.db"); } catch {}
+    const proc = Bun.spawn(["bun", "broker.ts"], {
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-noexit.json",
+             CLAUDE_PEERS_DB: "/tmp/broker-noexit.db", CLAUDE_PEERS_IDLE_EXIT_MS: "0" },
+      stdout: "ignore", stderr: "ignore",
+    });
+    try {
+      let up = false;
+      for (let i = 0; i < 25; i++) {
+        try { if ((await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(300) })).ok) { up = true; break; } } catch {}
+        await new Promise((r) => setTimeout(r, 300));
+      }
+      expect(up).toBe(true);
+      // Wait well past any plausible short idle window, then confirm still alive.
+      await new Promise((r) => setTimeout(r, 4_000));
+      const res = await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(500) });
+      expect(res.ok).toBe(true);
+    } finally {
+      proc.kill();
+      try { unlinkSync("/tmp/broker-noexit.db"); } catch {}
+      try { unlinkSync("/tmp/config-noexit.json"); } catch {}
+    }
+  }, 15_000);
+});
