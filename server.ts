@@ -4,13 +4,11 @@
  *
  * Spawned by Claude Code as a stdio MCP server (one per instance).
  * Connects to the shared broker daemon for peer discovery and messaging.
- * Declares claude/channel capability to push inbound messages immediately.
+ * Reports its own tmux pane at registration so the broker can deliver messages
+ * straight into the session; non-tmux sessions read theirs via check_messages.
  *
- * Usage:
- *   claude --dangerously-load-development-channels server:claude-peers
- *
- * With .mcp.json:
- *   { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }
+ * Usage (plain MCP — no special flags needed for delivery):
+ *   { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }   // .mcp.json
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -24,13 +22,14 @@ import type {
   Peer,
   RegisterResponse,
   PollMessagesResponse,
-  Message,
 } from "./shared/types.ts";
+import { PROTOCOL_VERSION as REQUIRED_BROKER_PROTOCOL } from "./shared/types.ts";
 import {
   getGitBranch,
   getRecentFiles,
 } from "./shared/summarize.ts"; // used when populating peer context for federation (Task 6)
 import { loadConfig } from "./shared/config.ts";
+import { resolveTmuxTarget } from "./delivery.ts";
 
 const config = loadConfig();
 
@@ -38,16 +37,19 @@ const config = loadConfig();
 
 const BROKER_PORT = config.port;
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
-const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 
 // --- Broker communication ---
 
 async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  // Present the session token once we hold one. /register (pre-token) and /health carry none;
+  // the broker exempts /register and validates the rest against the call's principal.
+  if (myAuthToken) headers["Authorization"] = `Bearer ${myAuthToken}`;
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(body),
   });
   if (!res.ok) {
@@ -66,15 +68,50 @@ async function isBrokerAlive(): Promise<boolean> {
   }
 }
 
+async function brokerProtocolVersion(): Promise<number | null> {
+  try {
+    const res = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(2000) });
+    if (!res.ok) return null;
+    const h = await res.json() as { protocol_version?: number };
+    return typeof h.protocol_version === "number" ? h.protocol_version : null;
+  } catch { return null; }
+}
+
 async function ensureBroker(): Promise<void> {
   if (await isBrokerAlive()) {
-    log("Broker already running");
-    return;
+    const ver = await brokerProtocolVersion();
+    if (ver !== null && ver >= REQUIRED_BROKER_PROTOCOL) {
+      log("Broker already running");
+      return;
+    }
+    log(`Stale broker (protocol ${ver ?? "?"} < ${REQUIRED_BROKER_PROTOCOL}); retiring it`);
+    let retireRefused = false;
+    try {
+      const res = await fetch(`${BROKER_URL}/retire`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}", signal: AbortSignal.timeout(2000) });
+      // A protocol-1 broker has no /retire route and answers 404. Any non-ok status means the
+      // broker will not self-exit, so waiting out the drain loop below is pointless — fail fast
+      // with an accurate instruction instead of stalling 5s on a broker that cannot retire. A
+      // thrown fetch (broker exited mid-response) still falls through to the wait-and-see loop.
+      if (!res.ok) retireRefused = true;
+    } catch { /* it may exit before responding; confirm via the wait loop below */ }
+    if (retireRefused) {
+      throw new Error("The running claude-peers broker predates this version and cannot self-retire; run `bun cli.ts kill-broker` and retry.");
+    }
+    let freed = false;
+    for (let i = 0; i < 25; i++) {
+      await new Promise((r) => setTimeout(r, 200));
+      if (!(await isBrokerAlive())) { freed = true; break; }
+    }
+    if (!freed) throw new Error("A stale claude-peers broker is running; run `bun cli.ts kill-broker` and retry.");
   }
 
   log("Starting broker daemon...");
   const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
     stdio: ["ignore", "ignore", "inherit"],
+    // Opt this auto-launched broker into idle self-exit so it reaps itself once every
+    // peer is gone (no daemon supervisor here, unlike the systemd unit). Respect an
+    // existing override. The broker treats <=0 as "never self-exit".
+    env: { ...process.env, CLAUDE_PEERS_IDLE_EXIT_MS: process.env.CLAUDE_PEERS_IDLE_EXIT_MS ?? "600000" },
     // Detach so the broker survives if this MCP server exits
     // On macOS/Linux, the broker will keep running
   });
@@ -138,6 +175,10 @@ function getTty(): string | null {
 // --- State ---
 
 let myId: PeerId | null = null;
+// Per-session capability token, minted by the broker at /register. brokerFetch presents it
+// (Authorization: Bearer) on every mutating control-plane call so the broker can bind the
+// call to this session. Null before registration — /register itself needs no token.
+let myAuthToken: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 
@@ -147,20 +188,19 @@ const mcp = new Server(
   { name: "claude-peers", version: "0.1.0" },
   {
     capabilities: {
-      experimental: { "claude/channel": {} },
       tools: {},
     },
     instructions: `You are connected to the claude-peers network. Other Claude Code instances on this machine and across the network can see you and send you messages. Peers on other machines are marked with their hostname. Messages to remote peers are routed automatically.
 
-IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
+How messages reach you: if you are running in a tmux pane, the broker types an incoming peer message straight into your session. It arrives inline as a line beginning with "[peer <from_id> #<n>]" followed by the text and a reply hint. If you are NOT in a tmux pane, messages queue instead — call check_messages to read them.
 
-Read the from_id, from_summary, and from_cwd attributes to understand who sent the message. Reply by calling send_message with their from_id.
+IMPORTANT: When a "[peer ...]" message appears, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply with send_message to the from_id shown in the message, then resume your work. Treat it like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
 
 Available tools:
 - list_peers: Discover other Claude Code instances (scope: machine/directory/repo)
 - send_message: Send a message to another instance by ID
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
-- check_messages: Manually check for new messages
+- check_messages: Read messages that were queued rather than pushed into your session
 
 When you start, proactively call set_summary to describe what you're working on. This helps other instances understand your context.`,
   }
@@ -189,7 +229,7 @@ const TOOLS = [
   {
     name: "send_message",
     description:
-      "Send a message to another Claude Code instance by peer ID. The message will be pushed into their session immediately via channel notification.",
+      "Send a message to another Claude Code instance by peer ID. If the peer is in a tmux session it is delivered into their session; otherwise it is queued for their next check_messages.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -223,7 +263,7 @@ const TOOLS = [
   {
     name: "check_messages",
     description:
-      "Manually check for new messages from other Claude Code instances. Messages are normally pushed automatically via channel notifications, but you can use this as a fallback.",
+      "Check for messages from other Claude Code instances that were queued rather than pushed into your session. Returns and clears the queued messages.",
     inputSchema: {
       type: "object" as const,
       properties: {},
@@ -306,7 +346,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
-        const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
+        const result = await brokerFetch<{ ok: boolean; error?: string; delivery?: string }>("/send-message", {
           from_id: myId,
           to_id,
           text: message,
@@ -317,8 +357,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             isError: true,
           };
         }
+        const how = result.delivery === "accepted"
+          ? " (pushed to their session)"
+          : " (queued; they'll see it on their next check)";
         return {
-          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}` }],
+          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}${how}` }],
         };
       } catch (e) {
         return {
@@ -402,70 +445,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 });
 
-// --- Polling loop for inbound messages ---
-
-async function pollAndPushMessages() {
-  if (!myId) return;
-
-  try {
-    // Peek at messages without marking them delivered
-    const result = await brokerFetch<PollMessagesResponse>("/peek-messages", { id: myId });
-    if (result.messages.length === 0) return;
-
-    const ackedIds: number[] = [];
-
-    for (const msg of result.messages) {
-      // Look up the sender's info for context
-      let fromSummary = "";
-      let fromCwd = "";
-      try {
-        const peers = await brokerFetch<Peer[]>("/list-peers", {
-          scope: "machine",
-          cwd: myCwd,
-          git_root: myGitRoot,
-        });
-        const sender = peers.find((p) => p.id === msg.from_id);
-        if (sender) {
-          fromSummary = sender.summary;
-          fromCwd = sender.cwd;
-        }
-      } catch {
-        // Non-critical, proceed without sender info
-      }
-
-      // Try to push as channel notification
-      try {
-        await mcp.notification({
-          method: "notifications/claude/channel",
-          params: {
-            content: msg.text,
-            meta: {
-              from_id: msg.from_id,
-              from_summary: fromSummary,
-              from_cwd: fromCwd,
-              sent_at: msg.sent_at,
-            },
-          },
-        });
-        // Channel push succeeded — mark this message for ack
-        ackedIds.push(msg.id);
-        log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
-      } catch {
-        // Channel push failed (no channel flag) — leave message for check_messages
-        log(`Channel push failed for message ${msg.id}, leaving for manual check`);
-      }
-    }
-
-    // Only ack messages that were successfully pushed via channel
-    if (ackedIds.length > 0) {
-      await brokerFetch("/ack-messages", { ids: ackedIds });
-    }
-  } catch (e) {
-    // Broker might be down temporarily, don't crash
-    log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
-  }
-}
-
 // --- Startup ---
 
 async function main() {
@@ -482,6 +461,7 @@ async function main() {
   log(`TTY: ${tty ?? "(unknown)"}`);
 
   // 3. Register with broker
+  const tmuxTarget = resolveTmuxTarget(process.env);
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: process.pid,
     cwd: myCwd,
@@ -490,27 +470,18 @@ async function main() {
     summary: "",
     machine: config.machine,
     tailscale_ip: config.tailscale_ip,
+    tmux_pane: tmuxTarget?.pane ?? null,
+    tmux_socket: tmuxTarget?.socket ?? null,
   });
   myId = reg.id;
+  myAuthToken = reg.token; // capability for every subsequent control-plane call this session
   log(`Registered as peer ${myId}`);
 
   // 5. Connect MCP over stdio
   await mcp.connect(new StdioServerTransport());
   log("MCP connected");
 
-  // 6. Start polling for inbound messages (only if channel push is explicitly enabled)
-  // mcp.notification() silently no-ops when the channel capability isn't loaded,
-  // so the poll loop acks messages that were never delivered. Only enable if the
-  // user explicitly opts in via CLAUDE_PEERS_CHANNEL=1 env var.
-  const channelEnabled = process.env.CLAUDE_PEERS_CHANNEL === "1";
-  const pollTimer = channelEnabled
-    ? setInterval(pollAndPushMessages, POLL_INTERVAL_MS)
-    : null;
-  if (!channelEnabled) {
-    log("Poll loop disabled — messages delivered via check_messages only. Set CLAUDE_PEERS_CHANNEL=1 to enable channel push.");
-  }
-
-  // 7. Start heartbeat
+  // 6. Start heartbeat
   const heartbeatTimer = setInterval(async () => {
     if (myId) {
       try {
@@ -523,7 +494,6 @@ async function main() {
 
   // 8. Clean up on exit
   const cleanup = async () => {
-    if (pollTimer) clearInterval(pollTimer);
     clearInterval(heartbeatTimer);
     if (myId) {
       try {
