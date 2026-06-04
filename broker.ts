@@ -442,7 +442,12 @@ if (import.meta.main) {
 
   async function handleSendMessage(body: SendMessageRequest): Promise<SendResult> {
     const localTarget = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id);
-    if (localTarget) {
+    // Accept the local route only for a row whose process is still alive. A peer's row outlives
+    // its process between cleanup sweeps (deletion is decoupled from listing), and queuing a
+    // message under a dead local id is a false positive: no live session can poll it and the
+    // next sweep deletes it. A dead row is treated as absent so the caller gets an honest
+    // result (a sibling, or "not found") instead of an ok that silently drops the message.
+    if (localTarget && peerStillLive(body.to_id)) {
       insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
       const disposition = (await deliverNext(body.to_id)) ?? "queued";
       if (disposition === "accepted") await drainAfterDelivery(body.to_id);
@@ -480,8 +485,11 @@ if (import.meta.main) {
       console.error(`[claude-peers broker] Warning: received protocol_version ${body.protocol_version}, expected ${PROTOCOL_VERSION}`);
     }
     const localTarget = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id);
-    if (!localTarget) {
-      console.error(`[claude-peers broker] Dropping forwarded message: unknown local peer ${body.to_id}`);
+    // Same liveness gate as the local send route: a stale row for a dead process is not a valid
+    // recipient. Accepting the forward would queue a message the next sweep deletes and hand the
+    // originating broker a false ok, so reject it and let the sender learn the peer is gone.
+    if (!localTarget || !peerStillLive(body.to_id)) {
+      console.error(`[claude-peers broker] Dropping forwarded message: no live local peer ${body.to_id}`);
       return { ok: false };
     }
     insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());

@@ -778,3 +778,62 @@ describe("federation traffic does not defeat idle self-exit", () => {
     }
   }, 25_000);
 });
+
+// A peer's row outlives its process between cleanup sweeps (Task 10 decoupled deletion from
+// listing). A send or forward to that stale row must not be accepted-then-silently-dropped:
+// the recipient is gone, the queued message is unreachable, and the next sweep deletes it, so
+// an ok:true here is a false positive. Both accept paths re-check liveness, not just row
+// existence, and report honestly.
+describe("send/forward to a dead-but-unswept local peer is honest", () => {
+  const PORT = 17915;
+  let proc: any;
+
+  beforeAll(async () => {
+    await Bun.write("/tmp/config-deadlocal.json", JSON.stringify({
+      machine: "dl-a", tailscale_ip: "127.0.0.1", port: PORT, id_prefix: "dla",
+      siblings: [], allowed_ips: ["127.0.0.1"],
+    }));
+    try { unlinkSync("/tmp/broker-deadlocal.db"); } catch {}
+    proc = Bun.spawn(["bun", "broker.ts"], {
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-deadlocal.json", CLAUDE_PEERS_DB: "/tmp/broker-deadlocal.db" },
+      stdout: "ignore", stderr: "inherit",
+    });
+    for (let i = 0; i < 20; i++) { try { if ((await fetch(`http://127.0.0.1:${PORT}/health`)).ok) break; } catch {} await new Promise((r) => setTimeout(r, 300)); }
+  });
+
+  afterAll(() => {
+    proc?.kill();
+    try { unlinkSync("/tmp/broker-deadlocal.db"); } catch {}
+    try { unlinkSync("/tmp/config-deadlocal.json"); } catch {}
+  });
+
+  // Register a peer whose process is already dead, so its row exists but no live session can
+  // ever poll the id. The next cleanup sweep is ~15s away, leaving the stale-row window open.
+  async function registerDeadPeer(): Promise<string> {
+    const dead = Bun.spawn(["sleep", "60"]);
+    dead.kill();
+    await dead.exited; // pid is now dead and reaped
+    const reg = await brokerFetch(PORT, "/register", {
+      pid: dead.pid, cwd: "/tmp/dl", git_root: null, tty: null, summary: "",
+      machine: "dl-a", tailscale_ip: "127.0.0.1", tmux_pane: null, tmux_socket: null,
+    }) as any;
+    return reg.id;
+  }
+
+  it("does not falsely accept a /send-message to a local peer whose process is gone", async () => {
+    const deadId = await registerDeadPeer();
+    const result = await brokerFetch(PORT, "/send-message", {
+      from_id: "dla-sender0", to_id: deadId, text: "to a ghost",
+    }) as any;
+    expect(result.ok).toBe(false);
+  }, 15_000);
+
+  it("does not falsely accept a /forward-message to a local peer whose process is gone", async () => {
+    const deadId = await registerDeadPeer();
+    const result = await brokerFetch(PORT, "/forward-message", {
+      protocol_version: 2, from_id: "remote-sender0", to_id: deadId,
+      text: "forwarded to a ghost", from_machine: "other-machine",
+    }) as any;
+    expect(result.ok).toBe(false);
+  }, 15_000);
+});
