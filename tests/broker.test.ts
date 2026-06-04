@@ -251,4 +251,24 @@ describe("resolveTargetBroker", () => {
   it("returns null for unknown peer ID", () => {
     expect(resolveTargetBroker(db, "xxx-unknown1", siblings)).toBeNull();
   });
+
+  // Regression: issue #17. A peer is visible in list_peers but every send_message
+  // bounces "Peer not found" because the sibling config's machine casing differs
+  // from the name the remote broker broadcasts in its gossip.
+  it("resolves when sibling config casing differs from the broadcast machine name", () => {
+    // The A4000 (2026-06-04) broadcasts machine "A4000"; the sibling was configured "a4000".
+    const lowercaseSiblings = [{ machine: "a4000", url: "http://100.73.117.41:7899" }];
+    db.run("INSERT INTO remote_peers (id, machine, tailscale_ip, pid, cwd, summary, registered_at, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      ["a40-8qp0moq4", "A4000", "100.73.117.41", 3000, "C:\\WINDOWS\\system32", "", new Date().toISOString(), new Date().toISOString()]);
+
+    expect(resolveTargetBroker(db, "a40-8qp0moq4", lowercaseSiblings)).toBe("http://100.73.117.41:7899");
+  });
+
+  it("matches machine names case-insensitively regardless of which side is uppercase", () => {
+    const uppercaseSiblings = [{ machine: "OFFICEJAWN", url: "http://100.84.214.24:7899" }];
+    db.run("INSERT INTO remote_peers (id, machine, tailscale_ip, pid, cwd, summary, registered_at, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      ["ofj-mixed111", "officejawn", "100.84.214.24", 4000, "/tmp", "", new Date().toISOString(), new Date().toISOString()]);
+
+    expect(resolveTargetBroker(db, "ofj-mixed111", uppercaseSiblings)).toBe("http://100.84.214.24:7899");
+  });
 });
