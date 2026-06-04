@@ -1,5 +1,6 @@
 // tests/integration.test.ts
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
+import { Database } from "bun:sqlite";
 import { unlinkSync, mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -90,6 +91,20 @@ async function rawPost(port: number, path: string, body: unknown, token?: string
   let json: any = null;
   try { json = JSON.parse(await res.text()); } catch {}
   return { status: res.status, json };
+}
+
+// Insert a peer row with a NULL token straight into a broker's SQLite file, modelling a v2 peer
+// whose row migrated forward before tokens existed. This is the only principal the unsigned grace
+// may wave through without a token. The broker reads tokens per-call (a fresh SELECT), so it sees
+// this NULL token immediately; a dead pid is fine because a sender is never a delivery target.
+function insertLegacyPeer(dbPath: string, id: string, machine: string): void {
+  const db = new Database(dbPath);
+  db.exec("PRAGMA busy_timeout=3000");
+  const now = new Date().toISOString();
+  db.prepare(
+    "INSERT INTO peers (id, pid, machine, tailscale_ip, cwd, git_root, tty, summary, registered_at, last_seen, tmux_pane, tmux_socket, delivery_kind, token) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"
+  ).run(id, 999_999, machine, "127.0.0.1", "/tmp/legacy", null, null, "", now, now, null, null, "none");
+  db.close();
 }
 
 describe("two-broker federation", () => {
@@ -1127,10 +1142,18 @@ describe("per-session capability tokens (enforced)", () => {
     expect(ok.status).toBe(200);
   });
 
-  it("leaves /list-peers token-free (read-only browsing)", async () => {
+  it("never serializes the capability token into the token-exempt /list-peers", async () => {
+    // /list-peers is read-only and token-exempt, so leaking the token column here would hand any
+    // loopback caller every peer's credential and defeat the whole gate. Register a live peer so
+    // the listing has a real row carrying a (secret) token, then assert no row exposes it.
+    const p = await registerAndGetToken(PORT, { cwd: "/tmp/t-list", pid: process.pid });
     const r = await rawPost(PORT, "/list-peers", { scope: "machine", cwd: "/", git_root: null });
     expect(r.status).toBe(200);
     expect(Array.isArray(r.json)).toBe(true);
+    const me = (r.json as any[]).find((x) => x.id === p.id);
+    expect(me).toBeDefined();
+    expect("token" in me).toBe(false);
+    expect((r.json as any[]).every((x) => !("token" in x))).toBe(true);
   });
 });
 
@@ -1150,13 +1173,37 @@ describe("per-session capability tokens (CLAUDE_PEERS_ALLOW_UNSIGNED grace)", ()
   });
   afterAll(() => { proc?.kill(); try { unlinkSync("/tmp/broker-tkg.db"); } catch {} try { unlinkSync("/tmp/config-tkg.json"); } catch {} });
 
-  it("accepts an unsigned send under the grace flag", async () => {
+  it("accepts an unsigned send only from a genuine pre-v3 (NULL-token) row", async () => {
     const recip = await registerAndGetToken(PORT, { cwd: "/tmp/g-r1", pid: process.pid });
-    const r = await rawPost(PORT, "/send-message", { from_id: "legacy-sender", to_id: recip.id, text: "grace hello" });
+    // A real migrated v2 peer: a row that exists but whose token was never minted.
+    const legacyId = "legacy-null-token-sender";
+    insertLegacyPeer("/tmp/broker-tkg.db", legacyId, "tkg-a");
+    const r = await rawPost(PORT, "/send-message", { from_id: legacyId, to_id: recip.id, text: "grace hello" });
     expect(r.status).toBe(200);
     const poll = await brokerFetch(PORT, "/poll-messages", { id: recip.id }, recip.token) as any;
     expect(poll.messages).toHaveLength(1);
     expect(poll.messages[0].text).toBe("grace hello");
+  });
+
+  it("rejects an unsigned send from a principal that already holds a token, even under grace", async () => {
+    // The grace flag must not let header omission impersonate a token-bearing peer — otherwise the
+    // from_id forgery this commit closes would reopen for the whole upgrade window. Only NULL-token
+    // legacy rows get the pass; a minted-token principal must always present its token.
+    const holder = await registerAndGetToken(PORT, { cwd: "/tmp/g-holder" });
+    const recip = await registerAndGetToken(PORT, { cwd: "/tmp/g-r3", pid: process.pid });
+    const r = await rawPost(PORT, "/send-message", { from_id: holder.id, to_id: recip.id, text: "should not pass" });
+    expect(r.status).toBe(401);
+    const poll = await brokerFetch(PORT, "/poll-messages", { id: recip.id }, recip.token) as any;
+    expect(poll.messages).toHaveLength(0);
+  });
+
+  it("rejects an unsigned unregister of a token-holding peer, even under grace", async () => {
+    const victim = await registerAndGetToken(PORT, { cwd: "/tmp/g-victim", pid: process.pid });
+    const r = await rawPost(PORT, "/unregister", { id: victim.id });
+    expect(r.status).toBe(401);
+    // The victim still has a token row and a live pid, so it remains listed: it was not removed.
+    const list = await rawPost(PORT, "/list-peers", { scope: "machine", cwd: "/", git_root: null });
+    expect((list.json as any[]).some((x) => x.id === victim.id)).toBe(true);
   });
 
   it("still rejects a wrong token even under the grace flag", async () => {
