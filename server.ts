@@ -24,10 +24,6 @@ import type {
   PollMessagesResponse,
 } from "./shared/types.ts";
 import { PROTOCOL_VERSION as REQUIRED_BROKER_PROTOCOL } from "./shared/types.ts";
-import {
-  getGitBranch,
-  getRecentFiles,
-} from "./shared/summarize.ts"; // used when populating peer context for federation (Task 6)
 import { loadConfig } from "./shared/config.ts";
 import { resolveTmuxTarget } from "./delivery.ts";
 
@@ -46,7 +42,7 @@ async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   // Present the session token once we hold one. /register (pre-token) and /health carry none;
   // the broker exempts /register and validates the rest against the call's principal.
-  if (myAuthToken) headers["Authorization"] = `Bearer ${myAuthToken}`;
+  if (myAuthToken) headers.Authorization = `Bearer ${myAuthToken}`;
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
     headers,

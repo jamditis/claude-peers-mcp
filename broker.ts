@@ -10,10 +10,10 @@
 import { Database } from "bun:sqlite";
 import { loadConfig, type SiblingConfig } from "./shared/config.ts";
 import type {
-  RegisterRequest, RegisterResponse, HeartbeatRequest,
-  SetSummaryRequest, ListPeersRequest, SendMessageRequest,
+  RegisterRequest, RegisterResponse, ListPeersRequest, SendMessageRequest,
   PollMessagesRequest, PollMessagesResponse, Peer, Message,
   GossipRequest, ForwardMessageRequest, SendResult,
+  ControlPlaneRequest,
 } from "./shared/types.ts";
 import {
   ensureMessagesTable, migrateMessagesSchema, resetDeliveringOnStart,
@@ -34,7 +34,7 @@ const GOSSIP_SUMMARY_INTERVAL_MS = 5 * 60_000;
 
 export function generatePeerId(prefix: string): string {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-  let id = prefix + "-";
+  let id = `${prefix}-`;
   for (let i = 0; i < 8; i++) {
     id += chars[Math.floor(Math.random() * chars.length)];
   }
@@ -381,7 +381,7 @@ if (import.meta.main) {
     const row = nextDeliverable(db, toId, now, activeRowIds);
     if (!row) return null;
     const target = peerDelivery(toId);
-    if (!target || target.kind !== "tmux" || !target.pane || !tmuxAvailable()) return "queued";
+    if (target?.kind !== "tmux" || !target.pane || !tmuxAvailable()) return "queued";
 
     if (row.delivery_state === "delivering") {
       if (!reclaimIfExpired(db, row.id, now)) return null; // someone else owns it
@@ -441,7 +441,7 @@ if (import.meta.main) {
     // old id's mail is dropped, not carried over — the new session polls under its own id.
     if (existing) removePeerOrDefer(existing.id);
     const pane = body.tmux_pane && /^%\d+$/.test(body.tmux_pane) ? body.tmux_pane : null;
-    const socket = body.tmux_socket && body.tmux_socket.startsWith("/") ? body.tmux_socket : null;
+    const socket = body.tmux_socket?.startsWith("/") ? body.tmux_socket : null;
     const kind = pane ? "tmux" : "none";
     // Mint a per-session capability token. The peer presents it on every mutating
     // control-plane call; the gate binds the call's principal (from_id/id) to it.
@@ -475,7 +475,7 @@ if (import.meta.main) {
 
     let allPeers: Peer[];
     if (body.scope === "machine") {
-      const remotePeers = (selectAllRemotePeers.all() as any[]).map(p => ({ ...stripToken(p), is_remote: true }));
+      const remotePeers = (selectAllRemotePeers.all() as Peer[]).map(p => ({ ...stripToken(p), is_remote: true }));
       allPeers = [...localPeers, ...remotePeers];
     } else {
       allPeers = localPeers;
@@ -683,8 +683,8 @@ if (import.meta.main) {
       if (req.method !== "POST") {
         if (path === "/health") {
           return Response.json({
-            status: "ok", peers: (selectAllPeers.all() as any[]).length,
-            machine: config.machine, remote_peer_count: (selectAllRemotePeers.all() as any[]).length,
+            status: "ok", peers: (selectAllPeers.all() as unknown[]).length,
+            machine: config.machine, remote_peer_count: (selectAllRemotePeers.all() as unknown[]).length,
             protocol_version: PROTOCOL_VERSION,
           });
         }
@@ -704,7 +704,9 @@ if (import.meta.main) {
       }
 
       try {
-        const body = await req.json();
+        // Loopback-gated control plane, single trusted client (our MCP server) — see
+        // ControlPlaneRequest. The cast restores the per-route field types from `unknown`.
+        const body = (await req.json()) as ControlPlaneRequest;
         // Per-session capability auth, before the idle bump (an unauthorized request is neither
         // trusted input nor real traffic, like the loopback gate above). Every mutating control-
         // plane call binds to the session that registered it: the presented Authorization: Bearer
