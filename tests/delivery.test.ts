@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
-import { unlinkSync } from "fs";
+import { unlinkSync } from "node:fs";
 import { ensureMessagesTable, migrateMessagesSchema } from "../delivery.ts";
 import {
-  generateLeaseToken, claimForDelivery, confirmDelivered,
+  claimForDelivery, confirmDelivered,
   releaseToQueued, resetDeliveringOnStart, reclaimIfExpired,
 } from "../delivery.ts";
 import { resolveTmuxTarget, formatPeerMessage, PASTE_START, PASTE_END } from "../delivery.ts";

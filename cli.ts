@@ -29,7 +29,7 @@ const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 async function brokerFetch<T>(path: string, body?: unknown, token?: string): Promise<T> {
   const headers: Record<string, string> = {};
   if (body) headers["Content-Type"] = "application/json";
-  if (token) headers["Authorization"] = `Bearer ${token}`;
+  if (token) headers.Authorization = `Bearer ${token}`;
   const opts: RequestInit = body
     ? { method: "POST", headers, body: JSON.stringify(body) }
     : Object.keys(headers).length ? { headers } : {};
@@ -232,7 +232,7 @@ switch (cmd) {
         .split("\n")
         .filter((p) => p);
       for (const pid of pids) {
-        process.kill(parseInt(pid), "SIGTERM");
+        process.kill(parseInt(pid, 10), "SIGTERM");
       }
       console.log("Broker stopped.");
     } catch {

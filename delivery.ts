@@ -109,16 +109,20 @@ export function resetDeliveringOnStart(db: Database): number {
 export const PASTE_START = "\x1b[200~";
 export const PASTE_END = "\x1b[201~";
 
-/** Validate a session's own $TMUX/$TMUX_PANE into a delivery target, or null. */
+/**
+ * Validate a session's own $TMUX/$TMUX_PANE into a delivery target, or null.
+ * The index signature lets `process.env` (a string-keyed map) be passed directly;
+ * only TMUX and TMUX_PANE are read.
+ */
 export function resolveTmuxTarget(
-  env: { TMUX?: string | null; TMUX_PANE?: string | null },
+  env: { TMUX?: string | null; TMUX_PANE?: string | null; [key: string]: string | null | undefined },
 ): { pane: string; socket: string | null } | null {
   const pane = env.TMUX_PANE ?? "";
   if (!/^%\d+$/.test(pane)) return null;
   let socket: string | null = null;
   if (env.TMUX) {
     const candidate = env.TMUX.split(",")[0];
-    if (candidate && candidate.startsWith("/")) socket = candidate;
+    if (candidate?.startsWith("/")) socket = candidate;
   }
   return { pane, socket };
 }
@@ -133,6 +137,7 @@ export function resolveTmuxTarget(
 // UTF-8 encoding preserves U+009B end to end, so the ESC-only strip alone is bypassable.
 // Newlines are kept so a multi-line message still pastes as one.
 function stripControl(s: string): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: deliberately strips C0/C1 control chars (incl. ESC) to neutralize bracketed-paste injection — see comment above.
   return s.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
 }
 
@@ -240,7 +245,7 @@ export function isFederationRoute(path: string): boolean {
  */
 export function isPidDead(probe: () => void): boolean {
   try { probe(); return false; }
-  catch (e: any) { return e?.code === "ESRCH"; }
+  catch (e) { return (e as NodeJS.ErrnoException | null)?.code === "ESRCH"; }
 }
 
 /** The standard probe: signal 0 to a pid. Throws (ESRCH) if the pid is gone. */

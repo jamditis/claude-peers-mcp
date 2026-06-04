@@ -1,5 +1,9 @@
 # claude-peers
 
+[![CI](https://github.com/jamditis/claude-peers-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/jamditis/claude-peers-mcp/actions/workflows/ci.yml)
+
+Continuous integration runs typecheck, lint, and tests on every push and pull request.
+
 Let your Claude Code instances find each other and talk. When you're running 5 sessions across different projects, any Claude can discover the others and send messages that arrive instantly.
 
 ```
