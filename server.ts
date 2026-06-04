@@ -11,6 +11,7 @@
  *   { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }   // .mcp.json
  */
 
+import { fileURLToPath } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -34,7 +35,10 @@ const config = loadConfig();
 const BROKER_PORT = config.port;
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const HEARTBEAT_INTERVAL_MS = 15_000;
-const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
+// fileURLToPath, not URL.pathname: on Windows .pathname yields "/C:/Users/Joe%20Amditis/..."
+// (leading slash + percent-encoded spaces), which Bun.spawn cannot resolve. fileURLToPath
+// decodes and uses native separators on every platform.
+const BROKER_SCRIPT = fileURLToPath(new URL("./broker.ts", import.meta.url));
 
 // --- Broker communication ---
 
