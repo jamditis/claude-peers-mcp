@@ -439,6 +439,9 @@ if (import.meta.main) {
     }
     localPeers = localPeers
       .filter(p => !isPidDead(pidProbe(p.pid)))
+      // A peer pending deferred deletion is logically gone: its row lingers only so an in-flight
+      // lease can settle. Don't advertise it, or a peer would address a superseded/departing id.
+      .filter(p => !pendingPeerDeletes.has(p.id))
       .map(p => ({ ...p, is_remote: false }));
 
     let allPeers: Peer[];
@@ -454,12 +457,14 @@ if (import.meta.main) {
 
   async function handleSendMessage(body: SendMessageRequest): Promise<SendResult> {
     const localTarget = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id);
-    // Accept the local route only for a row whose process is still alive. A peer's row outlives
-    // its process between cleanup sweeps (deletion is decoupled from listing), and queuing a
-    // message under a dead local id is a false positive: no live session can poll it and the
-    // next sweep deletes it. A dead row is treated as absent so the caller gets an honest
-    // result (a sibling, or "not found") instead of an ok that silently drops the message.
-    if (localTarget && peerStillLive(body.to_id)) {
+    // Accept the local route only for a row whose process is still alive AND not pending deferred
+    // deletion. A peer's row outlives its process between cleanup sweeps (deletion is decoupled
+    // from listing), and a peer pending deferred deletion (pendingPeerDeletes — superseded by a
+    // same-pid re-register, or mid-unregister) shares the live pid yet is logically gone. Queuing
+    // under either is a false positive: no valid session polls it, and the deferred delete or next
+    // sweep wipes it. Treat both as absent so the caller gets an honest result (a sibling, or "not
+    // found") instead of an ok that silently drops the message.
+    if (localTarget && peerStillLive(body.to_id) && !pendingPeerDeletes.has(body.to_id)) {
       insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
       const disposition = (await deliverNext(body.to_id)) ?? "queued";
       if (disposition === "accepted") await drainAfterDelivery(body.to_id);
@@ -497,10 +502,12 @@ if (import.meta.main) {
       console.error(`[claude-peers broker] Warning: received protocol_version ${body.protocol_version}, expected ${PROTOCOL_VERSION}`);
     }
     const localTarget = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id);
-    // Same liveness gate as the local send route: a stale row for a dead process is not a valid
-    // recipient. Accepting the forward would queue a message the next sweep deletes and hand the
-    // originating broker a false ok, so reject it and let the sender learn the peer is gone.
-    if (!localTarget || !peerStillLive(body.to_id)) {
+    // Same gate as the local send route: a stale row for a dead process, or a peer pending
+    // deferred deletion (pendingPeerDeletes — logically gone, row kept only for its in-flight
+    // lease), is not a valid recipient. Accepting the forward would queue a message the deferred
+    // delete or next sweep deletes and hand the originating broker a false ok, so reject it and
+    // let the sender learn the peer is gone.
+    if (!localTarget || !peerStillLive(body.to_id) || pendingPeerDeletes.has(body.to_id)) {
       console.error(`[claude-peers broker] Dropping forwarded message: no live local peer ${body.to_id}`);
       return { ok: false };
     }
