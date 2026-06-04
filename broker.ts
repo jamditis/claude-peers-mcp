@@ -89,6 +89,17 @@ export function toGossipPeer(p: Peer): Peer {
   };
 }
 
+// Strip the secret capability token before a peer crosses the /list-peers boundary. That route is
+// token-exempt (read-only browsing), so serializing the token column `SELECT *` reads off the row
+// would hand any loopback caller every peer's credential — enough to impersonate it on the gated
+// routes. The local-only tmux coordinates a lister saw before stay (they are loopback data; gossip
+// strips them via its own allow-list projection, toGossipPeer). token is not on the Peer type, so
+// the cast names the runtime-only column the destructure removes.
+export function stripToken(p: Peer): Peer {
+  const { token: _token, ...rest } = p as Peer & { token?: string | null };
+  return rest;
+}
+
 export interface GossipFailureState {
   firstFailureAt: number;
   lastSummaryAt: number;
@@ -453,11 +464,12 @@ if (import.meta.main) {
       // A peer pending deferred deletion is logically gone: its row lingers only so an in-flight
       // lease can settle. Don't advertise it, or a peer would address a superseded/departing id.
       .filter(p => !pendingPeerDeletes.has(p.id))
-      .map(p => ({ ...p, is_remote: false }));
+      // stripToken: never serialize the capability token into this token-exempt route.
+      .map(p => ({ ...stripToken(p), is_remote: false }));
 
     let allPeers: Peer[];
     if (body.scope === "machine") {
-      const remotePeers = (selectAllRemotePeers.all() as any[]).map(p => ({ ...p, is_remote: true }));
+      const remotePeers = (selectAllRemotePeers.all() as any[]).map(p => ({ ...stripToken(p), is_remote: true }));
       allPeers = [...localPeers, ...remotePeers];
     } else {
       allPeers = localPeers;
@@ -693,9 +705,10 @@ if (import.meta.main) {
         // token must equal the stored token for the call's principal — from_id for /send-message,
         // which is what blocks forging a sender; id otherwise. Exempt: /register (mints the token),
         // /retire (a broker-lifecycle call from a NEW server that never registered here, so it
-        // holds no token), /list-peers (read-only browsing), and federation routes (cross-machine,
-        // IP-gated; the token never crosses a machine boundary). A missing token 401s unless
-        // ALLOW_UNSIGNED (the upgrade grace); a wrong token always 401s.
+        // holds no token), /list-peers (read-only browsing, and it must strip the token column it
+        // would otherwise return), and federation routes (cross-machine, IP-gated; the token never
+        // crosses a machine boundary). A missing token 401s unless ALLOW_UNSIGNED AND the principal
+        // is a genuine pre-v3 NULL-token row (see below); a wrong token always 401s.
         const tokenExempt = path === "/register" || path === "/retire" || path === "/list-peers" || isFederationRoute(path);
         if (!tokenExempt) {
           const principal = path === "/send-message" ? body.from_id : body.id;
@@ -703,7 +716,13 @@ if (import.meta.main) {
           const presented = auth.startsWith("Bearer ") ? auth.slice(7) : null;
           const row = principal ? (tokenForPeer.get(principal) as { token: string | null } | null) : null;
           const valid = presented !== null && row?.token != null && row.token === presented;
-          if (!valid && !(ALLOW_UNSIGNED && presented === null)) {
+          // The unsigned grace covers exactly one principal: a genuine pre-v3 row whose token is
+          // still NULL — a legacy client that registered before tokens existed and cannot present
+          // one yet. A principal that already minted a token must ALWAYS present it, or mere header
+          // omission would reopen the from_id forgery for the whole upgrade window; an unknown
+          // principal (no row) is not a legacy peer either, so it gets no pass.
+          const legacyUnsigned = ALLOW_UNSIGNED && presented === null && row != null && row.token == null;
+          if (!valid && !legacyUnsigned) {
             return Response.json({ ok: false, error: "unauthorized" }, { status: 401 });
           }
         }
