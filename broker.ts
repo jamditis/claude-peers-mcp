@@ -77,6 +77,18 @@ export function resolveTargetBroker(
   return sibling?.url ?? null;
 }
 
+// Project a peer down to the fields that may cross a machine boundary. The local-only delivery
+// coordinates (tmux_pane, tmux_socket, delivery_kind) must never leave this host (see
+// shared/types.ts). The federated fields are listed explicitly so a future local-only column is
+// excluded by default instead of silently riding along in a gossip payload to every sibling.
+export function toGossipPeer(p: Peer): Peer {
+  return {
+    id: p.id, pid: p.pid, machine: p.machine, tailscale_ip: p.tailscale_ip,
+    cwd: p.cwd, git_root: p.git_root, tty: p.tty, summary: p.summary,
+    registered_at: p.registered_at, last_seen: p.last_seen,
+  };
+}
+
 export interface GossipFailureState {
   firstFailureAt: number;
   lastSummaryAt: number;
@@ -540,9 +552,13 @@ if (import.meta.main) {
   const gossipFailureStates = new Map<string, GossipFailureState>();
 
   async function gossipToSiblings(peerList?: Peer[]) {
-    const peers = peerList ?? (selectAllPeers.all() as Peer[]).filter(p => {
+    const sourcePeers = peerList ?? (selectAllPeers.all() as Peer[]).filter(p => {
       try { process.kill(p.pid, 0); return true; } catch { return false; }
     });
+    // Project every peer through the federated allow-list before it crosses a machine boundary,
+    // regardless of whether the caller passed an explicit list or we read the table. This keeps the
+    // local-only delivery coordinates (tmux_pane/tmux_socket/delivery_kind) on this host.
+    const peers = sourcePeers.map(toGossipPeer);
     for (const sibling of config.siblings) {
       let succeeded = false;
       let errorMessage = "";
@@ -592,12 +608,11 @@ if (import.meta.main) {
     if ((selectAllPeers.all() as unknown[]).length > 0) return;
     if (Date.now() - lastActivityAt <= IDLE_EXIT_MS) return;
     console.error("[claude-peers broker] idle with no peers; exiting");
-    clearInterval(gossipTimer);
-    clearInterval(cleanupTimer);
-    if (idleTimer) clearInterval(idleTimer);
-    try { httpServer?.stop(true); } catch {}
-    db.close();
-    process.exit(0);
+    // Route through retire() rather than duplicating teardown here: retire() announces an empty
+    // peer list to siblings (so they drop this broker's peers instead of carrying them stale until
+    // their own sweep), clears the same timers, and is idempotent. maybeIdleExit already bailed on
+    // `retiring`, so a re-entrant idle tick during the retire window is a no-op.
+    void retire();
   }
   const idleTimer = IDLE_EXIT_MS > 0
     ? setInterval(maybeIdleExit, Math.max(1_000, Math.min(IDLE_EXIT_MS, CLEANUP_INTERVAL_MS)))
