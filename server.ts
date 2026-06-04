@@ -185,7 +185,7 @@ let myGitRoot: string | null = null;
 // --- MCP Server ---
 
 const mcp = new Server(
-  { name: "claude-peers", version: "0.1.0" },
+  { name: "claude-peers", version: "0.2.0" },
   {
     capabilities: {
       tools: {},
