@@ -43,9 +43,13 @@ const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 // --- Broker communication ---
 
 async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  // Present the session token once we hold one. /register (pre-token) and /health carry none;
+  // the broker exempts /register and validates the rest against the call's principal.
+  if (myAuthToken) headers["Authorization"] = `Bearer ${myAuthToken}`;
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(body),
   });
   if (!res.ok) {
@@ -171,6 +175,10 @@ function getTty(): string | null {
 // --- State ---
 
 let myId: PeerId | null = null;
+// Per-session capability token, minted by the broker at /register. brokerFetch presents it
+// (Authorization: Bearer) on every mutating control-plane call so the broker can bind the
+// call to this session. Null before registration — /register itself needs no token.
+let myAuthToken: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 
@@ -466,6 +474,7 @@ async function main() {
     tmux_socket: tmuxTarget?.socket ?? null,
   });
   myId = reg.id;
+  myAuthToken = reg.token; // capability for every subsequent control-plane call this session
   log(`Registered as peer ${myId}`);
 
   // 5. Connect MCP over stdio

@@ -38,11 +38,16 @@ const configB = {
 
 let procA: any;
 let procB: any;
+// Captured at each broker's registration `it` so the later send/poll tests can authenticate as
+// that real local peer (the control plane now binds each call to the session's token).
+let fedAId = "", fedAToken = "", fedBId = "", fedBToken = "";
 
-async function brokerFetch(port: number, path: string, body: unknown) {
+async function brokerFetch(port: number, path: string, body: unknown, token?: string) {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
   const res = await fetch(`http://127.0.0.1:${port}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(body),
   });
   const text = await res.text();
@@ -54,6 +59,37 @@ async function brokerFetch(port: number, path: string, body: unknown) {
   } catch (err) {
     throw new Error(`brokerFetch non-JSON response from ${path}: ${text}`);
   }
+}
+
+// Distinct synthetic pids so co-registered peers in one test don't collide on the broker's
+// same-pid supersede (handleRegister removes an existing row with the caller's pid). Based
+// above Linux pid_max so each probes dead — fine for a sender, which only needs a token row.
+// A peer that must actually RECEIVE a queued delivery needs a live pid: pass pid: process.pid.
+let fakePid = 7_000_000;
+
+// Register a peer and return { id, token } — the sender credential most send/unregister
+// tests need now that the control plane authenticates the principal. Pass overrides to
+// shape the row (e.g. pid: process.pid for a live delivery target; default is a queued-only
+// peer on a distinct synthetic pid).
+async function registerAndGetToken(port: number, overrides: Record<string, unknown> = {}) {
+  const reg = await brokerFetch(port, "/register", {
+    pid: ++fakePid, cwd: "/tmp/sender", git_root: null, tty: null, summary: "",
+    machine: "x", tailscale_ip: "127.0.0.1", tmux_pane: null, tmux_socket: null,
+    ...overrides,
+  }) as { id: string; token: string };
+  return reg;
+}
+
+// Raw POST that returns status + parsed body without throwing — for asserting 401s.
+async function rawPost(port: number, path: string, body: unknown, token?: string) {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+    method: "POST", headers, body: JSON.stringify(body),
+  });
+  let json: any = null;
+  try { json = JSON.parse(await res.text()); } catch {}
+  return { status: res.status, json };
 }
 
 describe("two-broker federation", () => {
@@ -117,6 +153,7 @@ describe("two-broker federation", () => {
       tailscale_ip: "127.0.0.1",
     });
     expect(result.id).toMatch(/^bra-/);
+    fedAId = result.id; fedAToken = result.token;
   });
 
   it("registers a peer on broker B", async () => {
@@ -130,6 +167,7 @@ describe("two-broker federation", () => {
       tailscale_ip: "127.0.0.1",
     });
     expect(result.id).toMatch(/^brb-/);
+    fedBId = result.id; fedBToken = result.token;
   });
 
   it("gossip syncs peers between brokers", async () => {
@@ -171,11 +209,11 @@ describe("two-broker federation", () => {
       from_id: localA.id,
       to_id: localB.id,
       text: "hello from broker A",
-    }) as any;
+    }, fedAToken) as any;
     expect(sendResult.ok).toBe(true);
     expect(sendResult.routed).toBe("remote");
 
-    const pollResult = await brokerFetch(BROKER_B_PORT, "/poll-messages", { id: localB.id }) as any;
+    const pollResult = await brokerFetch(BROKER_B_PORT, "/poll-messages", { id: localB.id }, fedBToken) as any;
     expect(pollResult.messages).toHaveLength(1);
     expect(pollResult.messages[0].text).toBe("hello from broker A");
     expect(pollResult.messages[0].from_id).toBe(localA.id);
@@ -189,7 +227,7 @@ describe("two-broker federation", () => {
       from_id: localA.id,
       to_id: "brb-nonexist",
       text: "this should fail",
-    }) as any;
+    }, fedAToken) as any;
     expect(sendResult.ok).toBe(false);
   });
 
@@ -248,12 +286,13 @@ describe("tmux delivery and floor", () => {
       pid: process.pid, cwd: "/tmp/d1", git_root: null, tty: null, summary: "",
       machine: "del-a", tailscale_ip: "127.0.0.1", tmux_pane: "%9", tmux_socket: null,
     }) as any;
+    const sender = await registerAndGetToken(PORT, { cwd: "/tmp/d1-s" });
     const send = await brokerFetch(PORT, "/send-message", {
-      from_id: "dla-sender0", to_id: reg.id, text: "hello tmux",
-    }) as any;
+      from_id: sender.id, to_id: reg.id, text: "hello tmux",
+    }, sender.token) as any;
     expect(send.ok).toBe(true);
     expect(send.delivery).toBe("accepted");
-    const poll = await brokerFetch(PORT, "/poll-messages", { id: reg.id }) as any;
+    const poll = await brokerFetch(PORT, "/poll-messages", { id: reg.id }, reg.token) as any;
     expect(poll.messages).toHaveLength(0);
     const log = readFileSync(stub.logFile, "utf-8");
     expect(log).toContain("%9");
@@ -265,11 +304,12 @@ describe("tmux delivery and floor", () => {
       pid: process.pid, cwd: "/tmp/d2", git_root: null, tty: null, summary: "",
       machine: "del-a", tailscale_ip: "127.0.0.1", tmux_pane: null, tmux_socket: null,
     }) as any;
+    const sender = await registerAndGetToken(PORT, { cwd: "/tmp/d2-s" });
     const send = await brokerFetch(PORT, "/send-message", {
-      from_id: "dla-sender0", to_id: reg.id, text: "floor me",
-    }) as any;
+      from_id: sender.id, to_id: reg.id, text: "floor me",
+    }, sender.token) as any;
     expect(send.delivery).toBe("queued");
-    const poll = await brokerFetch(PORT, "/poll-messages", { id: reg.id }) as any;
+    const poll = await brokerFetch(PORT, "/poll-messages", { id: reg.id }, reg.token) as any;
     expect(poll.messages).toHaveLength(1);
     expect(poll.messages[0].text).toBe("floor me");
   });
@@ -310,14 +350,15 @@ describe("silent-consume regression", () => {
       pid: process.pid, cwd: "/tmp/reg1", git_root: null, tty: null, summary: "",
       machine: "reg-a", tailscale_ip: "127.0.0.1", tmux_pane: "%4", tmux_socket: null,
     }) as any;
-    const send = await brokerFetch(PORT, "/send-message", { from_id: "rga-x", to_id: reg.id, text: "must not vanish" }) as any;
+    const sender = await registerAndGetToken(PORT, { cwd: "/tmp/reg1-s" });
+    const send = await brokerFetch(PORT, "/send-message", { from_id: sender.id, to_id: reg.id, text: "must not vanish" }, sender.token) as any;
     expect(send.delivery).toBe("queued"); // push failed => not accepted
     // The push was actually attempted (not short-circuited by an absent tmux).
     const log = readFileSync(logFile, "utf-8");
     expect(log).toContain("%4");
     expect(log).toContain("must not vanish");
     // And the message is still retrievable — it was NOT silently consumed.
-    const poll = await brokerFetch(PORT, "/poll-messages", { id: reg.id }) as any;
+    const poll = await brokerFetch(PORT, "/poll-messages", { id: reg.id }, reg.token) as any;
     expect(poll.messages).toHaveLength(1);
     expect(poll.messages[0].text).toBe("must not vanish");
   });
@@ -341,7 +382,7 @@ describe("broker version handshake", () => {
 
   it("reports protocol_version on /health", async () => {
     const h = await (await fetch(`http://127.0.0.1:${PORT}/health`)).json() as any;
-    expect(h.protocol_version).toBe(2);
+    expect(h.protocol_version).toBe(3);
   });
 
   it("retire drains and exits even with a peer registered", async () => {
@@ -510,11 +551,14 @@ describe("unregister during in-flight delivery defers peer deletion", () => {
       machine: "unreg-a", tailscale_ip: "127.0.0.1", tmux_pane: "%5", tmux_socket: null,
     }) as any;
 
+    // A registered sender (distinct pid so it does not supersede reg) authenticates both sends.
+    const sender = await registerAndGetToken(PORT, { cwd: "/tmp/u1-s" });
+
     // Fire the send WITHOUT awaiting: the broker claims the lease, spawns the stub, and
     // parks on the fifo — the delivery is now in flight and /send-message stays pending.
     const sendPromise = brokerFetch(PORT, "/send-message", {
-      from_id: "ura-sender0", to_id: reg.id, text: "in flight",
-    });
+      from_id: sender.id, to_id: reg.id, text: "in flight",
+    }, sender.token);
 
     let inflight: any;
     try {
@@ -524,7 +568,7 @@ describe("unregister during in-flight delivery defers peer deletion", () => {
 
       // Recipient unregisters mid-delivery. The row is deferred (kept for the lease), but the
       // peer is logically gone from this point.
-      await brokerFetch(PORT, "/unregister", { id: reg.id });
+      await brokerFetch(PORT, "/unregister", { id: reg.id }, reg.token);
 
       // It must not appear in listings — a peer that said "I'm leaving" should not be offered.
       const peers = await brokerFetch(PORT, "/list-peers", {
@@ -535,8 +579,8 @@ describe("unregister during in-flight delivery defers peer deletion", () => {
       // And a NEW send to it must be refused, not accepted-then-dropped: the deferred delete
       // would wipe the row plus any mail queued under it, so an ok here would be a silent loss.
       const newSend = await brokerFetch(PORT, "/send-message", {
-        from_id: "ura-sender1", to_id: reg.id, text: "after unregister",
-      }) as any;
+        from_id: sender.id, to_id: reg.id, text: "after unregister",
+      }, sender.token) as any;
       expect(newSend.ok).toBe(false);
     } finally {
       // Release the parked delivery so the broker is not left holding it for teardown.
@@ -606,10 +650,13 @@ describe("same-pid re-register during in-flight delivery defers old-peer deletio
       machine: "rereg-a", tailscale_ip: "127.0.0.1", tmux_pane: "%5", tmux_socket: null,
     }) as any;
 
+    // A registered sender (distinct pid so it does not collide with reg1/reg2's pid) authenticates.
+    const sender = await registerAndGetToken(PORT, { cwd: "/tmp/rr1-s" });
+
     // In-flight delivery to the first id, parked on the fifo.
     const sendPromise = brokerFetch(PORT, "/send-message", {
-      from_id: "rra-sender0", to_id: reg1.id, text: "in flight",
-    });
+      from_id: sender.id, to_id: reg1.id, text: "in flight",
+    }, sender.token);
 
     let reg2: any;
     let inflight: any;
@@ -635,8 +682,8 @@ describe("same-pid re-register during in-flight delivery defers old-peer deletio
       // so peerStillLive() alone would wrongly accept it; the deferred-delete guard rejects it
       // instead, so mail is not queued under a doomed id and dropped when the row is reaped.
       const newSend = await brokerFetch(PORT, "/send-message", {
-        from_id: "rra-sender1", to_id: reg1.id, text: "to the old id",
-      }) as any;
+        from_id: sender.id, to_id: reg1.id, text: "to the old id",
+      }, sender.token) as any;
       expect(newSend.ok).toBe(false);
     } finally {
       if (existsSync(marker)) {
@@ -714,10 +761,14 @@ describe("retire waits for an in-flight remote forward", () => {
         summary: "", registered_at: new Date().toISOString() }],
     });
 
+    // A registered local sender authenticates the originating /send-message (the forward to the
+    // sibling is federation-exempt, but the local accept is token-gated).
+    const sender = await registerAndGetToken(PORT, { cwd: "/tmp/fwd-s" });
+
     // Fire the send WITHOUT awaiting: it parks inside handleSendMessage on the forward fetch.
     const sendPromise = brokerFetch(PORT, "/send-message", {
-      from_id: "fws-sender0", to_id: "hang-peer0", text: "in flight",
-    }).catch(() => {});
+      from_id: sender.id, to_id: "hang-peer0", text: "in flight",
+    }, sender.token).catch(() => {});
 
     // Wait until the stub confirms the forward is in flight, then retire.
     for (let i = 0; i < 60 && !existsSync(marker); i++) await new Promise((r) => setTimeout(r, 50));
@@ -847,9 +898,10 @@ describe("send/forward to a dead-but-unswept local peer is honest", () => {
 
   it("does not falsely accept a /send-message to a local peer whose process is gone", async () => {
     const deadId = await registerDeadPeer();
+    const sender = await registerAndGetToken(PORT, { cwd: "/tmp/dl-s" });
     const result = await brokerFetch(PORT, "/send-message", {
-      from_id: "dla-sender0", to_id: deadId, text: "to a ghost",
-    }) as any;
+      from_id: sender.id, to_id: deadId, text: "to a ghost",
+    }, sender.token) as any;
     expect(result.ok).toBe(false);
   }, 15_000);
 
@@ -993,4 +1045,160 @@ describe("idle self-exit announces an empty peer list to siblings", () => {
     expect(captured.length).toBeGreaterThanOrEqual(1);
     expect(captured.every(g => Array.isArray(g.peers) && g.peers.length === 0)).toBe(true);
   }, 20_000);
+});
+
+// Per-session capability tokens: the control plane binds every mutating call to the
+// session that registered it. A peer may act only as the id it holds the token for,
+// closing the forged-from_id -> pane-injection vector. /register mints the token;
+// /retire and /list-peers stay token-free; federation routes are exempt (token never
+// crosses a machine boundary).
+describe("per-session capability tokens (enforced)", () => {
+  const PORT = 17920;
+  let proc: any;
+  const cfg = { machine: "tok-a", tailscale_ip: "127.0.0.1", port: PORT, id_prefix: "tka", siblings: [], allowed_ips: ["127.0.0.1"] };
+
+  beforeAll(async () => {
+    await Bun.write("/tmp/config-tok.json", JSON.stringify(cfg));
+    try { unlinkSync("/tmp/broker-tok.db"); } catch {}
+    proc = Bun.spawn(["bun", "broker.ts"], {
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-tok.json", CLAUDE_PEERS_DB: "/tmp/broker-tok.db" },
+      stdout: "ignore", stderr: "inherit",
+    });
+    for (let i = 0; i < 20; i++) { try { if ((await fetch(`http://127.0.0.1:${PORT}/health`)).ok) break; } catch {} await new Promise((r) => setTimeout(r, 300)); }
+  });
+  afterAll(() => { proc?.kill(); try { unlinkSync("/tmp/broker-tok.db"); } catch {} try { unlinkSync("/tmp/config-tok.json"); } catch {} });
+
+  it("register mints a non-empty capability token", async () => {
+    const reg = await registerAndGetToken(PORT, { cwd: "/tmp/t-mint" });
+    expect(typeof reg.token).toBe("string");
+    expect(reg.token.length).toBeGreaterThanOrEqual(32);
+  });
+
+  it("accepts a send when the token matches the from_id", async () => {
+    const sender = await registerAndGetToken(PORT, { cwd: "/tmp/t-s1" });
+    const recip = await registerAndGetToken(PORT, { cwd: "/tmp/t-r1", pid: process.pid });
+    const send = await brokerFetch(PORT, "/send-message",
+      { from_id: sender.id, to_id: recip.id, text: "authed hello" }, sender.token) as any;
+    expect(send.ok).toBe(true);
+    const poll = await brokerFetch(PORT, "/poll-messages", { id: recip.id }, recip.token) as any;
+    expect(poll.messages).toHaveLength(1);
+    expect(poll.messages[0].text).toBe("authed hello");
+  });
+
+  it("rejects a send carrying no token", async () => {
+    const sender = await registerAndGetToken(PORT, { cwd: "/tmp/t-s2" });
+    const recip = await registerAndGetToken(PORT, { cwd: "/tmp/t-r2" });
+    const r = await rawPost(PORT, "/send-message", { from_id: sender.id, to_id: recip.id, text: "no token" });
+    expect(r.status).toBe(401);
+    const poll = await brokerFetch(PORT, "/poll-messages", { id: recip.id }, recip.token) as any;
+    expect(poll.messages).toHaveLength(0);
+  });
+
+  it("rejects a send carrying the wrong token", async () => {
+    const sender = await registerAndGetToken(PORT, { cwd: "/tmp/t-s3" });
+    const recip = await registerAndGetToken(PORT, { cwd: "/tmp/t-r3" });
+    const r = await rawPost(PORT, "/send-message",
+      { from_id: sender.id, to_id: recip.id, text: "wrong token" }, "deadbeef-not-a-real-token");
+    expect(r.status).toBe(401);
+    const poll = await brokerFetch(PORT, "/poll-messages", { id: recip.id }, recip.token) as any;
+    expect(poll.messages).toHaveLength(0);
+  });
+
+  it("rejects forging from_id with a valid token for a different peer", async () => {
+    const attacker = await registerAndGetToken(PORT, { cwd: "/tmp/t-atk" });
+    const victim = await registerAndGetToken(PORT, { cwd: "/tmp/t-vic" });
+    const recip = await registerAndGetToken(PORT, { cwd: "/tmp/t-r4" });
+    // attacker holds its own valid token but claims to be the victim
+    const r = await rawPost(PORT, "/send-message",
+      { from_id: victim.id, to_id: recip.id, text: "spoofed" }, attacker.token);
+    expect(r.status).toBe(401);
+    const poll = await brokerFetch(PORT, "/poll-messages", { id: recip.id }, recip.token) as any;
+    expect(poll.messages).toHaveLength(0);
+  });
+
+  it("requires the peer's own token to unregister it", async () => {
+    const a = await registerAndGetToken(PORT, { cwd: "/tmp/t-u1" });
+    const b = await registerAndGetToken(PORT, { cwd: "/tmp/t-u2" });
+    // b cannot unregister a with b's token
+    const bad = await rawPost(PORT, "/unregister", { id: a.id }, b.token);
+    expect(bad.status).toBe(401);
+    // a unregisters itself with its own token
+    const ok = await rawPost(PORT, "/unregister", { id: a.id }, a.token);
+    expect(ok.status).toBe(200);
+  });
+
+  it("leaves /list-peers token-free (read-only browsing)", async () => {
+    const r = await rawPost(PORT, "/list-peers", { scope: "machine", cwd: "/", git_root: null });
+    expect(r.status).toBe(200);
+    expect(Array.isArray(r.json)).toBe(true);
+  });
+});
+
+describe("per-session capability tokens (CLAUDE_PEERS_ALLOW_UNSIGNED grace)", () => {
+  const PORT = 17921;
+  let proc: any;
+  const cfg = { machine: "tkg-a", tailscale_ip: "127.0.0.1", port: PORT, id_prefix: "tkg", siblings: [], allowed_ips: ["127.0.0.1"] };
+
+  beforeAll(async () => {
+    await Bun.write("/tmp/config-tkg.json", JSON.stringify(cfg));
+    try { unlinkSync("/tmp/broker-tkg.db"); } catch {}
+    proc = Bun.spawn(["bun", "broker.ts"], {
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-tkg.json", CLAUDE_PEERS_DB: "/tmp/broker-tkg.db", CLAUDE_PEERS_ALLOW_UNSIGNED: "1" },
+      stdout: "ignore", stderr: "inherit",
+    });
+    for (let i = 0; i < 20; i++) { try { if ((await fetch(`http://127.0.0.1:${PORT}/health`)).ok) break; } catch {} await new Promise((r) => setTimeout(r, 300)); }
+  });
+  afterAll(() => { proc?.kill(); try { unlinkSync("/tmp/broker-tkg.db"); } catch {} try { unlinkSync("/tmp/config-tkg.json"); } catch {} });
+
+  it("accepts an unsigned send under the grace flag", async () => {
+    const recip = await registerAndGetToken(PORT, { cwd: "/tmp/g-r1", pid: process.pid });
+    const r = await rawPost(PORT, "/send-message", { from_id: "legacy-sender", to_id: recip.id, text: "grace hello" });
+    expect(r.status).toBe(200);
+    const poll = await brokerFetch(PORT, "/poll-messages", { id: recip.id }, recip.token) as any;
+    expect(poll.messages).toHaveLength(1);
+    expect(poll.messages[0].text).toBe("grace hello");
+  });
+
+  it("still rejects a wrong token even under the grace flag", async () => {
+    const recip = await registerAndGetToken(PORT, { cwd: "/tmp/g-r2" });
+    const r = await rawPost(PORT, "/send-message", { from_id: "legacy-sender", to_id: recip.id, text: "bad" }, "nope-wrong");
+    expect(r.status).toBe(401);
+  });
+});
+
+// The CLI send path: `bun cli.ts send` is no longer a synthetic unauthenticated "cli" sender.
+// It registers an ephemeral queued-only peer to obtain a token, sends as that id, then
+// unregisters — so the message arrives and no sender row lingers afterward.
+describe("cli send authenticates via an ephemeral registration", () => {
+  const PORT = 17922;
+  let proc: any;
+  const cfg = { machine: "cli-a", tailscale_ip: "127.0.0.1", port: PORT, id_prefix: "cli", siblings: [], allowed_ips: ["127.0.0.1"] };
+
+  beforeAll(async () => {
+    await Bun.write("/tmp/config-cli.json", JSON.stringify(cfg));
+    try { unlinkSync("/tmp/broker-cli.db"); } catch {}
+    proc = Bun.spawn(["bun", "broker.ts"], {
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-cli.json", CLAUDE_PEERS_DB: "/tmp/broker-cli.db" },
+      stdout: "ignore", stderr: "inherit",
+    });
+    for (let i = 0; i < 20; i++) { try { if ((await fetch(`http://127.0.0.1:${PORT}/health`)).ok) break; } catch {} await new Promise((r) => setTimeout(r, 300)); }
+  });
+  afterAll(() => { proc?.kill(); try { unlinkSync("/tmp/broker-cli.db"); } catch {} try { unlinkSync("/tmp/config-cli.json"); } catch {} });
+
+  it("delivers a CLI message and leaves no lingering ephemeral sender", async () => {
+    const recip = await registerAndGetToken(PORT, { cwd: "/tmp/cli-r", pid: process.pid });
+    const sent = Bun.spawnSync(["bun", "cli.ts", "send", recip.id, "from the cli"], {
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-cli.json" },
+    });
+    const out = new TextDecoder().decode(sent.stdout) + new TextDecoder().decode(sent.stderr);
+    expect(out).toContain(`Message sent to ${recip.id}`);
+
+    const poll = await brokerFetch(PORT, "/poll-messages", { id: recip.id }, recip.token) as any;
+    expect(poll.messages).toHaveLength(1);
+    expect(poll.messages[0].text).toBe("from the cli");
+
+    // The ephemeral sender unregistered itself in its finally — only the recipient remains.
+    const peers = await brokerFetch(PORT, "/list-peers", { scope: "machine", cwd: "/", git_root: null }) as any[];
+    expect(peers.filter((p) => !p.is_remote).length).toBe(1);
+  }, 15_000);
 });

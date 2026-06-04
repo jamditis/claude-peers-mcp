@@ -17,7 +17,7 @@ import type {
 } from "./shared/types.ts";
 import {
   ensureMessagesTable, migrateMessagesSchema, resetDeliveringOnStart,
-  generateLeaseToken, claimForDelivery, confirmDelivered, releaseToQueued,
+  generateLeaseToken, generateAuthToken, claimForDelivery, confirmDelivered, releaseToQueued,
   reclaimIfExpired, nextDeliverable, formatPeerMessage, releasableQueuedPrefix,
   deliverViaTmux, isLoopback, isFederationRoute, isPidDead, pidProbe, pruneMessages, type TmuxSpawn,
 } from "./delivery.ts";
@@ -159,10 +159,12 @@ if (import.meta.main) {
     id TEXT PRIMARY KEY, pid INTEGER NOT NULL, machine TEXT NOT NULL,
     tailscale_ip TEXT NOT NULL, cwd TEXT NOT NULL, git_root TEXT, tty TEXT,
     summary TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL, last_seen TEXT NOT NULL,
-    tmux_pane TEXT, tmux_socket TEXT, delivery_kind TEXT NOT NULL DEFAULT 'none'
+    tmux_pane TEXT, tmux_socket TEXT, delivery_kind TEXT NOT NULL DEFAULT 'none', token TEXT
   )`);
-  // Upgrade a legacy peers table that predates the delivery columns.
-  for (const [col, type] of [["tmux_pane","TEXT"],["tmux_socket","TEXT"],["delivery_kind","TEXT NOT NULL DEFAULT 'none'"]] as const) {
+  // Upgrade a legacy peers table that predates the delivery columns (and the auth token).
+  // A NULL token is a pre-v3 row: it can never match a presented token, so it authenticates
+  // only under CLAUDE_PEERS_ALLOW_UNSIGNED until the session re-registers and is minted one.
+  for (const [col, type] of [["tmux_pane","TEXT"],["tmux_socket","TEXT"],["delivery_kind","TEXT NOT NULL DEFAULT 'none'"],["token","TEXT"]] as const) {
     const present = (db.query("PRAGMA table_info(peers)").all() as { name: string }[]).some((c) => c.name === col);
     if (!present) db.run(`ALTER TABLE peers ADD COLUMN ${col} ${type}`);
   }
@@ -180,9 +182,10 @@ if (import.meta.main) {
 
   // --- Prepared statements ---
   const insertPeer = db.prepare(`
-    INSERT INTO peers (id, pid, machine, tailscale_ip, cwd, git_root, tty, summary, registered_at, last_seen, tmux_pane, tmux_socket, delivery_kind)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO peers (id, pid, machine, tailscale_ip, cwd, git_root, tty, summary, registered_at, last_seen, tmux_pane, tmux_socket, delivery_kind, token)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
+  const tokenForPeer = db.prepare("SELECT token FROM peers WHERE id = ?");
   const updateLastSeen = db.prepare("UPDATE peers SET last_seen = ? WHERE id = ?");
   const updateSummary = db.prepare("UPDATE peers SET summary = ? WHERE id = ?");
   const deletePeer = db.prepare("DELETE FROM peers WHERE id = ?");
@@ -293,6 +296,11 @@ if (import.meta.main) {
     const v = parseInt(process.env.CLAUDE_PEERS_IDLE_EXIT_MS ?? "0", 10);
     return Number.isFinite(v) && v > 0 ? v : 0;
   })();
+  // Grace flag for the v2->v3 upgrade window: when set, the broker accepts an *unsigned*
+  // (missing-token) mutating request and treats the principal as legacy-unsigned, so live
+  // sessions on an old server keep working while they re-register on v3. A *wrong* token
+  // still 401s under the flag — grace forgives only the absence of proof, never a forgery.
+  const ALLOW_UNSIGNED = process.env.CLAUDE_PEERS_ALLOW_UNSIGNED === "1";
   let lastActivityAt = Date.now();
 
   async function retire(): Promise<void> {
@@ -418,9 +426,12 @@ if (import.meta.main) {
     const pane = body.tmux_pane && /^%\d+$/.test(body.tmux_pane) ? body.tmux_pane : null;
     const socket = body.tmux_socket && body.tmux_socket.startsWith("/") ? body.tmux_socket : null;
     const kind = pane ? "tmux" : "none";
+    // Mint a per-session capability token. The peer presents it on every mutating
+    // control-plane call; the gate binds the call's principal (from_id/id) to it.
+    const token = generateAuthToken();
     insertPeer.run(id, body.pid, config.machine, config.tailscale_ip,
-      body.cwd, body.git_root, body.tty, body.summary, now, now, pane, socket, kind);
-    return { id };
+      body.cwd, body.git_root, body.tty, body.summary, now, now, pane, socket, kind, token);
+    return { id, token };
   }
 
   function handleListPeers(body: ListPeersRequest): Peer[] {
@@ -676,6 +687,26 @@ if (import.meta.main) {
 
       try {
         const body = await req.json();
+        // Per-session capability auth, before the idle bump (an unauthorized request is neither
+        // trusted input nor real traffic, like the loopback gate above). Every mutating control-
+        // plane call binds to the session that registered it: the presented Authorization: Bearer
+        // token must equal the stored token for the call's principal — from_id for /send-message,
+        // which is what blocks forging a sender; id otherwise. Exempt: /register (mints the token),
+        // /retire (a broker-lifecycle call from a NEW server that never registered here, so it
+        // holds no token), /list-peers (read-only browsing), and federation routes (cross-machine,
+        // IP-gated; the token never crosses a machine boundary). A missing token 401s unless
+        // ALLOW_UNSIGNED (the upgrade grace); a wrong token always 401s.
+        const tokenExempt = path === "/register" || path === "/retire" || path === "/list-peers" || isFederationRoute(path);
+        if (!tokenExempt) {
+          const principal = path === "/send-message" ? body.from_id : body.id;
+          const auth = req.headers.get("authorization") ?? "";
+          const presented = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+          const row = principal ? (tokenForPeer.get(principal) as { token: string | null } | null) : null;
+          const valid = presented !== null && row?.token != null && row.token === presented;
+          if (!valid && !(ALLOW_UNSIGNED && presented === null)) {
+            return Response.json({ ok: false, error: "unauthorized" }, { status: 401 });
+          }
+        }
         // Refresh the idle window only for local control-plane traffic, not sibling federation
         // (/gossip, /forward-message). Self-exit reaps a broker with no LOCAL work; a federated
         // broker otherwise gets its idle clock reset forever by a sibling's periodic gossip and
