@@ -451,9 +451,11 @@ describe("empty-broker self-exit", () => {
 // If it deletes the peer row while a tmux send-keys is mid-spawn, the lease resolves
 // against a now-missing peer: peerStillLive() rejects, releaseToQueued() requeues the
 // row under the deleted id, and nothing — no heartbeat, no check_messages — can ever
-// drain it until the 24h prune. So the whole unregister defers while mid-delivery; the
-// peer stays addressable until the lease resolves, then cleanStalePeers reaps it once
-// the pid probes dead. A tmux stub that parks on a fifo makes the in-flight window
+// drain it until the 24h prune. So the whole unregister defers the row's deletion while
+// mid-delivery, but the peer is logically gone: hidden from listings and refusing new
+// mail (a fresh send would be queued under a doomed id and dropped when the deferred
+// delete fires). The row is kept ONLY so the in-flight lease can settle; deliverNext's
+// finally then reaps it. A tmux stub that parks on a fifo makes the in-flight window
 // deterministic (marker file + fifo handshake — no sleeps, no timing guesses).
 describe("unregister during in-flight delivery defers peer deletion", () => {
   const PORT = 17910;
@@ -501,7 +503,7 @@ describe("unregister during in-flight delivery defers peer deletion", () => {
     proc?.kill();
   });
 
-  it("keeps the peer registered while a delivery to it is in flight", async () => {
+  it("hides the unregistered peer and refuses new mail, but settles the in-flight lease", async () => {
     // pid = this live process so list-peers does not filter the peer for being dead.
     const reg = await brokerFetch(PORT, "/register", {
       pid: process.pid, cwd: "/tmp/u1", git_root: null, tty: null, summary: "",
@@ -514,26 +516,39 @@ describe("unregister during in-flight delivery defers peer deletion", () => {
       from_id: "ura-sender0", to_id: reg.id, text: "in flight",
     });
 
+    let inflight: any;
     try {
       // Wait for the stub to signal start: a deterministic "now in flight" edge.
       for (let i = 0; i < 60 && !existsSync(marker); i++) await new Promise((r) => setTimeout(r, 50));
       expect(existsSync(marker)).toBe(true);
 
-      // Recipient unregisters mid-delivery. The fix defers and keeps the peer; without
-      // it deletePeer ran unconditionally and the peer would be gone here.
+      // Recipient unregisters mid-delivery. The row is deferred (kept for the lease), but the
+      // peer is logically gone from this point.
       await brokerFetch(PORT, "/unregister", { id: reg.id });
 
+      // It must not appear in listings — a peer that said "I'm leaving" should not be offered.
       const peers = await brokerFetch(PORT, "/list-peers", {
         scope: "machine", cwd: "/tmp/u1", git_root: null,
       }) as any[];
-      expect(peers.some((p) => p.id === reg.id)).toBe(true);
+      expect(peers.some((p) => p.id === reg.id)).toBe(false);
+
+      // And a NEW send to it must be refused, not accepted-then-dropped: the deferred delete
+      // would wipe the row plus any mail queued under it, so an ok here would be a silent loss.
+      const newSend = await brokerFetch(PORT, "/send-message", {
+        from_id: "ura-sender1", to_id: reg.id, text: "after unregister",
+      }) as any;
+      expect(newSend.ok).toBe(false);
     } finally {
       // Release the parked delivery so the broker is not left holding it for teardown.
       if (existsSync(marker)) {
         writeFileSync(fifo, "go");
-        await sendPromise.catch(() => {});
+        inflight = await sendPromise.catch((e) => ({ error: String(e) }));
       }
     }
+
+    // The in-flight lease still resolved against the kept row — proof the deferral protected
+    // the active delivery (had the row been deleted on unregister, it would have requeued).
+    expect(inflight?.delivery).toBe("accepted");
   }, 15_000);
 });
 
@@ -585,7 +600,7 @@ describe("same-pid re-register during in-flight delivery defers old-peer deletio
     proc?.kill();
   });
 
-  it("keeps the old peer addressable until the in-flight lease resolves, then reaps it", async () => {
+  it("hides the superseded old id and refuses new mail to it, but settles its in-flight lease", async () => {
     const reg1 = await brokerFetch(PORT, "/register", {
       pid: process.pid, cwd: "/tmp/rr1", git_root: null, tty: null, summary: "",
       machine: "rereg-a", tailscale_ip: "127.0.0.1", tmux_pane: "%5", tmux_socket: null,
@@ -597,12 +612,13 @@ describe("same-pid re-register during in-flight delivery defers old-peer deletio
     });
 
     let reg2: any;
+    let inflight: any;
     try {
       for (let i = 0; i < 60 && !existsSync(marker); i++) await new Promise((r) => setTimeout(r, 50));
       expect(existsSync(marker)).toBe(true);
 
-      // Same pid re-registers mid-delivery. Without the fix the old peer row is deleted here
-      // and the in-flight message orphans; with it the old id stays addressable (deferred).
+      // Same pid re-registers mid-delivery, superseding the old id. The old row is deferred
+      // (kept for the in-flight lease) but logically gone — the live session is now reg2.
       reg2 = await brokerFetch(PORT, "/register", {
         pid: process.pid, cwd: "/tmp/rr1", git_root: null, tty: null, summary: "",
         machine: "rereg-a", tailscale_ip: "127.0.0.1", tmux_pane: "%6", tmux_socket: null,
@@ -612,17 +628,26 @@ describe("same-pid re-register during in-flight delivery defers old-peer deletio
       const during = await brokerFetch(PORT, "/list-peers", {
         scope: "machine", cwd: "/tmp/rr1", git_root: null,
       }) as any[];
-      expect(during.some((p) => p.id === reg1.id)).toBe(true); // old id deferred, still present
-      expect(during.some((p) => p.id === reg2.id)).toBe(true); // new id registered
+      expect(during.some((p) => p.id === reg1.id)).toBe(false); // old id superseded, hidden
+      expect(during.some((p) => p.id === reg2.id)).toBe(true);  // new id is the live session
+
+      // A NEW send to the superseded old id must be refused. It shares the pid/pane with reg2,
+      // so peerStillLive() alone would wrongly accept it; the deferred-delete guard rejects it
+      // instead, so mail is not queued under a doomed id and dropped when the row is reaped.
+      const newSend = await brokerFetch(PORT, "/send-message", {
+        from_id: "rra-sender1", to_id: reg1.id, text: "to the old id",
+      }) as any;
+      expect(newSend.ok).toBe(false);
     } finally {
       if (existsSync(marker)) {
         writeFileSync(fifo, "go");
-        await sendPromise.catch(() => {});
+        inflight = await sendPromise.catch((e) => ({ error: String(e) }));
       }
     }
 
-    // Lease resolved: the deferred old peer is reaped promptly (deliverNext's finally), while
-    // the new session remains. No row is left orphaned under the dead old id.
+    // The original in-flight delivery still resolved against the kept row (deferral protected
+    // the active lease), then the deferred old peer is reaped while the new session remains.
+    expect(inflight?.delivery).toBe("accepted");
     const after = await brokerFetch(PORT, "/list-peers", {
       scope: "machine", cwd: "/tmp/rr1", git_root: null,
     }) as any[];
