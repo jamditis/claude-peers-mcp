@@ -13,13 +13,21 @@ import type {
   RegisterRequest, RegisterResponse, HeartbeatRequest,
   SetSummaryRequest, ListPeersRequest, SendMessageRequest,
   PollMessagesRequest, PollMessagesResponse, Peer, Message,
-  GossipRequest, ForwardMessageRequest,
+  GossipRequest, ForwardMessageRequest, SendResult,
 } from "./shared/types.ts";
+import {
+  ensureMessagesTable, migrateMessagesSchema, resetDeliveringOnStart,
+  generateLeaseToken, generateAuthToken, claimForDelivery, confirmDelivered, releaseToQueued,
+  reclaimIfExpired, nextDeliverable, formatPeerMessage, releasableQueuedPrefix,
+  deliverViaTmux, isLoopback, isFederationRoute, isPidDead, pidProbe, pruneMessages, type TmuxSpawn,
+} from "./delivery.ts";
+import { PROTOCOL_VERSION } from "./shared/types.ts";
 
-const PROTOCOL_VERSION = 1;
 const GOSSIP_INTERVAL_MS = 5_000;
 const CLEANUP_INTERVAL_MS = 15_000;
 const REMOTE_TTL_MS = 30_000;
+const DELIVERED_TTL_MS = 60_000;
+const QUEUED_MAX_AGE_MS = 24 * 60 * 60_000; // lossy backstop
 const GOSSIP_SUMMARY_INTERVAL_MS = 5 * 60_000;
 
 // --- Exported testable functions (no side effects) ---
@@ -67,6 +75,29 @@ export function resolveTargetBroker(
   if (!remote) return null;
   const sibling = siblings.find(s => s.machine === remote.machine);
   return sibling?.url ?? null;
+}
+
+// Project a peer down to the fields that may cross a machine boundary. The local-only delivery
+// coordinates (tmux_pane, tmux_socket, delivery_kind) must never leave this host (see
+// shared/types.ts). The federated fields are listed explicitly so a future local-only column is
+// excluded by default instead of silently riding along in a gossip payload to every sibling.
+export function toGossipPeer(p: Peer): Peer {
+  return {
+    id: p.id, pid: p.pid, machine: p.machine, tailscale_ip: p.tailscale_ip,
+    cwd: p.cwd, git_root: p.git_root, tty: p.tty, summary: p.summary,
+    registered_at: p.registered_at, last_seen: p.last_seen,
+  };
+}
+
+// Strip the secret capability token before a peer crosses the /list-peers boundary. That route is
+// token-exempt (read-only browsing), so serializing the token column `SELECT *` reads off the row
+// would hand any loopback caller every peer's credential — enough to impersonate it on the gated
+// routes. The local-only tmux coordinates a lister saw before stay (they are loopback data; gossip
+// strips them via its own allow-list projection, toGossipPeer). token is not on the Peer type, so
+// the cast names the runtime-only column the destructure removes.
+export function stripToken(p: Peer): Peer {
+  const { token: _token, ...rest } = p as Peer & { token?: string | null };
+  return rest;
 }
 
 export interface GossipFailureState {
@@ -138,8 +169,16 @@ if (import.meta.main) {
   db.run(`CREATE TABLE IF NOT EXISTS peers (
     id TEXT PRIMARY KEY, pid INTEGER NOT NULL, machine TEXT NOT NULL,
     tailscale_ip TEXT NOT NULL, cwd TEXT NOT NULL, git_root TEXT, tty TEXT,
-    summary TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL, last_seen TEXT NOT NULL
+    summary TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL, last_seen TEXT NOT NULL,
+    tmux_pane TEXT, tmux_socket TEXT, delivery_kind TEXT NOT NULL DEFAULT 'none', token TEXT
   )`);
+  // Upgrade a legacy peers table that predates the delivery columns (and the auth token).
+  // A NULL token is a pre-v3 row: it can never match a presented token, so it authenticates
+  // only under CLAUDE_PEERS_ALLOW_UNSIGNED until the session re-registers and is minted one.
+  for (const [col, type] of [["tmux_pane","TEXT"],["tmux_socket","TEXT"],["delivery_kind","TEXT NOT NULL DEFAULT 'none'"],["token","TEXT"]] as const) {
+    const present = (db.query("PRAGMA table_info(peers)").all() as { name: string }[]).some((c) => c.name === col);
+    if (!present) db.run(`ALTER TABLE peers ADD COLUMN ${col} ${type}`);
+  }
 
   db.run(`CREATE TABLE IF NOT EXISTS remote_peers (
     id TEXT PRIMARY KEY, machine TEXT NOT NULL, tailscale_ip TEXT NOT NULL,
@@ -147,16 +186,17 @@ if (import.meta.main) {
     summary TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL, last_seen TEXT NOT NULL
   )`);
 
-  db.run(`CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT NOT NULL, to_id TEXT NOT NULL,
-    text TEXT NOT NULL, sent_at TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0
-  )`);
+  ensureMessagesTable(db);
+  migrateMessagesSchema(db);
+  const requeued = resetDeliveringOnStart(db);
+  if (requeued > 0) console.error(`[claude-peers broker] requeued ${requeued} orphaned delivering row(s) on start`);
 
   // --- Prepared statements ---
   const insertPeer = db.prepare(`
-    INSERT INTO peers (id, pid, machine, tailscale_ip, cwd, git_root, tty, summary, registered_at, last_seen)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO peers (id, pid, machine, tailscale_ip, cwd, git_root, tty, summary, registered_at, last_seen, tmux_pane, tmux_socket, delivery_kind, token)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
+  const tokenForPeer = db.prepare("SELECT token FROM peers WHERE id = ?");
   const updateLastSeen = db.prepare("UPDATE peers SET last_seen = ? WHERE id = ?");
   const updateSummary = db.prepare("UPDATE peers SET summary = ? WHERE id = ?");
   const deletePeer = db.prepare("DELETE FROM peers WHERE id = ?");
@@ -165,35 +205,244 @@ if (import.meta.main) {
   const selectPeersByGitRoot = db.prepare("SELECT * FROM peers WHERE git_root = ?");
   const selectAllRemotePeers = db.prepare("SELECT * FROM remote_peers");
   const insertMessage = db.prepare(
-    "INSERT INTO messages (from_id, to_id, text, sent_at, delivered) VALUES (?, ?, ?, ?, 0)"
+    "INSERT INTO messages (from_id, to_id, text, sent_at) VALUES (?, ?, ?, ?)"
   );
-  const selectUndelivered = db.prepare(
-    "SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC"
+  // Poll reads pending (queued OR delivering) in id order so it can stop at an in-flight head
+  // and never release a younger message ahead of an older one a tmux send still owns.
+  const selectPendingForPoll = db.prepare(
+    "SELECT * FROM messages WHERE to_id = ? AND delivery_state IN ('queued','delivering') ORDER BY id ASC"
   );
-  const markDelivered = db.prepare("UPDATE messages SET delivered = 1 WHERE id = ?");
+  const markPolled = db.prepare(
+    "UPDATE messages SET delivery_state = 'delivered', lease_expires_at = NULL, lease_token = NULL WHERE id = ? AND delivery_state = 'queued'"
+  );
   const deleteUndeliveredForPeer = db.prepare(
-    "DELETE FROM messages WHERE to_id = ? AND delivered = 0"
+    "DELETE FROM messages WHERE to_id = ? AND delivery_state != 'delivered'"
   );
 
-  // --- Clean stale peers ---
+  // In-memory delivery guards (this process only). Declared up here, before
+  // cleanStalePeers, so the sweep can skip a recipient that is mid-delivery;
+  // deliverNext (further down) is what populates them.
+  const activeRowIds = new Set<number>();
+  const recipientsInFlight = new Set<string>();
+  // Peer ids whose removal is deferred because a delivery to them is in flight. The
+  // delivery's lease must resolve first (see removePeerOrDefer); deliverNext's finally
+  // drains this set the instant the lease frees.
+  const pendingPeerDeletes = new Set<string>();
+
+  // Delete a peer's row and all its undelivered mail. A peer id is ephemeral (a fresh
+  // generatePeerId per session, never reused), so once the session is gone (unregister)
+  // or replaced (same-pid re-register) its undelivered mail is addressed to an id nothing
+  // will ever poll — removing it is the documented model, not message loss.
+  function deletePeerAndMail(id: string): void {
+    deleteUndeliveredForPeer.run(id);
+    deletePeer.run(id);
+  }
+
+  // Remove a peer now, or defer until its in-flight delivery's lease resolves. Deleting the
+  // peer row mid-delivery strands the attempt: peerStillLive() would fail against the missing
+  // row, releaseToQueued would requeue under a deleted id, and nothing could drain that row
+  // before the 24h prune. Both teardown paths (graceful /unregister and same-pid re-register)
+  // route through here so the active-lease invariant is total. cleanStalePeers is a backstop
+  // for the dead-pid case; the deferred delete itself is drained by deliverNext's finally.
+  function removePeerOrDefer(id: string): void {
+    if (recipientsInFlight.has(id)) pendingPeerDeletes.add(id);
+    else deletePeerAndMail(id);
+  }
+
+  // --- Clean dead peers ---
   function cleanStalePeers() {
     const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
     for (const peer of peers) {
-      try { process.kill(peer.pid, 0); } catch { deleteUndeliveredForPeer.run(peer.id); deletePeer.run(peer.id); }
+      // The pid probe is the only authoritative deadness signal (ESRCH alone — a foreign live
+      // pid gives EPERM and is NOT dead). A heartbeat gap never deletes a peer: a live but
+      // briefly stalled session (machine sleep, load spike, a wedged event loop) would
+      // otherwise lose its queued mail permanently and vanish from listings with no way to
+      // re-register. Mail for a genuinely abandoned-but-alive peer ages out via the
+      // queued-max-age backstop below, not on a transient gap.
+      if (!isPidDead(pidProbe(peer.pid))) continue;
+      // Never delete a recipient's rows while one of its messages is mid-delivery:
+      // deliverNext awaits the tmux spawn, and deleting the 'delivering' row out from
+      // under it would corrupt the lease and could drop a message the pane already
+      // received. Defer this peer to the next sweep, after the attempt finishes.
+      if (recipientsInFlight.has(peer.id)) continue;
+      deleteUndeliveredForPeer.run(peer.id);
+      deletePeer.run(peer.id);
     }
     pruneRemotePeers(db, REMOTE_TTL_MS);
+    const pruned = pruneMessages(db, { deliveredTtlMs: DELIVERED_TTL_MS, queuedMaxAgeMs: QUEUED_MAX_AGE_MS, nowMs: Date.now() });
+    if (pruned.queuedPruned > 0) console.error(`[claude-peers broker] dropped ${pruned.queuedPruned} over-age queued message(s) (lossy backstop)`);
   }
   cleanStalePeers();
+
+  // --- Delivery context ---
+  const LEASE_MS = 5_000;        // > the 2s tmux attempt timeout
+  const TMUX_TIMEOUT_MS = 2_000;
+  const FORWARD_TIMEOUT_MS = 5_000; // abort bound on an outbound cross-machine forward fetch
+  const MAX_HEARTBEAT_DRAIN = 50; // upper bound on pushes drained per heartbeat
+  // Deliveries currently being attempted. Read by the retire-drain (Task 9) and the
+  // empty-broker self-exit (Task 14) so the broker never exits mid-delivery.
+  let inFlightDeliveries = 0;
+  // Outbound cross-machine /forward-message sends in progress. A forward is delivery work
+  // the same way a tmux inject is, so the shutdown predicate must count it too — otherwise
+  // retire / idle self-exit would stop the server and exit while handleSendMessage is still
+  // awaiting the forward fetch, dropping the message before it reaches the sibling. The retire
+  // drain deadline covers the full FORWARD_TIMEOUT_MS so a slow-but-successful forward (a busy
+  // sibling, a laggy link) is not cut off at the deadline while it would still have landed; a
+  // forward that never completes is bounded by its own abort and frees the counter then.
+  let inFlightForwards = 0;
+  function hasWorkInFlight(): boolean {
+    return inFlightDeliveries > 0 || inFlightForwards > 0;
+  }
+  let retiring = false;
+  let httpServer: ReturnType<typeof Bun.serve> | null = null;
+
+  // Idle self-exit config (see maybeIdleExit). 0 / absent / non-numeric = disabled, so a
+  // systemd-supervised broker (Restart=always) never self-exits into a restart loop; the
+  // server.ts auto-launcher opts in with a positive value so an unmanaged broker reaps
+  // itself instead of leaking a process. lastActivityAt is bumped only on local control-plane
+  // POSTs; /health probes (a GET) and sibling federation traffic (/gossip, /forward-message)
+  // deliberately do not count, so neither a liveness poll nor a chatty sibling can keep an
+  // otherwise locally-idle broker alive.
+  const IDLE_EXIT_MS = (() => {
+    const v = parseInt(process.env.CLAUDE_PEERS_IDLE_EXIT_MS ?? "0", 10);
+    return Number.isFinite(v) && v > 0 ? v : 0;
+  })();
+  // Grace flag for the v2->v3 upgrade window: when set, the broker accepts an *unsigned*
+  // (missing-token) mutating request and treats the principal as legacy-unsigned, so live
+  // sessions on an old server keep working while they re-register on v3. A *wrong* token
+  // still 401s under the flag — grace forgives only the absence of proof, never a forgery.
+  const ALLOW_UNSIGNED = process.env.CLAUDE_PEERS_ALLOW_UNSIGNED === "1";
+  let lastActivityAt = Date.now();
+
+  async function retire(): Promise<void> {
+    if (retiring) return;            // idempotent: a second /retire (or signal) is a no-op
+    retiring = true;                 // new register/send/forward/heartbeat now refused
+    // Yield to the I/O event loop (a macrotask boundary) so Bun can flush the /retire
+    // response before we stop the server. A microtask yield (Promise.resolve) would not
+    // suffice — TCP writes only flush between macrotasks, not between microtasks.
+    await new Promise((r) => setTimeout(r, 50));
+    // Wait out the longest in-flight attempt before tearing down: a tmux send (2s) or a
+    // cross-machine forward (FORWARD_TIMEOUT_MS, the larger), plus a small margin for the
+    // attempt to settle and the next poll to observe the drained counter. The loop still
+    // exits early the moment hasWorkInFlight() clears, so a quiet broker retires at once.
+    const deadline = Date.now() + FORWARD_TIMEOUT_MS + 1_000;
+    while (hasWorkInFlight() && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    clearInterval(gossipTimer);
+    clearInterval(cleanupTimer);
+    if (idleTimer) clearInterval(idleTimer);
+    try { await gossipToSiblings([]); } catch {}
+    httpServer?.stop(true);
+    db.close();
+    process.exit(0);
+  }
+  let tmuxPresent: boolean | null = null;
+  function tmuxAvailable(): boolean {
+    if (tmuxPresent === null) {
+      try { tmuxPresent = Bun.spawnSync(["tmux", "-V"]).exitCode === 0; }
+      catch { tmuxPresent = false; }
+    }
+    return tmuxPresent;
+  }
+
+  const realTmuxSpawn: TmuxSpawn = async (args) => {
+    const proc = Bun.spawn(args, { stdout: "ignore", stderr: "ignore" });
+    const timer = setTimeout(() => { try { proc.kill(); } catch {} }, TMUX_TIMEOUT_MS);
+    try { const exitCode = await proc.exited; return { exitCode }; }
+    finally { clearTimeout(timer); }
+  };
+
+  function peerDelivery(toId: string): { kind: string; pane: string | null; socket: string | null } | null {
+    return db.query("SELECT delivery_kind AS kind, tmux_pane AS pane, tmux_socket AS socket FROM peers WHERE id = ?")
+      .get(toId) as { kind: string; pane: string | null; socket: string | null } | null;
+  }
+
+  // True only if the recipient is still registered and its pid still probes alive. Used to
+  // re-verify liveness after the tmux send (the lease was claimed before the await), since a
+  // 0 exit from send-keys does not prove a live peer consumed the text.
+  function peerStillLive(toId: string): boolean {
+    const p = db.query("SELECT pid FROM peers WHERE id = ?").get(toId) as { pid: number } | null;
+    return p !== null && !isPidDead(pidProbe(p.pid));
+  }
+
+  // Attempt to deliver the recipient's head-of-line row. Serial per recipient.
+  // Returns the delivery disposition for an immediately-attempted send, or null
+  // when nothing was attempted (blocked / no backend / already in flight).
+  async function deliverNext(toId: string): Promise<"accepted" | "queued" | null> {
+    if (recipientsInFlight.has(toId)) return null;
+    const now = Date.now();
+    const row = nextDeliverable(db, toId, now, activeRowIds);
+    if (!row) return null;
+    const target = peerDelivery(toId);
+    if (!target || target.kind !== "tmux" || !target.pane || !tmuxAvailable()) return "queued";
+
+    if (row.delivery_state === "delivering") {
+      if (!reclaimIfExpired(db, row.id, now)) return null; // someone else owns it
+    }
+    const token = generateLeaseToken();
+    if (!claimForDelivery(db, row.id, now, LEASE_MS, token)) return null;
+
+    recipientsInFlight.add(toId);
+    activeRowIds.add(row.id);
+    inFlightDeliveries++;
+    try {
+      const text = formatPeerMessage(row);
+      const ok = await deliverViaTmux(target.pane, target.socket, text, realTmuxSpawn);
+      // A 0 exit from send-keys is not proof a live peer consumed the text: the recipient can
+      // die after the lease is claimed (before or during the await), leaving a pane that
+      // outlived the Claude process — now a bare shell — that still accepts keystrokes and exits
+      // 0. Re-probe liveness before confirming so a death (or a graceful unregister) mid-send is
+      // not masked as a delivery. If the peer is gone, leave the row queued; cleanStalePeers
+      // drops it honestly when it reaps the dead pid, and retention prune bounds an orphan.
+      if (ok && peerStillLive(toId) && confirmDelivered(db, row.id, token)) return "accepted";
+      releaseToQueued(db, row.id, token);
+      return "queued";
+    } catch {
+      releaseToQueued(db, row.id, token);
+      return "queued";
+    } finally {
+      activeRowIds.delete(row.id);
+      recipientsInFlight.delete(toId);
+      inFlightDeliveries--;
+      // The lease has resolved (confirmed or requeued above). If a teardown deferred this
+      // peer's removal while we held the lease, do it now — synchronously, so no concurrent
+      // handler can observe the peer between the lease freeing and the delete.
+      if (pendingPeerDeletes.has(toId)) {
+        pendingPeerDeletes.delete(toId);
+        deletePeerAndMail(toId);
+      }
+    }
+  }
+
+  // After a successful inject, clear any backlog that a concurrent send deferred. While
+  // deliverNext awaits the tmux spawn, a second send to the same recipient hits the
+  // serial-per-recipient guard and is left queued; without this it would wait for the next
+  // heartbeat (seconds) to drain. Bounded by the same cap as the heartbeat drain.
+  async function drainAfterDelivery(toId: string): Promise<void> {
+    for (let n = 0; n < MAX_HEARTBEAT_DRAIN && (await deliverNext(toId)) === "accepted"; n++) {}
+  }
 
   // --- Request handlers ---
   function handleRegister(body: RegisterRequest): RegisterResponse {
     const id = generatePeerId(config.id_prefix);
     const now = new Date().toISOString();
     const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
-    if (existing) { deleteUndeliveredForPeer.run(existing.id); deletePeer.run(existing.id); }
+    // A same-pid re-register supersedes the old peer row. Remove it — but defer while a
+    // delivery to the old id is in flight, or deleting the row now would orphan that
+    // attempt's message under a dead id (the same race the /unregister path guards; both
+    // route through removePeerOrDefer). The new peer row is inserted below regardless. The
+    // old id's mail is dropped, not carried over — the new session polls under its own id.
+    if (existing) removePeerOrDefer(existing.id);
+    const pane = body.tmux_pane && /^%\d+$/.test(body.tmux_pane) ? body.tmux_pane : null;
+    const socket = body.tmux_socket && body.tmux_socket.startsWith("/") ? body.tmux_socket : null;
+    const kind = pane ? "tmux" : "none";
+    // Mint a per-session capability token. The peer presents it on every mutating
+    // control-plane call; the gate binds the call's principal (from_id/id) to it.
+    const token = generateAuthToken();
     insertPeer.run(id, body.pid, config.machine, config.tailscale_ip,
-      body.cwd, body.git_root, body.tty, body.summary, now, now);
-    return { id };
+      body.cwd, body.git_root, body.tty, body.summary, now, now, pane, socket, kind, token);
+    return { id, token };
   }
 
   function handleListPeers(body: ListPeersRequest): Peer[] {
@@ -211,14 +460,16 @@ if (import.meta.main) {
         localPeers = selectAllPeers.all() as Peer[];
     }
     localPeers = localPeers
-      .filter(p => {
-        try { process.kill(p.pid, 0); return true; } catch { deleteUndeliveredForPeer.run(p.id); deletePeer.run(p.id); return false; }
-      })
-      .map(p => ({ ...p, is_remote: false }));
+      .filter(p => !isPidDead(pidProbe(p.pid)))
+      // A peer pending deferred deletion is logically gone: its row lingers only so an in-flight
+      // lease can settle. Don't advertise it, or a peer would address a superseded/departing id.
+      .filter(p => !pendingPeerDeletes.has(p.id))
+      // stripToken: never serialize the capability token into this token-exempt route.
+      .map(p => ({ ...stripToken(p), is_remote: false }));
 
     let allPeers: Peer[];
     if (body.scope === "machine") {
-      const remotePeers = (selectAllRemotePeers.all() as any[]).map(p => ({ ...p, is_remote: true }));
+      const remotePeers = (selectAllRemotePeers.all() as any[]).map(p => ({ ...stripToken(p), is_remote: true }));
       allPeers = [...localPeers, ...remotePeers];
     } else {
       allPeers = localPeers;
@@ -227,14 +478,27 @@ if (import.meta.main) {
     return allPeers;
   }
 
-  async function handleSendMessage(body: SendMessageRequest): Promise<{ ok: boolean; error?: string; routed?: string }> {
+  async function handleSendMessage(body: SendMessageRequest): Promise<SendResult> {
     const localTarget = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id);
-    if (localTarget) {
+    // Accept the local route only for a row whose process is still alive AND not pending deferred
+    // deletion. A peer's row outlives its process between cleanup sweeps (deletion is decoupled
+    // from listing), and a peer pending deferred deletion (pendingPeerDeletes — superseded by a
+    // same-pid re-register, or mid-unregister) shares the live pid yet is logically gone. Queuing
+    // under either is a false positive: no valid session polls it, and the deferred delete or next
+    // sweep wipes it. Treat both as absent so the caller gets an honest result (a sibling, or "not
+    // found") instead of an ok that silently drops the message.
+    if (localTarget && peerStillLive(body.to_id) && !pendingPeerDeletes.has(body.to_id)) {
       insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
-      return { ok: true, routed: "local" };
+      const disposition = (await deliverNext(body.to_id)) ?? "queued";
+      if (disposition === "accepted") await drainAfterDelivery(body.to_id);
+      return { ok: true, routed: "local", delivery: disposition };
     }
     const siblingUrl = resolveTargetBroker(db, body.to_id, config.siblings);
     if (!siblingUrl) return { ok: false, error: `Peer ${body.to_id} not found` };
+    // Mark the forward in flight so a concurrent retire / idle self-exit drains it before
+    // exiting (see hasWorkInFlight); the finally clears it whether the fetch resolves, rejects,
+    // or aborts.
+    inFlightForwards++;
     try {
       const res = await fetch(`${siblingUrl}/forward-message`, {
         method: "POST",
@@ -243,7 +507,7 @@ if (import.meta.main) {
           protocol_version: PROTOCOL_VERSION, from_id: body.from_id,
           to_id: body.to_id, text: body.text, from_machine: config.machine,
         } satisfies ForwardMessageRequest),
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.timeout(FORWARD_TIMEOUT_MS),
       });
       if (!res.ok) return { ok: false, error: `Remote broker error: ${res.status}` };
       const result = await res.json() as { ok: boolean };
@@ -251,19 +515,31 @@ if (import.meta.main) {
       return { ok: true, routed: "remote" };
     } catch {
       return { ok: false, error: "Remote broker unreachable" };
+    } finally {
+      inFlightForwards--;
     }
   }
 
-  function handleForwardMessage(body: ForwardMessageRequest): { ok: boolean } {
+  async function handleForwardMessage(body: ForwardMessageRequest): Promise<{ ok: boolean }> {
     if (body.protocol_version !== PROTOCOL_VERSION) {
       console.error(`[claude-peers broker] Warning: received protocol_version ${body.protocol_version}, expected ${PROTOCOL_VERSION}`);
     }
     const localTarget = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id);
-    if (!localTarget) {
-      console.error(`[claude-peers broker] Dropping forwarded message: unknown local peer ${body.to_id}`);
+    // Same gate as the local send route: a stale row for a dead process, or a peer pending
+    // deferred deletion (pendingPeerDeletes — logically gone, row kept only for its in-flight
+    // lease), is not a valid recipient. Accepting the forward would queue a message the deferred
+    // delete or next sweep deletes and hand the originating broker a false ok, so reject it and
+    // let the sender learn the peer is gone.
+    if (!localTarget || !peerStillLive(body.to_id) || pendingPeerDeletes.has(body.to_id)) {
+      console.error(`[claude-peers broker] Dropping forwarded message: no live local peer ${body.to_id}`);
       return { ok: false };
     }
     insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
+    // floor_remote_forwards leaves a forwarded message queued for pull-only retrieval;
+    // by default a forward auto-injects into the recipient's backend like a local send.
+    if (!config.floor_remote_forwards && (await deliverNext(body.to_id)) === "accepted") {
+      await drainAfterDelivery(body.to_id);
+    }
     return { ok: true };
   }
 
@@ -288,30 +564,31 @@ if (import.meta.main) {
   }
 
   function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
-    const messages = selectUndelivered.all(body.id) as Message[];
-    for (const msg of messages) markDelivered.run(msg.id);
+    // Release queued mail in id order, but stop at the first 'delivering' row. That row is
+    // older pending mail a tmux send still owns and may requeue on failure; releasing the
+    // queued rows behind it would let the caller observe message n+1 before message n, breaking
+    // the head-of-line ordering this delivery model guarantees. Only a contiguous queued prefix
+    // whose older pending rows are all already delivered is safe to hand out. This handler runs
+    // synchronously (no await), so the rows cannot change underneath the loop.
+    const pending = selectPendingForPoll.all(body.id) as Message[];
+    const messages: Message[] = [];
+    for (const msg of releasableQueuedPrefix(pending)) {
+      if (markPolled.run(msg.id).changes === 1) messages.push(msg);
+    }
     return { messages };
-  }
-
-  // Peek: return undelivered messages WITHOUT marking them delivered
-  function handlePeekMessages(body: PollMessagesRequest): PollMessagesResponse {
-    const messages = selectUndelivered.all(body.id) as Message[];
-    return { messages };
-  }
-
-  // Ack: mark specific message IDs as delivered
-  function handleAckMessages(body: { ids: number[] }): { ok: boolean } {
-    for (const id of body.ids) markDelivered.run(id);
-    return { ok: true };
   }
 
   // --- Gossip loop ---
   const gossipFailureStates = new Map<string, GossipFailureState>();
 
   async function gossipToSiblings(peerList?: Peer[]) {
-    const peers = peerList ?? (selectAllPeers.all() as Peer[]).filter(p => {
+    const sourcePeers = peerList ?? (selectAllPeers.all() as Peer[]).filter(p => {
       try { process.kill(p.pid, 0); return true; } catch { return false; }
     });
+    // Project every peer through the federated allow-list before it crosses a machine boundary,
+    // regardless of whether the caller passed an explicit list or we read the table. This keeps the
+    // local-only delivery coordinates (tmux_pane/tmux_socket/delivery_kind) on this host.
+    const peers = sourcePeers.map(toGossipPeer);
     for (const sibling of config.siblings) {
       let succeeded = false;
       let errorMessage = "";
@@ -349,19 +626,41 @@ if (import.meta.main) {
   }, GOSSIP_INTERVAL_MS);
   const cleanupTimer = setInterval(cleanStalePeers, CLEANUP_INTERVAL_MS);
 
-  // --- Graceful shutdown ---
-  async function shutdown() {
-    clearInterval(gossipTimer);
-    clearInterval(cleanupTimer);
-    await gossipToSiblings([]);
-    db.close();
-    process.exit(0);
+  // --- Idle self-exit (opt-in; see IDLE_EXIT_MS) ---
+  // Exits only when there are zero live peers, zero in-flight deliveries, and the idle
+  // window has elapsed since the last POST. Disabled (idleTimer null) when IDLE_EXIT_MS<=0.
+  // Runs on its own timer rather than piggybacking the 15s peer sweep so a short window is
+  // observable and reaping is timely; the cadence is clamped so production (a multi-minute
+  // window) checks coarsely while a sub-second test window checks promptly.
+  function maybeIdleExit(): void {
+    if (IDLE_EXIT_MS <= 0 || retiring) return;
+    if (hasWorkInFlight()) return;
+    if ((selectAllPeers.all() as unknown[]).length > 0) return;
+    if (Date.now() - lastActivityAt <= IDLE_EXIT_MS) return;
+    console.error("[claude-peers broker] idle with no peers; exiting");
+    // Route through retire() rather than duplicating teardown here: retire() announces an empty
+    // peer list to siblings (so they drop this broker's peers instead of carrying them stale until
+    // their own sweep), clears the same timers, and is idempotent. maybeIdleExit already bailed on
+    // `retiring`, so a re-entrant idle tick during the retire window is a no-op.
+    void retire();
   }
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  const idleTimer = IDLE_EXIT_MS > 0
+    ? setInterval(maybeIdleExit, Math.max(1_000, Math.min(IDLE_EXIT_MS, CLEANUP_INTERVAL_MS)))
+    : null;
+
+  // --- Graceful shutdown ---
+  // SIGINT/SIGTERM share the retire path: it drains in-flight deliveries (up to 3s) before
+  // closing the DB, so a tmux send-keys that is mid-spawn at signal time finishes and resolves
+  // its lease instead of being stranded in 'delivering'. A plain close mid-spawn would leave a
+  // row that only a future broker's resetDeliveringOnStart could requeue — and an unmanaged,
+  // idle-exiting broker may never restart, so the message would be invisible to check_messages
+  // indefinitely. retire() is idempotent, so a double signal (or a /retire already in flight)
+  // is a no-op.
+  process.on("SIGINT", () => { void retire(); });
+  process.on("SIGTERM", () => { void retire(); });
 
   // --- HTTP Server ---
-  Bun.serve({
+  httpServer = Bun.serve({
     port: PORT,
     hostname: "0.0.0.0",
     async fetch(req, server) {
@@ -380,32 +679,108 @@ if (import.meta.main) {
           return Response.json({
             status: "ok", peers: (selectAllPeers.all() as any[]).length,
             machine: config.machine, remote_peer_count: (selectAllRemotePeers.all() as any[]).length,
+            protocol_version: PROTOCOL_VERSION,
           });
         }
         return new Response("claude-peers broker (federated)", { status: 200 });
       }
 
+      // Control plane is loopback-only; the federation allowlist authorizes only /gossip and
+      // /forward-message. Every other POST drives a local session (registers delivery targets,
+      // injects into a tmux pane via deliverNext, drains a queue, retires the broker), so a
+      // remote allowlisted sibling must not reach it directly — it reaches local peers only
+      // through /forward-message, which this broker originates after resolving the target.
+      // Gate before parsing the body and before bumping the idle window: an unauthorized
+      // request is neither trusted input nor real traffic.
+      if (!isFederationRoute(path) && !isLoopback(clientIp)) {
+        console.error(`[claude-peers broker] rejected non-loopback control-plane ${path} from ${clientIp}`);
+        return Response.json({ error: "forbidden" }, { status: 403 });
+      }
+
       try {
         const body = await req.json();
+        // Per-session capability auth, before the idle bump (an unauthorized request is neither
+        // trusted input nor real traffic, like the loopback gate above). Every mutating control-
+        // plane call binds to the session that registered it: the presented Authorization: Bearer
+        // token must equal the stored token for the call's principal — from_id for /send-message,
+        // which is what blocks forging a sender; id otherwise. Exempt: /register (mints the token),
+        // /retire (a broker-lifecycle call from a NEW server that never registered here, so it
+        // holds no token), /list-peers (read-only browsing, and it must strip the token column it
+        // would otherwise return), and federation routes (cross-machine, IP-gated; the token never
+        // crosses a machine boundary). A missing token 401s unless ALLOW_UNSIGNED AND the principal
+        // is a genuine pre-v3 NULL-token row (see below); a wrong token always 401s.
+        const tokenExempt = path === "/register" || path === "/retire" || path === "/list-peers" || isFederationRoute(path);
+        if (!tokenExempt) {
+          const principal = path === "/send-message" ? body.from_id : body.id;
+          const auth = req.headers.get("authorization") ?? "";
+          const presented = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+          const row = principal ? (tokenForPeer.get(principal) as { token: string | null } | null) : null;
+          const valid = presented !== null && row?.token != null && row.token === presented;
+          // The unsigned grace covers exactly one principal: a genuine pre-v3 row whose token is
+          // still NULL — a legacy client that registered before tokens existed and cannot present
+          // one yet. A principal that already minted a token must ALWAYS present it, or mere header
+          // omission would reopen the from_id forgery for the whole upgrade window; an unknown
+          // principal (no row) is not a legacy peer either, so it gets no pass.
+          const legacyUnsigned = ALLOW_UNSIGNED && presented === null && row != null && row.token == null;
+          if (!valid && !legacyUnsigned) {
+            return Response.json({ ok: false, error: "unauthorized" }, { status: 401 });
+          }
+        }
+        // Refresh the idle window only for local control-plane traffic, not sibling federation
+        // (/gossip, /forward-message). Self-exit reaps a broker with no LOCAL work; a federated
+        // broker otherwise gets its idle clock reset forever by a sibling's periodic gossip and
+        // never reaps itself. (/health is a GET handled above and never reaches here.)
+        if (!isFederationRoute(path)) lastActivityAt = Date.now();
+        // While retiring, refuse every path that creates new persistent work or can
+        // start a delivery — /heartbeat drives deliverNext, so it must be refused too,
+        // or a heartbeat at a drain-loop yield could start a send the broker then exits under.
+        if (retiring && (path === "/register" || path === "/send-message" || path === "/forward-message" || path === "/heartbeat")) {
+          return Response.json({ ok: false, error: "broker retiring" }, { status: 503 });
+        }
         switch (path) {
-          case "/register": return Response.json(handleRegister(body));
-          case "/heartbeat":
+          case "/register":
+            // Loopback-only (gated above), so the pane/socket coordinates are trusted here.
+            return Response.json(handleRegister(body));
+          case "/heartbeat": {
             updateLastSeen.run(new Date().toISOString(), body.id);
+            // Drain this recipient's queued backlog in id order (serial per recipient),
+            // continuing only while each attempt delivers. A non-delivery (no backend,
+            // or a failed/blocked head-of-line) stops the drain: under FIFO nothing
+            // behind a blocked head can go first, and stopping avoids re-spawning
+            // against a failing pane on every iteration.
+            let drained = 0;
+            for (; drained < MAX_HEARTBEAT_DRAIN; drained++) {
+              const d = await deliverNext(body.id);
+              if (d !== "accepted") break; // only a successful inject continues the drain
+            }
+            if (drained === MAX_HEARTBEAT_DRAIN) {
+              console.error(`[claude-peers broker] heartbeat drain hit the ${MAX_HEARTBEAT_DRAIN}-message cap for ${body.id}; backlog continues next heartbeat`);
+            }
             return Response.json({ ok: true });
+          }
           case "/set-summary":
             updateSummary.run(body.summary, body.id);
             return Response.json({ ok: true });
           case "/list-peers": return Response.json(handleListPeers(body));
           case "/send-message": return Response.json(await handleSendMessage(body));
           case "/poll-messages": return Response.json(handlePollMessages(body));
-          case "/peek-messages": return Response.json(handlePeekMessages(body));
-          case "/ack-messages": return Response.json(handleAckMessages(body));
           case "/unregister":
-            deleteUndeliveredForPeer.run(body.id);
-            deletePeer.run(body.id);
+            // Remove the departing peer and its now-unreachable mail. A peer id is ephemeral
+            // (a fresh id per session, never reused), so a graceful exit's undelivered mail is
+            // addressed to an id nothing will poll again — deleting it is the documented model,
+            // not loss. Routed through removePeerOrDefer so an in-flight delivery resolves
+            // against a peer that still exists instead of orphaning its row; list-peers filters
+            // dead pids, so the session disappears from listings immediately regardless.
+            removePeerOrDefer(body.id);
             return Response.json({ ok: true });
           case "/gossip": return Response.json(handleGossip(body));
-          case "/forward-message": return Response.json(handleForwardMessage(body));
+          case "/forward-message": return Response.json(await handleForwardMessage(body));
+          case "/retire": {
+            // Loopback-gated above with the rest of the control plane: only a local caller may
+            // retire the broker, so a remote allowlisted sibling cannot DoS the sessions it serves.
+            void retire();
+            return Response.json({ ok: true });
+          }
           default: return Response.json({ error: "not found" }, { status: 404 });
         }
       } catch (e) {
