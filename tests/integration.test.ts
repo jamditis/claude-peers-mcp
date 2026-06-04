@@ -837,3 +837,135 @@ describe("send/forward to a dead-but-unswept local peer is honest", () => {
     expect(result.ok).toBe(false);
   }, 15_000);
 });
+
+// A peer's tmux delivery coordinates (tmux_pane/tmux_socket/delivery_kind) are how THIS host
+// injects into THIS host's panes. They are meaningless on another machine and must never ride
+// along in a gossip payload (shared/types.ts marks them local-only). gossipToSiblings projects
+// every peer through the federated allow-list before serializing, so a future local-only column
+// is excluded by default instead of silently leaking.
+describe("gossip omits local-only tmux delivery coordinates", () => {
+  const PORT = 17916;
+  const STUB_PORT = 17917;
+  let proc: any;
+  let stub: any;
+  const captured: any[] = []; // every gossip body the stub sibling receives
+
+  beforeAll(async () => {
+    stub = Bun.serve({
+      port: STUB_PORT,
+      async fetch(req) {
+        if (new URL(req.url).pathname === "/gossip") {
+          try { captured.push(await req.json()); } catch {}
+        }
+        return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
+      },
+    });
+    await Bun.write("/tmp/config-gossipproj.json", JSON.stringify({
+      machine: "gp-a", tailscale_ip: "127.0.0.1", port: PORT, id_prefix: "gpa",
+      siblings: [{ machine: "gp-stub", url: `http://127.0.0.1:${STUB_PORT}` }],
+      allowed_ips: ["127.0.0.1"],
+    }));
+    try { unlinkSync("/tmp/broker-gossipproj.db"); } catch {}
+    proc = Bun.spawn(["bun", "broker.ts"], {
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-gossipproj.json", CLAUDE_PEERS_DB: "/tmp/broker-gossipproj.db" },
+      stdout: "ignore", stderr: "inherit",
+    });
+    for (let i = 0; i < 20; i++) { try { if ((await fetch(`http://127.0.0.1:${PORT}/health`)).ok) break; } catch {} await new Promise((r) => setTimeout(r, 300)); }
+  });
+
+  afterAll(() => {
+    proc?.kill();
+    stub?.stop(true);
+    try { unlinkSync("/tmp/broker-gossipproj.db"); } catch {}
+    try { unlinkSync("/tmp/config-gossipproj.json"); } catch {}
+  });
+
+  it("strips tmux_pane/tmux_socket/delivery_kind from gossiped peers", async () => {
+    // Register a LOCAL peer that carries a tmux delivery target. Its pid is this test process, so
+    // the gossip liveness filter (process.kill(pid, 0)) keeps it in the outbound payload.
+    const reg = await brokerFetch(PORT, "/register", {
+      pid: process.pid, cwd: "/tmp/gp1", git_root: null, tty: null, summary: "s",
+      machine: "gp-a", tailscale_ip: "127.0.0.1", tmux_pane: "%7", tmux_socket: "/tmp/sock",
+    }) as any;
+    expect(reg.id).toBeTruthy();
+
+    // Wait for a periodic gossip tick (GOSSIP_INTERVAL_MS = 5s) that carries the peer.
+    let gossipWithPeer: any = null;
+    for (let i = 0; i < 30 && !gossipWithPeer; i++) {
+      gossipWithPeer = captured.find(g => Array.isArray(g.peers) && g.peers.some((p: any) => p.id === reg.id));
+      if (!gossipWithPeer) await new Promise((r) => setTimeout(r, 300));
+    }
+    expect(gossipWithPeer).toBeTruthy();
+    const peer = gossipWithPeer.peers.find((p: any) => p.id === reg.id);
+    // The federated identity fields survive the projection...
+    expect(peer.id).toBe(reg.id);
+    expect(peer.pid).toBe(process.pid);
+    // ...but the local-only delivery coordinates must never cross the wire.
+    expect(peer.tmux_pane).toBeUndefined();
+    expect(peer.tmux_socket).toBeUndefined();
+    expect(peer.delivery_kind).toBeUndefined();
+  }, 15_000);
+});
+
+// Idle self-exit must not vanish silently from the federation: a broker that reaps itself while a
+// sibling still holds its peers leaves those peers stale until the sibling's own sweep. Routing
+// idle-exit through retire() means the teardown announces an empty peer list first, so siblings
+// drop this broker's peers immediately. IDLE_EXIT_MS (1500) < GOSSIP_INTERVAL_MS (5000) guarantees
+// the broker reaps itself before any PERIODIC gossip fires, so the only gossip the stub can see is
+// retire()'s empty-peer teardown announcement.
+describe("idle self-exit announces an empty peer list to siblings", () => {
+  const PORT = 17918;
+  const STUB_PORT = 17919;
+  let proc: any;
+  let stub: any;
+  const captured: any[] = [];
+
+  beforeAll(async () => {
+    stub = Bun.serve({
+      port: STUB_PORT,
+      async fetch(req) {
+        if (new URL(req.url).pathname === "/gossip") {
+          try { captured.push(await req.json()); } catch {}
+        }
+        return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
+      },
+    });
+    await Bun.write("/tmp/config-idlegossip.json", JSON.stringify({
+      machine: "ig-a", tailscale_ip: "127.0.0.1", port: PORT, id_prefix: "iga",
+      siblings: [{ machine: "ig-stub", url: `http://127.0.0.1:${STUB_PORT}` }],
+      allowed_ips: ["127.0.0.1"],
+    }));
+    try { unlinkSync("/tmp/broker-idlegossip.db"); } catch {}
+    proc = Bun.spawn(["bun", "broker.ts"], {
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-idlegossip.json",
+             CLAUDE_PEERS_DB: "/tmp/broker-idlegossip.db", CLAUDE_PEERS_IDLE_EXIT_MS: "1500" },
+      stdout: "ignore", stderr: "ignore",
+    });
+    for (let i = 0; i < 20; i++) { try { if ((await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(300) })).ok) break; } catch {} await new Promise((r) => setTimeout(r, 200)); }
+  });
+
+  afterAll(() => {
+    proc?.kill();
+    stub?.stop(true);
+    try { unlinkSync("/tmp/broker-idlegossip.db"); } catch {}
+    try { unlinkSync("/tmp/config-idlegossip.json"); } catch {}
+  });
+
+  it("posts an empty-peer gossip on idle teardown", async () => {
+    // No peer ever registers, so after the ~1.5s idle window the broker self-exits. Polling /health
+    // is a GET and never refreshes the idle clock, so the loop cannot keep the broker alive.
+    let down = false;
+    for (let i = 0; i < 30; i++) {
+      try { await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(300) }); }
+      catch { down = true; break; }
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    expect(down).toBe(true);
+    // Let the in-flight teardown gossip settle at the stub.
+    await new Promise((r) => setTimeout(r, 400));
+    // The teardown announced the broker is empty; under the bug idle-exit tore down without any
+    // gossip and the stub stays empty.
+    expect(captured.length).toBeGreaterThanOrEqual(1);
+    expect(captured.every(g => Array.isArray(g.peers) && g.peers.length === 0)).toBe(true);
+  }, 20_000);
+});
