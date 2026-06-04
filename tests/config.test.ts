@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import { loadConfig, type PeersConfig } from "../shared/config.ts";
+import { loadConfig } from "../shared/config.ts";
 
 describe("loadConfig", () => {
   it("loads config from a file path", async () => {

@@ -116,3 +116,19 @@ export interface ForwardMessageRequest {
   text: string;
   from_machine: string;
 }
+
+// The parsed body of a control-plane request. Each route reads only the fields of its own
+// request type; the switch on `path` selects which. The control plane is loopback-gated and the
+// only client is our own MCP server, which constructs these exact shapes, so the broker trusts
+// the parsed body — this intersection restores the field types `req.json()` erases to `unknown`.
+// No field name collides across the members (every shared key — id/from_id/to_id/summary/machine/
+// tailscale_ip/protocol_version — has the same type), so the intersection is internally consistent
+// and is assignable to each handler's parameter type.
+export type ControlPlaneRequest = RegisterRequest &
+  HeartbeatRequest &
+  SetSummaryRequest &
+  ListPeersRequest &
+  SendMessageRequest &
+  PollMessagesRequest &
+  GossipRequest &
+  ForwardMessageRequest;

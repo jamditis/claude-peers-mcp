@@ -1,9 +1,9 @@
 // tests/integration.test.ts
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import { Database } from "bun:sqlite";
-import { unlinkSync, mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync } from "fs";
-import { tmpdir } from "os";
-import { join } from "path";
+import { unlinkSync, mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // Create a directory holding a fake `tmux` executable that records its argv and
 // exits 0, so the broker's tmux backend is deterministic without a real tmux.
@@ -41,11 +41,11 @@ let procA: any;
 let procB: any;
 // Captured at each broker's registration `it` so the later send/poll tests can authenticate as
 // that real local peer (the control plane now binds each call to the session's token).
-let fedAId = "", fedAToken = "", fedBId = "", fedBToken = "";
+let fedAToken = "", fedBToken = "";
 
 async function brokerFetch(port: number, path: string, body: unknown, token?: string) {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (token) headers["Authorization"] = `Bearer ${token}`;
+  if (token) headers.Authorization = `Bearer ${token}`;
   const res = await fetch(`http://127.0.0.1:${port}${path}`, {
     method: "POST",
     headers,
@@ -57,7 +57,7 @@ async function brokerFetch(port: number, path: string, body: unknown, token?: st
   }
   try {
     return JSON.parse(text);
-  } catch (err) {
+  } catch {
     throw new Error(`brokerFetch non-JSON response from ${path}: ${text}`);
   }
 }
@@ -84,7 +84,7 @@ async function registerAndGetToken(port: number, overrides: Record<string, unkno
 // Raw POST that returns status + parsed body without throwing — for asserting 401s.
 async function rawPost(port: number, path: string, body: unknown, token?: string) {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (token) headers["Authorization"] = `Bearer ${token}`;
+  if (token) headers.Authorization = `Bearer ${token}`;
   const res = await fetch(`http://127.0.0.1:${port}${path}`, {
     method: "POST", headers, body: JSON.stringify(body),
   });
@@ -106,6 +106,11 @@ function insertLegacyPeer(dbPath: string, id: string, machine: string): void {
   ).run(id, 999_999, machine, "127.0.0.1", "/tmp/legacy", null, null, "", now, now, null, null, "none");
   db.close();
 }
+
+// These federation cases spawn two real broker subprocesses and wait on cross-broker
+// gossip, so they need a longer budget than the default per-test timeout. Bun takes the
+// timeout as a numeric arg on each hook/test (describe itself takes no options object).
+const FED_TIMEOUT_MS = 30_000;
 
 describe("two-broker federation", () => {
   beforeAll(async () => {
@@ -145,7 +150,7 @@ describe("two-broker federation", () => {
     if (!brokersReady) {
       throw new Error("Brokers failed to become ready within allotted time");
     }
-  });
+  }, FED_TIMEOUT_MS);
 
   afterAll(() => {
     procA?.kill();
@@ -168,8 +173,8 @@ describe("two-broker federation", () => {
       tailscale_ip: "127.0.0.1",
     });
     expect(result.id).toMatch(/^bra-/);
-    fedAId = result.id; fedAToken = result.token;
-  });
+    fedAToken = result.token;
+  }, FED_TIMEOUT_MS);
 
   it("registers a peer on broker B", async () => {
     const result = await brokerFetch(BROKER_B_PORT, "/register", {
@@ -182,8 +187,8 @@ describe("two-broker federation", () => {
       tailscale_ip: "127.0.0.1",
     });
     expect(result.id).toMatch(/^brb-/);
-    fedBId = result.id; fedBToken = result.token;
-  });
+    fedBToken = result.token;
+  }, FED_TIMEOUT_MS);
 
   it("gossip syncs peers between brokers", async () => {
     const maxWaitMs = 15_000;
@@ -211,7 +216,7 @@ describe("two-broker federation", () => {
 
       await new Promise(r => setTimeout(r, pollIntervalMs));
     }
-  });
+  }, FED_TIMEOUT_MS);
 
   it("sends a cross-broker message", async () => {
     const peersOnA = await brokerFetch(BROKER_A_PORT, "/list-peers", { scope: "machine", cwd: "/", git_root: null }) as any[];
@@ -232,7 +237,7 @@ describe("two-broker federation", () => {
     expect(pollResult.messages).toHaveLength(1);
     expect(pollResult.messages[0].text).toBe("hello from broker A");
     expect(pollResult.messages[0].from_id).toBe(localA.id);
-  });
+  }, FED_TIMEOUT_MS);
 
   it("reports error when forwarding to unknown remote peer", async () => {
     const peersOnA = await brokerFetch(BROKER_A_PORT, "/list-peers", { scope: "machine", cwd: "/", git_root: null }) as any[];
@@ -244,7 +249,7 @@ describe("two-broker federation", () => {
       text: "this should fail",
     }, fedAToken) as any;
     expect(sendResult.ok).toBe(false);
-  });
+  }, FED_TIMEOUT_MS);
 
   it("graceful shutdown clears remote peers on sibling", async () => {
     const beforePeers = await brokerFetch(BROKER_A_PORT, "/list-peers", { scope: "machine", cwd: "/", git_root: null }) as any[];
@@ -258,8 +263,8 @@ describe("two-broker federation", () => {
     const afterPeers = await brokerFetch(BROKER_A_PORT, "/list-peers", { scope: "machine", cwd: "/", git_root: null }) as any[];
     const remoteAfter = afterPeers.filter((p: any) => p.machine === "broker-b");
     expect(remoteAfter).toHaveLength(0);
-  });
-}, { timeout: 30_000 });
+  }, FED_TIMEOUT_MS);
+});
 
 describe("tmux delivery and floor", () => {
   const PORT = 17905;

@@ -1,5 +1,5 @@
-import { readFileSync } from "fs";
-import { homedir } from "os";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 
 export interface SiblingConfig {
   machine: string;
