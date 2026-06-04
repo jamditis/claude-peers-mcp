@@ -224,17 +224,71 @@ switch (cmd) {
     try {
       const health = await brokerFetch<{ status: string; peers: number }>("/health");
       console.log(`Broker has ${health.peers} peer(s). Shutting down...`);
-      // Find and kill the broker process on the port
-      const proc = Bun.spawnSync(["lsof", "-ti", `:${BROKER_PORT}`]);
-      const pids = new TextDecoder()
-        .decode(proc.stdout)
-        .trim()
-        .split("\n")
-        .filter((p) => p);
-      for (const pid of pids) {
-        process.kill(parseInt(pid, 10), "SIGTERM");
+      // Find and kill the broker process listening on the port. lsof is POSIX-only,
+      // so branch on platform: netstat -ano on Windows, lsof elsewhere. Without this,
+      // `kill-broker` silently reports "not running" on Windows (lsof throws -> catch)
+      // even though it is the recovery command server.ts points users to for a stale broker.
+      let pids: number[] = [];
+      if (process.platform === "win32") {
+        // No -p filter: `netstat -p TCP` lists only IPv4 TCP and would miss a broker
+        // bound to IPv6 ([::]:port); plain `netstat -ano` includes both. The regex
+        // accepts a "TCP" or "TCPv6" proto label and a v4 or bracketed-v6 address.
+        const out = new TextDecoder().decode(
+          Bun.spawnSync(["netstat", "-ano"]).stdout,
+        );
+        const seen = new Set<number>();
+        for (const line of out.split(/\r?\n/)) {
+          // "  TCP    0.0.0.0:7899   0.0.0.0:0   LISTENING   1234"
+          // "  TCP    [::]:7899      [::]:0      LISTENING   1234"
+          const m = line.match(/^\s*TCP(?:v6)?\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)/i);
+          if (m && Number(m[1]) === BROKER_PORT) seen.add(Number(m[2]));
+        }
+        pids = [...seen];
+      } else {
+        const out = new TextDecoder().decode(
+          Bun.spawnSync(["lsof", "-ti", `:${BROKER_PORT}`]).stdout,
+        );
+        pids = out
+          .trim()
+          .split("\n")
+          .map((p) => parseInt(p, 10))
+          .filter((n) => Number.isFinite(n) && n > 0);
       }
-      console.log("Broker stopped.");
+      if (pids.length === 0) {
+        // /health just succeeded, so the broker IS running — we simply could not
+        // locate its PID on the port. Never claim "stopped" when nothing was killed.
+        console.log(
+          `Broker is running but its PID could not be found on port ${BROKER_PORT}; nothing was killed. ` +
+            (process.platform === "win32"
+              ? `Check: netstat -ano | findstr :${BROKER_PORT}`
+              : `Check: lsof -i :${BROKER_PORT}`),
+        );
+      } else {
+        // Signal each PID on its own. process.kill can throw ESRCH (the PID exited
+        // between the netstat/lsof probe and now) or EPERM (owned by another user).
+        // /health already succeeded, so a kill failure is not "broker not running" —
+        // report it here instead of letting it fall through to the outer catch.
+        const failures: string[] = [];
+        let signaled = 0;
+        for (const pid of pids) {
+          try {
+            process.kill(pid, "SIGTERM");
+            signaled++;
+          } catch (e) {
+            failures.push(`PID ${pid}: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }
+        if (signaled > 0) console.log("Broker stopped.");
+        if (failures.length > 0) {
+          console.error(
+            `Could not signal ${failures.length} broker process(es): ${failures.join("; ")}.` +
+              (signaled === 0
+                ? " The broker responded to /health but no process could be signaled; " +
+                  "it may be owned by another user or exiting on its own."
+                : ""),
+          );
+        }
+      }
     } catch {
       console.log("Broker is not running.");
     }
