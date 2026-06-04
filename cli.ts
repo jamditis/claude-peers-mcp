@@ -26,14 +26,13 @@ try {
 const BROKER_PORT = config?.port ?? parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 
-async function brokerFetch<T>(path: string, body?: unknown): Promise<T> {
+async function brokerFetch<T>(path: string, body?: unknown, token?: string): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (body) headers["Content-Type"] = "application/json";
+  if (token) headers["Authorization"] = `Bearer ${token}`;
   const opts: RequestInit = body
-    ? {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      }
-    : {};
+    ? { method: "POST", headers, body: JSON.stringify(body) }
+    : Object.keys(headers).length ? { headers } : {};
   const res = await fetch(`${BROKER_URL}${path}`, {
     ...opts,
     signal: AbortSignal.timeout(3000),
@@ -145,12 +144,28 @@ switch (cmd) {
       console.error("Usage: bun cli.ts send <peer-id> <message>");
       process.exit(1);
     }
+    // The control plane authenticates the sender, so the CLI registers an ephemeral
+    // queued-only peer (no tmux pane -> never a delivery target), sends as that id with its
+    // token, then unregisters. Dead-pid filtering hides the row the moment this process exits,
+    // so a crash before the finally cannot leave a visible ghost.
+    let reg: { id: string; token: string } | null = null;
     try {
+      reg = await brokerFetch<{ id: string; token: string }>("/register", {
+        pid: process.pid,
+        cwd: process.cwd(),
+        git_root: null,
+        tty: null,
+        summary: "",
+        machine: config?.machine ?? "cli",
+        tailscale_ip: config?.tailscale_ip ?? "127.0.0.1",
+        tmux_pane: null,
+        tmux_socket: null,
+      });
       const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
-        from_id: "cli",
+        from_id: reg.id,
         to_id: toId,
         text: msg,
-      });
+      }, reg.token);
       if (result.ok) {
         console.log(`Message sent to ${toId}`);
       } else {
@@ -158,6 +173,10 @@ switch (cmd) {
       }
     } catch (e) {
       console.error(`Error: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      if (reg) {
+        try { await brokerFetch("/unregister", { id: reg.id }, reg.token); } catch {}
+      }
     }
     break;
   }

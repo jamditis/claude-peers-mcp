@@ -52,6 +52,17 @@ export function generateLeaseToken(): string {
   return t;
 }
 
+/**
+ * A per-session capability token. Unlike the lease nonce (which only needs to be
+ * unique-ish to name an attempt), this is a credential a peer presents to act as its
+ * registered id, so it draws 256 bits from a CSPRNG — unguessable, not just unique.
+ */
+export function generateAuthToken(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 /** Claim a queued row for one delivery attempt. Returns true iff this caller won it. */
 export function claimForDelivery(db: Database, id: number, nowMs: number, leaseMs: number, token: string): boolean {
   const res = db.run(

@@ -5,8 +5,10 @@ export type DeliveryKind = "tmux" | "launcher" | "none";
 export type DeliveryState = "queued" | "delivering" | "delivered";
 
 // Broker wire-protocol version. Bumped to 2 for the delivery_state schema and
-// delivery backends. server.ts requires at least this from a running broker.
-export const PROTOCOL_VERSION = 2;
+// delivery backends; to 3 for per-session capability tokens (a registered peer may
+// act only as the id it holds the token for). server.ts requires at least this from
+// a running broker.
+export const PROTOCOL_VERSION = 3;
 
 export interface Peer {
   id: PeerId;
@@ -53,6 +55,10 @@ export interface RegisterRequest {
 
 export interface RegisterResponse {
   id: PeerId;
+  // Per-session capability token. The peer presents it (Authorization: Bearer) on every
+  // mutating control-plane call; the broker binds the call's principal to it. Loopback-only,
+  // never serialized into gossip/forward payloads.
+  token: string;
 }
 
 export interface HeartbeatRequest {
