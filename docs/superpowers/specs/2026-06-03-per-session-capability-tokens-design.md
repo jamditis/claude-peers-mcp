@@ -53,16 +53,19 @@ const principal = path === "/send-message" ? body.from_id : body.id;
 const presented = bearerToken(req.headers);            // Authorization: Bearer <t>
 const row = principal ? tokenForPeer.get(principal) : null;
 const valid = presented !== null && row?.token != null && row.token === presented;
-if (!valid) {
-  const unsigned = presented === null;
-  if (!(ALLOW_UNSIGNED && unsigned)) return 401;       // grace accepts only *unsigned*
-}
+// Grace covers exactly one principal: a genuine pre-v3 row whose token is still NULL. A minted-
+// token principal must always present its token (else header omission re-opens forgery for the
+// whole upgrade window); an unknown principal (no row) is not a legacy peer and gets no pass.
+const legacyUnsigned = ALLOW_UNSIGNED && presented === null && row != null && row.token == null;
+if (!valid && !legacyUnsigned) return 401;
 ```
 
 - **Exempt routes:** `/register` (mints), `/retire` (broker-lifecycle — the caller is a *new*
   server retiring a stale broker and never registered with it, so it structurally holds no token),
-  `/list-peers` (read-only browsing), `/gossip` + `/forward-message` (federation, already IP-gated,
-  token-free by construction — like `tmux_pane`, the token never crosses a machine boundary).
+  `/list-peers` (read-only browsing — but it must `stripToken` its projection: `SELECT *` now reads
+  the secret token column, and a token-exempt route returning it would hand any loopback caller
+  every peer's credential), `/gossip` + `/forward-message` (federation, already IP-gated, token-free
+  by construction — like `tmux_pane`, the token never crosses a machine boundary; see residual below).
 - **`from_id` binding:** for `/send-message` the principal is `from_id`, so presenting peer A's
   token with `from_id=B` looks up B's token, mismatches, and 401s. Forgery is blocked at the gate
   by construction — no per-handler check needed.
@@ -107,3 +110,13 @@ A v3 broker restarted while their servers are still tokenless would 401 their he
 - Uid-gating the control plane / per-uid Unix-socket transport — closes multi-user vector (2).
 - Federation per-message auth (issue #4) — cross-machine forwards stay IP-gated; tokens never
   leave the host.
+- **Federation-route local reachability (issue #15).** `/forward-message` and `/gossip` are
+  token-exempt *and* reachable from loopback (`allowed_ips` must include `127.0.0.1` for local
+  sessions to register, and the loopback-only gate skips federation routes). So a local process can
+  reach `/forward-message` to queue a forged-`from_id` message into a live local peer — the same
+  forged-sender delivery the gate blocks on `/send-message` — or `/gossip` to corrupt remote
+  routing, without a token. On a single host, sibling and local-attacker traffic are
+  indistinguishable by source IP, so closing it needs sibling auth (#4). **Mitigation already in
+  place:** `floor_remote_forwards` defaults true, so a forward only *queues* — it does not auto-paste
+  into a pane; pane injection via this path requires the operator to opt into cross-node push. Found
+  by codex round 2 of this work; scoped to follow-up per Joe.
