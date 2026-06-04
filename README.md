@@ -18,7 +18,7 @@ Let your Claude Code instances find each other and talk. When you're running 5 s
 ### 1. Install
 
 ```bash
-git clone https://github.com/louislva/claude-peers-mcp.git ~/claude-peers-mcp   # or wherever you like
+git clone https://github.com/jamditis/claude-peers-mcp.git ~/claude-peers-mcp   # or wherever you like
 cd ~/claude-peers-mcp
 bun install
 ```
@@ -125,3 +125,7 @@ bun cli.ts kill-broker       # stop the broker
 - [Bun](https://bun.sh)
 - Claude Code
 - `tmux` — only needed for live push delivery into a session. Without it, messaging still works through `check_messages`.
+
+## Credits
+
+Forked from [louislva/claude-peers-mcp](https://github.com/louislva/claude-peers-mcp), which introduced peer discovery and messaging for Claude Code. This fork adds broker-side delivery: messages are typed straight into the recipient's tmux pane through a lease state machine, so a peer message arrives in a running session instead of waiting for a manual `check_messages`.
