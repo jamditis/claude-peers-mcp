@@ -73,7 +73,13 @@ export function resolveTargetBroker(
   const remote = db.query("SELECT machine FROM remote_peers WHERE id = ?").get(toId) as
     { machine: string } | null;
   if (!remote) return null;
-  const sibling = siblings.find(s => s.machine === remote.machine);
+  // Match case-insensitively: the sibling config and the remote's gossiped machine
+  // name come from independently-edited config files, so casing can drift (e.g. a
+  // sibling configured "host-d" vs a broker that broadcasts "host-d"). A case-sensitive
+  // compare here silently drops delivery as "Peer not found" while the peer still
+  // shows in list_peers. See issue #17.
+  const target = remote.machine.toLowerCase();
+  const sibling = siblings.find(s => s.machine.toLowerCase() === target);
   return sibling?.url ?? null;
 }
 
