@@ -264,10 +264,30 @@ switch (cmd) {
               : `Check: lsof -i :${BROKER_PORT}`),
         );
       } else {
+        // Signal each PID on its own. process.kill can throw ESRCH (the PID exited
+        // between the netstat/lsof probe and now) or EPERM (owned by another user).
+        // /health already succeeded, so a kill failure is not "broker not running" —
+        // report it here instead of letting it fall through to the outer catch.
+        const failures: string[] = [];
+        let signaled = 0;
         for (const pid of pids) {
-          process.kill(pid, "SIGTERM");
+          try {
+            process.kill(pid, "SIGTERM");
+            signaled++;
+          } catch (e) {
+            failures.push(`PID ${pid}: ${e instanceof Error ? e.message : String(e)}`);
+          }
         }
-        console.log("Broker stopped.");
+        if (signaled > 0) console.log("Broker stopped.");
+        if (failures.length > 0) {
+          console.error(
+            `Could not signal ${failures.length} broker process(es): ${failures.join("; ")}.` +
+              (signaled === 0
+                ? " The broker responded to /health but no process could be signaled; " +
+                  "it may be owned by another user or exiting on its own."
+                : ""),
+          );
+        }
       }
     } catch {
       console.log("Broker is not running.");
