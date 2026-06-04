@@ -30,10 +30,12 @@ as it. Tokens are never secrets at rest and never cross a machine boundary.
 ## Mechanism
 
 ### Mint (broker)
-- New nullable `peers.token TEXT` column. `ALTER TABLE peers ADD COLUMN token TEXT` migration,
-  the same upgrade pattern as the `delivery_kind` column (broker.ts:164-168).
-- `handleRegister` generates a 256-bit token (`generateAuthToken()` in delivery.ts, hex,
-  `crypto.getRandomValues`), stores it on the peer row, returns `{ id, token }`.
+- New nullable `peers.token TEXT` column, added by the same migration for-loop over column
+  tuples that backfills `delivery_kind` (the `for (const [col, type] of [...])` block in
+  `broker.ts` that issues `ALTER TABLE peers ADD COLUMN <col> <type>` for any missing column).
+- `handleRegister` generates a 256-bit token rendered as 64-char hex (`generateAuthToken()` in
+  delivery.ts — 32 bytes from `crypto.getRandomValues`), stores it on the peer row, returns
+  `{ id, token }`.
 
 ### Carry (server + CLI)
 - `server.ts` captures `myAuthToken = reg.token` at registration; `brokerFetch` attaches
@@ -46,7 +48,8 @@ as it. Tokens are never secrets at rest and never cross a machine boundary.
   auto-hides any crash-leaked ghost; the prune reaps it.
 
 ### Validate (broker — single point at the gate)
-One block after the loopback check and body parse, before the `switch` (broker.ts:~672):
+One block after the loopback check and body parse, before the route `switch` (the token-exempt
+gate in `broker.ts` — the block computing `principal`/`presented`/`valid`/`legacyUnsigned`):
 
 ```
 const principal = path === "/send-message" ? body.from_id : body.id;
