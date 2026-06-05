@@ -1309,33 +1309,37 @@ describe("cross-broker send reports the remote delivery disposition", () => {
 
   beforeAll(async () => {
     stub = makeStubTmux();
-    await Bun.write("/tmp/config-fwa.json", JSON.stringify(cfgA));
-    await Bun.write("/tmp/config-fwb.json", JSON.stringify(cfgB));
-    await Bun.write("/tmp/config-fwc.json", JSON.stringify(cfgC));
-    await Bun.write("/tmp/config-fwd.json", JSON.stringify(cfgD));
-    for (const f of ["fwa", "fwb", "fwc", "fwd"]) {
+    // Config/DB paths must be unique across the whole file: the "retire waits for an
+    // in-flight remote forward" block owns /tmp/{config,broker}-fwd.*, and overwriting its
+    // config + unlinking its DB while that broker's handle is still open races into
+    // SQLITE_IOERR_SHORT_READ. This block uses a disp* prefix that no other block touches.
+    await Bun.write("/tmp/config-dispa.json", JSON.stringify(cfgA));
+    await Bun.write("/tmp/config-dispb.json", JSON.stringify(cfgB));
+    await Bun.write("/tmp/config-dispc.json", JSON.stringify(cfgC));
+    await Bun.write("/tmp/config-dispd.json", JSON.stringify(cfgD));
+    for (const f of ["dispa", "dispb", "dispc", "dispd"]) {
       try { unlinkSync(`/tmp/broker-${f}.db`); } catch {}
     }
 
     pA = Bun.spawn(["bun", "broker.ts"], {
-      env: { ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-fwa.json", CLAUDE_PEERS_DB: "/tmp/broker-fwa.db" },
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-dispa.json", CLAUDE_PEERS_DB: "/tmp/broker-dispa.db" },
       stdout: "ignore", stderr: "inherit",
     });
     // Broker B pushes the forward, so its tmux backend must be the deterministic stub.
     pB = Bun.spawn(["bun", "broker.ts"], {
       env: {
-        ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-fwb.json", CLAUDE_PEERS_DB: "/tmp/broker-fwb.db",
+        ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-dispb.json", CLAUDE_PEERS_DB: "/tmp/broker-dispb.db",
         PATH: `${stub.dir}:${process.env.PATH}`,
       },
       stdout: "ignore", stderr: "inherit",
     });
     pC = Bun.spawn(["bun", "broker.ts"], {
-      env: { ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-fwc.json", CLAUDE_PEERS_DB: "/tmp/broker-fwc.db" },
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-dispc.json", CLAUDE_PEERS_DB: "/tmp/broker-dispc.db" },
       stdout: "ignore", stderr: "inherit",
     });
     pD = Bun.spawn(["bun", "broker.ts"], {
       env: {
-        ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-fwd.json", CLAUDE_PEERS_DB: "/tmp/broker-fwd.db",
+        ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-dispd.json", CLAUDE_PEERS_DB: "/tmp/broker-dispd.db",
         PATH: `${stub.dir}:${process.env.PATH}`,
       },
       stdout: "ignore", stderr: "inherit",
@@ -1346,7 +1350,7 @@ describe("cross-broker send reports the remote delivery disposition", () => {
 
   afterAll(() => {
     pA?.kill(); pB?.kill(); pC?.kill(); pD?.kill();
-    for (const f of ["fwa", "fwb", "fwc", "fwd"]) {
+    for (const f of ["dispa", "dispb", "dispc", "dispd"]) {
       try { unlinkSync(`/tmp/broker-${f}.db`); } catch {}
       try { unlinkSync(`/tmp/config-${f}.json`); } catch {}
     }
