@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import { loadConfig } from "../shared/config.ts";
+import { loadConfig, singleHostDefault } from "../shared/config.ts";
 
 describe("loadConfig", () => {
   it("loads config from a file path", async () => {
@@ -20,10 +20,6 @@ describe("loadConfig", () => {
     expect(config.id_prefix).toBe("tst");
     expect(config.siblings).toHaveLength(1);
     expect(config.allowed_ips).toContain("127.0.0.1");
-  });
-
-  it("throws if config file is missing", () => {
-    expect(() => loadConfig("/tmp/nonexistent-peers.json")).toThrow();
   });
 
   it("throws if required fields are missing", async () => {
@@ -66,5 +62,51 @@ describe("floor_remote_forwards", () => {
       floor_remote_forwards: true,
     }));
     expect(loadConfig(path).floor_remote_forwards).toBe(true);
+  });
+});
+
+describe("single-host default (zero-config fresh install)", () => {
+  // A fresh single-host install requests no config and has no ~/.claude-peers.json yet, so
+  // loadConfig returns this loopback-only default. The default is tested directly because the
+  // trigger (the absent DEFAULT path) can't be forced on a dev box where that file exists.
+  it("singleHostDefault is a valid loopback-only config", () => {
+    const config = singleHostDefault();
+    expect(config.port).toBe(7899);
+    expect(config.siblings).toEqual([]);
+    expect(config.allowed_ips).toContain("127.0.0.1");
+    expect(config.tailscale_ip).toBe("127.0.0.1");
+    expect(config.floor_remote_forwards).toBe(true);
+    expect(config.machine.length).toBeGreaterThan(0);
+    expect(config.id_prefix).toMatch(/^[a-z0-9]+$/);
+    expect(config.id_prefix.length).toBeGreaterThanOrEqual(1);
+    expect(config.id_prefix.length).toBeLessThanOrEqual(3);
+  });
+
+  it("throws on an explicit missing path (only the default path defaults)", () => {
+    // A caller that passes a path MEANT to load it — a missing explicit config is a real
+    // misconfiguration, not a fresh install, so it must fail loudly rather than default.
+    expect(() => loadConfig("/tmp/definitely-absent-peers.json")).toThrow();
+  });
+
+  it("throws when CLAUDE_PEERS_CONFIG points at a missing file (deploy misconfig fails loudly)", () => {
+    const prev = process.env.CLAUDE_PEERS_CONFIG;
+    process.env.CLAUDE_PEERS_CONFIG = "/tmp/definitely-absent-env-peers.json";
+    try {
+      expect(() => loadConfig()).toThrow();
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_PEERS_CONFIG;
+      else process.env.CLAUDE_PEERS_CONFIG = prev;
+    }
+  });
+
+  it("still throws on a present-but-incomplete file (does not loosen validation)", async () => {
+    await Bun.write("/tmp/cfg-present-incomplete.json", JSON.stringify({ machine: "only-machine" }));
+    expect(() => loadConfig("/tmp/cfg-present-incomplete.json")).toThrow();
+  });
+
+  it("still throws when the config path is unreadable (a directory -> EISDIR, not absence)", () => {
+    // A path that exists but cannot be read as a file is an explicit misconfiguration and
+    // must fail loudly, not silently default.
+    expect(() => loadConfig("/tmp")).toThrow();
   });
 });
