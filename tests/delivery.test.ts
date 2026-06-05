@@ -4,7 +4,7 @@ import { unlinkSync } from "node:fs";
 import { ensureMessagesTable, migrateMessagesSchema } from "../delivery.ts";
 import {
   claimForDelivery, confirmDelivered,
-  releaseToQueued, resetDeliveringOnStart, reclaimIfExpired,
+  releaseToQueued, resetDeliveringOnStart, reclaimIfExpired, findLeaklessDelivering,
 } from "../delivery.ts";
 import { resolveTmuxTarget, formatPeerMessage, PASTE_START, PASTE_END } from "../delivery.ts";
 import { deliverViaTmux, buildTmuxArgs, type TmuxSpawn } from "../delivery.ts";
@@ -99,6 +99,14 @@ function insert(db: Database, toId: string): number {
 function state(db: Database, id: number) {
   return db.query("SELECT delivery_state, lease_token, lease_expires_at FROM messages WHERE id=?").get(id) as any;
 }
+// Construct the issue #10 corrupt state (a delivering row with no lease). The create-path
+// CHECK rejects it, so model its real-world provenance — a migrated legacy table or a write
+// that bypassed the constraint — by suspending the CHECK for just this raw UPDATE.
+function rawNullLease(db: Database, id: number): void {
+  db.run("PRAGMA ignore_check_constraints = ON");
+  try { db.run("UPDATE messages SET lease_expires_at=NULL WHERE id=?", [id]); }
+  finally { db.run("PRAGMA ignore_check_constraints = OFF"); }
+}
 
 describe("lease state machine", () => {
   let db: Database;
@@ -168,6 +176,46 @@ describe("lease state machine", () => {
     claimForDelivery(db, id, 1000, 5000, "tok1"); // expires at 6000
     expect(reclaimIfExpired(db, id, 6000)).toBe(true); // boundary is inclusive
     expect(state(db, id).delivery_state).toBe("queued");
+  });
+
+  // Issue #10: a delivering row whose lease was raw-nulled out (the only way the corrupt
+  // state arises) has no live claim, so it must be reclaimable — otherwise it jams the head.
+  it("reclaims a delivering row whose lease was nulled out (orphaned, no live claim)", () => {
+    const id = insert(db, "b");
+    claimForDelivery(db, id, 1000, 5000, "tok1");           // delivering, lease=6000
+    // Construct the corrupt NULL-lease delivering state with a raw UPDATE (the only way it arises).
+    rawNullLease(db, id);
+    expect(state(db, id).delivery_state).toBe("delivering");
+    expect(state(db, id).lease_expires_at).toBeNull();
+    expect(reclaimIfExpired(db, id, 7000)).toBe(true);       // FAILS before the fix (guard returns false)
+    expect(state(db, id).delivery_state).toBe("queued");
+    expect(state(db, id).lease_token).toBeNull();
+  });
+
+  it("does not reclaim a delivering row whose lease is still in the future (NULL-relaxation must not reclaim live)", () => {
+    const id = insert(db, "b");
+    claimForDelivery(db, id, 1000, 5000, "tok1");           // lease=6000, not yet expired
+    expect(reclaimIfExpired(db, id, 5000)).toBe(false);      // still passes after the fix
+    expect(state(db, id).delivery_state).toBe("delivering");
+  });
+
+  it("findLeaklessDelivering counts a NULL-lease delivering row", () => {
+    const id = insert(db, "b");
+    claimForDelivery(db, id, 1000, 5000, "tok1");
+    expect(findLeaklessDelivering(db)).toBe(0);
+    rawNullLease(db, id);
+    expect(findLeaklessDelivering(db)).toBe(1);
+  });
+
+  // The create-path CHECK enforces 'delivering' => a live claim: a non-null lease AND a
+  // non-null token. A future lease with no token still has no holder that can confirm or
+  // release the row, so a raw write of that shape must be rejected on a fresh table.
+  it("the create-path CHECK rejects a delivering row with no lease token (holderless)", () => {
+    const id = insert(db, "b"); // queued
+    expect(() => db.run(
+      "UPDATE messages SET delivery_state='delivering', lease_expires_at=? WHERE id=?",
+      [9999, id],
+    )).toThrow();
   });
 });
 
@@ -294,6 +342,21 @@ describe("nextDeliverable", () => {
     ins(db, "other");
     expect(nextDeliverable(db, "b", 1000, new Set())).toBeNull();
   });
+
+  // Issue #10: an orphaned NULL-lease delivering head must be reclaimable so younger mail
+  // behind it is not blocked head-of-line forever.
+  it("an orphaned NULL-lease delivering head is reclaimable and unblocks younger mail", () => {
+    const a = ins(db, "b"); ins(db, "b");                  // a is the older head; a younger row sits behind it
+    claimForDelivery(db, a, 1000, 5000, "t1");
+    rawNullLease(db, a); // orphan the head (suspends the create-path CHECK, as in production legacy DBs)
+    // nextDeliverable already returns it (live=false) — that part is not the bug:
+    const row = nextDeliverable(db, "b", 7000, new Set());
+    expect(row!.id).toBe(a);
+    expect(row!.delivery_state).toBe("delivering");
+    // The fix: reclaimIfExpired must now actually reclaim it so the consumer can proceed.
+    expect(reclaimIfExpired(db, a, 7000)).toBe(true);       // FAILS before the fix
+    expect(nextDeliverable(db, "b", 7000, new Set())!.id).toBe(a); // now a queued, deliverable head
+  });
 });
 
 describe("releasableQueuedPrefix", () => {
@@ -387,7 +450,9 @@ describe("pruneMessages", () => {
   it("never prunes a delivering row, however old (it is an active lease)", () => {
     const now = Date.now();
     const old = new Date(now - 60 * 60_000).toISOString();
-    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,delivery_state) VALUES ('a','b','in-flight',?,'delivering')", [old]);
+    // A real delivering row holds a live claim — a non-null lease AND token (the invariant
+    // the create-path CHECK enforces); supply both.
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,delivery_state,lease_expires_at,lease_token) VALUES ('a','b','in-flight',?,'delivering',?,'tok')", [old, now + 5000]);
     const res = pruneMessages(db, { deliveredTtlMs: 60_000, queuedMaxAgeMs: 5 * 60_000, nowMs: now });
     expect(res.deliveredPruned).toBe(0);
     expect(res.queuedPruned).toBe(0);

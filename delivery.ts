@@ -4,13 +4,22 @@
 
 import type { Database } from "bun:sqlite";
 
-/** Create the messages table in the M1 target schema if it does not exist. */
+/**
+ * Create the messages table in the M1 target schema if it does not exist. The CHECK
+ * enforces the 'delivering' => live-claim invariant (a non-null lease AND a non-null
+ * token: a delivering row with no holder can jam the recipient head-of-line) so a raw
+ * write can never recreate the issue #10 jam. It is best-effort: it only guards freshly-
+ * created tables — SQLite cannot ADD a table CHECK via ALTER, so a migrated legacy table
+ * is unprotected. findLeaklessDelivering is the portable runtime probe for the permanent
+ * (null-lease) case on those tables.
+ */
 export function ensureMessagesTable(db: Database): void {
   db.run(`CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT NOT NULL, to_id TEXT NOT NULL,
     text TEXT NOT NULL, sent_at TEXT NOT NULL,
     delivery_state TEXT NOT NULL DEFAULT 'queued',
-    lease_expires_at INTEGER, lease_token TEXT
+    lease_expires_at INTEGER, lease_token TEXT,
+    CHECK (delivery_state <> 'delivering' OR (lease_expires_at IS NOT NULL AND lease_token IS NOT NULL))
   )`);
 }
 
@@ -89,10 +98,16 @@ export function releaseToQueued(db: Database, id: number, token: string): void {
   );
 }
 
-/** Reclaim a delivering row whose lease has expired (caller must guard the active set). */
+/**
+ * Reclaim a delivering row whose lease has expired (caller must guard the active set). A
+ * NULL lease (a delivering row with no live claim — the issue #10 orphan) is also
+ * reclaimable: a delivering row with no lease cannot belong to a live attempt by
+ * definition. A future lease (lease_expires_at>now) still fails the predicate and is NOT
+ * reclaimed, so a live attempt is left alone.
+ */
 export function reclaimIfExpired(db: Database, id: number, nowMs: number): boolean {
   const res = db.run(
-    "UPDATE messages SET delivery_state='queued', lease_expires_at=NULL, lease_token=NULL WHERE id=? AND delivery_state='delivering' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?",
+    "UPDATE messages SET delivery_state='queued', lease_expires_at=NULL, lease_token=NULL WHERE id=? AND delivery_state='delivering' AND (lease_expires_at IS NULL OR lease_expires_at<=?)",
     [id, nowMs],
   );
   return res.changes === 1;
@@ -104,6 +119,11 @@ export function resetDeliveringOnStart(db: Database): number {
     "UPDATE messages SET delivery_state='queued', lease_expires_at=NULL, lease_token=NULL WHERE delivery_state='delivering'",
   );
   return res.changes;
+}
+
+/** Invariant: a 'delivering' row always holds a non-null lease. Returns the count of rows that violate it. */
+export function findLeaklessDelivering(db: Database): number {
+  return (db.query("SELECT COUNT(*) AS n FROM messages WHERE delivery_state='delivering' AND lease_expires_at IS NULL").get() as { n: number }).n;
 }
 
 export const PASTE_START = "\x1b[200~";
