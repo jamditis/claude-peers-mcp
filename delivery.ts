@@ -121,22 +121,29 @@ export function resetDeliveringOnStart(db: Database): number {
   return res.changes;
 }
 
-/** Invariant: a 'delivering' row always holds a non-null lease. Returns the count of rows that violate it. */
+// The orphan predicate mirrors the create-path CHECK exactly: a 'delivering' row is holderless
+// if EITHER lease column is null. Half of it (lease_expires_at only) would miss a future-lease /
+// null-token row, which nextDeliverable treats as a live lease and would block until the arbitrary
+// timestamp. Migrated legacy tables carry no CHECK (SQLite can't add one via ALTER TABLE ADD
+// COLUMN), so this runtime predicate is their only enforcement — it must cover the whole invariant.
+const HOLDERLESS_DELIVERING = "delivery_state='delivering' AND (lease_expires_at IS NULL OR lease_token IS NULL)";
+
+/** Invariant: a 'delivering' row always holds a non-null lease AND token. Returns the count that violate it. */
 export function findLeaklessDelivering(db: Database): number {
-  return (db.query("SELECT COUNT(*) AS n FROM messages WHERE delivery_state='delivering' AND lease_expires_at IS NULL").get() as { n: number }).n;
+  return (db.query(`SELECT COUNT(*) AS n FROM messages WHERE ${HOLDERLESS_DELIVERING}`).get() as { n: number }).n;
 }
 
 /**
- * Reclaim every orphaned (NULL-lease) delivering row back to queued, returning the count reclaimed.
+ * Reclaim every orphaned (holderless) delivering row back to queued, returning the count reclaimed.
  * The periodic broker sweep calls this. Unlike deliverNext — which returns "queued" at its tmux
  * backend gate before reaching reclaimIfExpired, so it never reclaims for a pull-only recipient —
  * the sweep has no backend gate, so it unjams a stuck head-of-line regardless of how the recipient
- * receives mail. A delivering row with a NULL lease cannot belong to a live attempt (claimForDelivery
- * sets state and lease atomically), so reclaiming it is always safe.
+ * receives mail. A delivering row missing either lease column cannot belong to a live attempt
+ * (claimForDelivery sets state, lease, and token in one atomic UPDATE), so reclaiming it is always safe.
  */
 export function reclaimLeaklessDelivering(db: Database): number {
   return db.run(
-    "UPDATE messages SET delivery_state='queued', lease_expires_at=NULL, lease_token=NULL WHERE delivery_state='delivering' AND lease_expires_at IS NULL",
+    `UPDATE messages SET delivery_state='queued', lease_expires_at=NULL, lease_token=NULL WHERE ${HOLDERLESS_DELIVERING}`,
   ).changes;
 }
 

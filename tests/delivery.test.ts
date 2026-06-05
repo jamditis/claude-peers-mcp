@@ -109,6 +109,14 @@ function rawNullLease(db: Database, id: number): void {
   finally { db.run("PRAGMA ignore_check_constraints = OFF"); }
 }
 
+// The other half of the holderless shape: a future lease_expires_at with no token (a legacy
+// 'delivering' row migrated onto a table that never got the CHECK). Only a raw write makes it.
+function rawNullToken(db: Database, id: number): void {
+  db.run("PRAGMA ignore_check_constraints = ON");
+  try { db.run("UPDATE messages SET lease_token=NULL WHERE id=?", [id]); }
+  finally { db.run("PRAGMA ignore_check_constraints = OFF"); }
+}
+
 describe("lease state machine", () => {
   let db: Database;
   beforeEach(() => { db = seededDb(); });
@@ -230,6 +238,21 @@ describe("lease state machine", () => {
     expect(reclaimLeaklessDelivering(db)).toBe(0);
     expect(state(db, id).delivery_state).toBe("delivering");
     expect(state(db, id).lease_token).toBe("tok1");
+  });
+
+  // The holderless invariant has two halves — null lease_expires_at OR null lease_token — and must
+  // match the create-path CHECK. A future-lease/null-token row has no token that can ever confirm or
+  // release it, yet nextDeliverable reads the future lease as live and blocks the queue until that
+  // timestamp. The runtime defense (the only enforcement on a CHECK-less legacy table) must catch it.
+  it("findLeaklessDelivering and reclaimLeaklessDelivering catch a future-lease, null-token row", () => {
+    const id = insert(db, "b");
+    claimForDelivery(db, id, 1000, 5000, "tok1"); // delivering, lease=6000 (future), token set
+    rawNullToken(db, id);                          // holderless: token gone, lease still in the future
+    expect(state(db, id).lease_expires_at).not.toBeNull();
+    expect(state(db, id).lease_token).toBeNull();
+    expect(findLeaklessDelivering(db)).toBe(1);    // FAILS before the predicate covers null token
+    expect(reclaimLeaklessDelivering(db)).toBe(1); // FAILS before the predicate covers null token
+    expect(state(db, id).delivery_state).toBe("queued");
   });
 
   // The create-path CHECK enforces 'delivering' => a live claim: a non-null lease AND a
