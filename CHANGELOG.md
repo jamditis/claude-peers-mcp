@@ -1,0 +1,40 @@
+# Changelog
+
+All notable changes to this project are documented here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.2.0] - 2026-06-04
+
+This release turns claude-peers from a single-machine discovery tool into a federated, security-gated peer messaging fabric: cross-machine gossip across four broker nodes, broker-side tmux delivery backed by a per-message lease state machine, and per-session capability-token auth (protocol version 3) that closes the `from_id` forgery hole.
+
+### Added
+
+- Federated cross-machine peer discovery: each node's broker POSTs its live local peer list to every sibling on a 5s gossip loop over Tailscale and TTLs remote rows out after 30s, so `list_peers` scope:machine merges local and remote peers (#1).
+- Cross-machine message routing: `send_message` to a non-local peer resolves the owning broker from gossiped machine names and forwards over `/forward-message`, which the receiver queues for the local peer (#1, #16).
+- A4000 (Tailscale name `lenovo-work-desktop`, 100.73.117.41) as a 4th broker node, with symmetric sibling configs for all four machines and two PowerShell installers (Bun + clone + firewall rule for inbound TCP 7899, and a logon Task Scheduler entry) (#2).
+- Reliable broker-side tmux delivery: the broker types each message into the recipient's pane via `tmux send-keys` bracketed-paste, tracked by a per-message `queued -> delivering -> delivered` lease machine that re-probes liveness before confirming and requeues on failure so a message is never silently lost (#16).
+- Per-session capability-token auth (protocol version 3): `/register` mints a 256-bit token bound to the peer, and every mutating control-plane call must present `Authorization: Bearer` matching its principal, so a forged `from_id` returns 401 (#16, closes #13).
+- `CLAUDE_PEERS_ALLOW_UNSIGNED=1` upgrade-grace flag that forgives only a missing token on a pre-v3 NULL-token row during the v2-to-v3 window; a wrong token always 401s (#16).
+- Source-IP allowlist and `floor_remote_forwards` secure-by-default behavior so cross-machine forwards queue for pull instead of auto-pasting unless opted out (#1, #16).
+- CI workflow running typecheck, Biome lint, and `bun test` as a single required-check job, a CodeQL JavaScript/TypeScript workflow on PRs and a weekly cron, and a `biome.json` pinned to Biome 2.4.16 (#20).
+- Native Windows support for the broker process: `fileURLToPath` for the auto-spawn path (replacing `new URL(...).pathname`, which `Bun.spawn` can't resolve on Windows) and a `kill-broker` that branches on `process.platform` — `netstat -ano` on Windows, `lsof` elsewhere (#19).
+
+### Changed
+
+- Match peer machine names case-insensitively in broker routing, so config casing drift (a node broadcasting `A4000` listed as sibling `a4000`) no longer returns a null forward URL (#18, closes #17).
+- Collapse repeated gossip failures into periodic summaries: log the first failure, stay silent within a 5-minute window, then emit one `still failing` summary per interval and a `recovered` line on recovery, replacing the ~17,280 log lines/day a single dead sibling produced (#3).
+- Drop the OpenAI auto-summary dependency in favor of each instance setting its own summary via the `set_summary` tool (#1).
+- Gate the broker control plane to loopback only, exempting just the two federation routes (`/gossip`, `/forward-message`), so off-machine traffic cannot reach the mutating endpoints (#16).
+- Strip the token column from `/list-peers` responses so the read route never leaks the per-session secret (#16).
+- Bump `PROTOCOL_VERSION` to 3 and retire any older broker on startup via a `/health` version handshake (#16).
+
+### Fixed
+
+- Clear 16 pre-existing strict `tsc` errors that blocked a typecheck gate, including the control-plane request cast at the `req.json()` boundary, an env index-signature widening in `resolveTmuxTarget`, and an unhonored federation-test timeout moved onto the hooks (#20).
+- Keep an in-flight delivery's peer row from being deleted out from under it across unregister and same-pid re-register, making the active-lease invariant total (#16).
+- Drain an in-flight remote forward before a retire or idle-exit so cross-machine mail is not dropped on shutdown (#16).
+- Strip C0/C1 control characters (including ESC and the C1 CSI byte) before injection to neutralize bracketed-paste escape injection (#16).
+
+[0.2.0]: https://github.com/jamditis/claude-peers-mcp/releases/tag/v0.2.0
