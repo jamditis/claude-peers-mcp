@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { unlinkSync } from "node:fs";
 import { ensureMessagesTable, migrateMessagesSchema } from "../delivery.ts";
 import {
-  claimForDelivery, confirmDelivered,
+  claimForDelivery, confirmDelivered, isMessageDelivered,
   releaseToQueued, resetDeliveringOnStart, reclaimIfExpired, findLeaklessDelivering,
   reclaimLeaklessDelivering,
 } from "../delivery.ts";
@@ -137,6 +137,18 @@ describe("lease state machine", () => {
     expect(state(db, id).delivery_state).toBe("delivering");
     expect(confirmDelivered(db, id, "tok1")).toBe(true);
     expect(state(db, id).delivery_state).toBe("delivered");
+  });
+
+  // Issue #14: reporting a forward's own disposition reads the specific row's state, so a
+  // queued or in-flight row is not "delivered" — only a confirmed one is.
+  it("isMessageDelivered is true only for a row in the delivered state", () => {
+    const id = insert(db, "b");
+    expect(isMessageDelivered(db, id)).toBe(false);       // queued
+    claimForDelivery(db, id, 1000, 5000, "tok1");
+    expect(isMessageDelivered(db, id)).toBe(false);       // delivering
+    confirmDelivered(db, id, "tok1");
+    expect(isMessageDelivered(db, id)).toBe(true);        // delivered
+    expect(isMessageDelivered(db, 9999)).toBe(false);     // absent row
   });
 
   it("releaseToQueued only releases the holder's row", () => {

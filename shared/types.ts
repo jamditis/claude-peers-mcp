@@ -117,6 +117,15 @@ export interface ForwardMessageRequest {
   from_machine: string;
 }
 
+export interface ForwardMessageResponse {
+  ok: boolean;
+  // Disposition of the auto-inject the receiving broker attempted for this forward:
+  // "accepted" = pushed into the recipient's live tmux session; "queued" = left for
+  // their next check_messages (e.g. floor_remote_forwards, no tmux backend, or a failed
+  // push). Absent when ok is false (no recipient to deliver to).
+  delivery?: "accepted" | "queued";
+}
+
 // The parsed body of a control-plane request. Each route reads only the fields of its own
 // request type; the switch on `path` selects which. The control plane is loopback-gated and the
 // only client is our own MCP server, which constructs these exact shapes, so the broker trusts

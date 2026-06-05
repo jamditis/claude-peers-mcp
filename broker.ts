@@ -12,13 +12,13 @@ import { loadConfig, type SiblingConfig } from "./shared/config.ts";
 import type {
   RegisterRequest, RegisterResponse, ListPeersRequest, SendMessageRequest,
   PollMessagesRequest, PollMessagesResponse, Peer, Message,
-  GossipRequest, ForwardMessageRequest, SendResult,
+  GossipRequest, ForwardMessageRequest, ForwardMessageResponse, SendResult,
   ControlPlaneRequest,
 } from "./shared/types.ts";
 import {
   ensureMessagesTable, migrateMessagesSchema, resetDeliveringOnStart, reclaimLeaklessDelivering,
   generateLeaseToken, generateAuthToken, claimForDelivery, confirmDelivered, releaseToQueued,
-  reclaimIfExpired, nextDeliverable, formatPeerMessage, releasableQueuedPrefix,
+  reclaimIfExpired, nextDeliverable, formatPeerMessage, releasableQueuedPrefix, isMessageDelivered,
   deliverViaTmux, isLoopback, isFederationRoute, isPidDead, pidProbe, pruneMessages, type TmuxSpawn,
 } from "./delivery.ts";
 import { PROTOCOL_VERSION } from "./shared/types.ts";
@@ -525,9 +525,9 @@ if (import.meta.main) {
         signal: AbortSignal.timeout(FORWARD_TIMEOUT_MS),
       });
       if (!res.ok) return { ok: false, error: `Remote broker error: ${res.status}` };
-      const result = await res.json() as { ok: boolean };
+      const result = await res.json() as ForwardMessageResponse;
       if (!result.ok) return { ok: false, error: "Remote broker rejected message (target peer not found)" };
-      return { ok: true, routed: "remote" };
+      return { ok: true, routed: "remote", delivery: result.delivery ?? "queued" };
     } catch {
       return { ok: false, error: "Remote broker unreachable" };
     } finally {
@@ -535,7 +535,7 @@ if (import.meta.main) {
     }
   }
 
-  async function handleForwardMessage(body: ForwardMessageRequest): Promise<{ ok: boolean }> {
+  async function handleForwardMessage(body: ForwardMessageRequest): Promise<ForwardMessageResponse> {
     if (body.protocol_version !== PROTOCOL_VERSION) {
       console.error(`[claude-peers broker] Warning: received protocol_version ${body.protocol_version}, expected ${PROTOCOL_VERSION}`);
     }
@@ -549,13 +549,22 @@ if (import.meta.main) {
       console.error(`[claude-peers broker] Dropping forwarded message: no live local peer ${body.to_id}`);
       return { ok: false };
     }
-    insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
+    const inserted = insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
+    const forwardedRowId = Number(inserted.lastInsertRowid);
     // floor_remote_forwards leaves a forwarded message queued for pull-only retrieval;
     // by default a forward auto-injects into the recipient's backend like a local send.
-    if (!config.floor_remote_forwards && (await deliverNext(body.to_id)) === "accepted") {
-      await drainAfterDelivery(body.to_id);
+    // Report the honest per-message disposition so the originating broker can tell the
+    // sender whether the message was pushed or left for their next check (issue #14).
+    let delivery: "accepted" | "queued" = "queued";
+    if (!config.floor_remote_forwards) {
+      // deliverNext delivers the recipient's queue HEAD (possibly older backlog, not this
+      // forward); drainAfterDelivery then works down the queue. Report THIS message's own
+      // fate — it may have ridden out behind the backlog, or still be queued if the drain
+      // cap was hit — not the head's disposition.
+      if ((await deliverNext(body.to_id)) === "accepted") await drainAfterDelivery(body.to_id);
+      delivery = isMessageDelivered(db, forwardedRowId) ? "accepted" : "queued";
     }
-    return { ok: true };
+    return { ok: true, delivery };
   }
 
   function handleGossip(body: GossipRequest): { ok: boolean } {
