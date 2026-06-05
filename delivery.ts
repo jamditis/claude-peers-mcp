@@ -126,6 +126,20 @@ export function findLeaklessDelivering(db: Database): number {
   return (db.query("SELECT COUNT(*) AS n FROM messages WHERE delivery_state='delivering' AND lease_expires_at IS NULL").get() as { n: number }).n;
 }
 
+/**
+ * Reclaim every orphaned (NULL-lease) delivering row back to queued, returning the count reclaimed.
+ * The periodic broker sweep calls this. Unlike deliverNext — which returns "queued" at its tmux
+ * backend gate before reaching reclaimIfExpired, so it never reclaims for a pull-only recipient —
+ * the sweep has no backend gate, so it unjams a stuck head-of-line regardless of how the recipient
+ * receives mail. A delivering row with a NULL lease cannot belong to a live attempt (claimForDelivery
+ * sets state and lease atomically), so reclaiming it is always safe.
+ */
+export function reclaimLeaklessDelivering(db: Database): number {
+  return db.run(
+    "UPDATE messages SET delivery_state='queued', lease_expires_at=NULL, lease_token=NULL WHERE delivery_state='delivering' AND lease_expires_at IS NULL",
+  ).changes;
+}
+
 export const PASTE_START = "\x1b[200~";
 export const PASTE_END = "\x1b[201~";
 

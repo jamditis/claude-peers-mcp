@@ -5,6 +5,7 @@ import { ensureMessagesTable, migrateMessagesSchema } from "../delivery.ts";
 import {
   claimForDelivery, confirmDelivered,
   releaseToQueued, resetDeliveringOnStart, reclaimIfExpired, findLeaklessDelivering,
+  reclaimLeaklessDelivering,
 } from "../delivery.ts";
 import { resolveTmuxTarget, formatPeerMessage, PASTE_START, PASTE_END } from "../delivery.ts";
 import { deliverViaTmux, buildTmuxArgs, type TmuxSpawn } from "../delivery.ts";
@@ -205,6 +206,30 @@ describe("lease state machine", () => {
     expect(findLeaklessDelivering(db)).toBe(0);
     rawNullLease(db, id);
     expect(findLeaklessDelivering(db)).toBe(1);
+  });
+
+  // The periodic sweep — not the delivery path — is what unjams a pull-only recipient: deliverNext
+  // bails at its tmux backend gate before reclaiming, and a poll stops at the delivering head, so
+  // an orphaned head would sit until a restart. reclaimLeaklessDelivering requeues it in the sweep.
+  it("reclaimLeaklessDelivering requeues every orphaned (NULL-lease) delivering row", () => {
+    const a = insert(db, "b"); const c = insert(db, "b");
+    claimForDelivery(db, a, 1000, 5000, "t1");
+    claimForDelivery(db, c, 1000, 5000, "t2");
+    rawNullLease(db, a); rawNullLease(db, c); // orphan both heads (the only way the corrupt state arises)
+    expect(findLeaklessDelivering(db)).toBe(2);
+    expect(reclaimLeaklessDelivering(db)).toBe(2);
+    expect(findLeaklessDelivering(db)).toBe(0);
+    expect(state(db, a).delivery_state).toBe("queued");
+    expect(state(db, c).delivery_state).toBe("queued");
+  });
+
+  // Safety boundary: the sweep must touch only orphans, never a live attempt holding a future lease.
+  it("reclaimLeaklessDelivering leaves a live (future-lease) delivering row alone", () => {
+    const id = insert(db, "b");
+    claimForDelivery(db, id, 1000, 5000, "tok1"); // lease=6000, a live attempt
+    expect(reclaimLeaklessDelivering(db)).toBe(0);
+    expect(state(db, id).delivery_state).toBe("delivering");
+    expect(state(db, id).lease_token).toBe("tok1");
   });
 
   // The create-path CHECK enforces 'delivering' => a live claim: a non-null lease AND a

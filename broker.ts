@@ -16,7 +16,7 @@ import type {
   ControlPlaneRequest,
 } from "./shared/types.ts";
 import {
-  ensureMessagesTable, migrateMessagesSchema, resetDeliveringOnStart, findLeaklessDelivering,
+  ensureMessagesTable, migrateMessagesSchema, resetDeliveringOnStart, reclaimLeaklessDelivering,
   generateLeaseToken, generateAuthToken, claimForDelivery, confirmDelivered, releaseToQueued,
   reclaimIfExpired, nextDeliverable, formatPeerMessage, releasableQueuedPrefix,
   deliverViaTmux, isLoopback, isFederationRoute, isPidDead, pidProbe, pruneMessages, type TmuxSpawn,
@@ -277,12 +277,15 @@ if (import.meta.main) {
     pruneRemotePeers(db, REMOTE_TTL_MS);
     const pruned = pruneMessages(db, { deliveredTtlMs: DELIVERED_TTL_MS, queuedMaxAgeMs: QUEUED_MAX_AGE_MS, nowMs: Date.now() });
     if (pruned.queuedPruned > 0) console.error(`[claude-peers broker] dropped ${pruned.queuedPruned} over-age queued message(s) (lossy backstop)`);
-    // Issue #10: a delivering row with no lease has no live claim and jams its recipient
-    // head-of-line. reclaimIfExpired now reclaims it on the delivery path; this surfaces
-    // the corruption loudly if one is ever observed. A count + log only — never throw here,
-    // since a throw in the sweep would itself wedge delivery.
-    const leakless = findLeaklessDelivering(db);
-    if (leakless > 0) console.error(`[claude-peers broker] invariant violation: ${leakless} delivering row(s) with no lease (issue #10) — reclaimable on next delivery`);
+    // Issue #10: a delivering row with no lease has no live claim and jams its recipient's
+    // head-of-line. The delivery path only reclaims it for a live tmux recipient — deliverNext
+    // returns "queued" at its backend gate before reaching reclaimIfExpired, and a poll stops at
+    // the delivering head — so for a pull-only recipient the orphan would sit until a restart.
+    // Reclaim it here (the sweep has no backend gate) and log loudly. A NULL-lease delivering row
+    // has no live attempt (claimForDelivery sets state and lease atomically), so this is always
+    // safe; it never throws, since a throw in the sweep would itself wedge delivery.
+    const reclaimed = reclaimLeaklessDelivering(db);
+    if (reclaimed > 0) console.error(`[claude-peers broker] reclaimed ${reclaimed} leaseless delivering row(s) to queued (issue #10 orphan)`);
   }
   cleanStalePeers();
 
