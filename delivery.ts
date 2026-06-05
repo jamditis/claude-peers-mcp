@@ -121,6 +121,19 @@ export function resetDeliveringOnStart(db: Database): number {
   return res.changes;
 }
 
+/**
+ * Whether one specific message row reached the 'delivered' state. Used to report a forward's
+ * own disposition rather than the recipient queue head's: deliverNext/drainAfterDelivery work
+ * down the queue head-first, so the just-forwarded row may have ridden out behind older
+ * backlog or still be queued — its own state is the honest answer (issue #14).
+ */
+export function isMessageDelivered(db: Database, id: number): boolean {
+  const row = db.query("SELECT delivery_state FROM messages WHERE id=?").get(id) as
+    | { delivery_state: string }
+    | null;
+  return row?.delivery_state === "delivered";
+}
+
 // The orphan predicate mirrors the create-path CHECK exactly: a 'delivering' row is holderless
 // if EITHER lease column is null. Half of it (lease_expires_at only) would miss a future-lease /
 // null-token row, which nextDeliverable treats as a live lease and would block until the arbitrary
