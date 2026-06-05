@@ -15,10 +15,12 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 - `delivery.ts` — Pure, testable delivery logic (lease state machine, tmux target resolution, bracketed-paste formatting + C0 stripping, ordered next-deliverable selection, liveness probe, retention prune, `generateAuthToken` for the capability token). `broker.ts` composes these; tests import them directly.
 - `shared/types.ts` — Shared types for the broker API, including `PROTOCOL_VERSION`, the `delivery_state` schema, and the per-session capability `token` field on `RegisterResponse`.
 - `shared/config.ts` — Config loader. Notable: `floor_remote_forwards` (default true, secure-by-default) leaves cross-machine forwards queued for `check_messages` instead of pushing them into the local pane; set it `false` to opt in to cross-node push. Local same-machine peers always push.
-- `shared/summarize.ts` — Auto-summary generation via gpt-5.4-nano.
+- `shared/summarize.ts` — Git-context helpers (`getGitBranch`, `getRecentFiles`) used to seed a peer's default summary. Auto-summary generation was removed; each instance sets its own summary via the `set_summary` tool.
 - `cli.ts` — CLI utility for inspecting broker state and sending messages. `send` registers an ephemeral queued-only peer (no tmux pane, so never a delivery target), authenticates the send with that peer's token, and unregisters in a `finally`.
 
 ## Running
+
+Both the broker and the MCP server read their settings from a config file — `~/.claude-peers.json` by default, overridable with `CLAUDE_PEERS_CONFIG` — not from environment variables. A missing or incomplete config throws on startup, so a valid one is required to run a session. Required fields: `machine`, `tailscale_ip`, `port`, `id_prefix`, `siblings`, `allowed_ips`. Optional: `db_path`, `floor_remote_forwards`. Per-host samples live under `deploy/configs/`.
 
 ```bash
 # Plain MCP — no channel flags needed. Delivery into a session works when Claude
