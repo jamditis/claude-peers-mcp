@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 
 export interface SiblingConfig {
   machine: string;
@@ -23,13 +23,46 @@ const HOME = homedir();
 const DEFAULT_CONFIG_PATH = `${HOME}/.claude-peers.json`;
 const DEFAULT_DB_PATH = `${HOME}/.claude-peers.db`;
 
+/**
+ * Build the zero-config single-host default: a loopback-only, non-federated island
+ * (port 7899, hostname-derived machine and id_prefix, no siblings, allowed_ips loopback,
+ * remote forwards floored). Used only when no config was requested and the default
+ * ~/.claude-peers.json is absent — a fresh single-host install.
+ */
+export function singleHostDefault(): PeersConfig {
+  const host = hostname();
+  const id_prefix = host.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 3) || "peer";
+  return {
+    machine: host,
+    tailscale_ip: "127.0.0.1",
+    port: 7899,
+    id_prefix,
+    siblings: [],
+    allowed_ips: ["127.0.0.1"],
+    db_path: process.env.CLAUDE_PEERS_DB ?? DEFAULT_DB_PATH,
+    floor_remote_forwards: true,
+  };
+}
+
 export function loadConfig(path?: string): PeersConfig {
-  const configPath = path ?? process.env.CLAUDE_PEERS_CONFIG ?? DEFAULT_CONFIG_PATH;
+  // An explicit path (arg or CLAUDE_PEERS_CONFIG) names a config the caller MEANT to load —
+  // a per-host deploy config. The zero-config default is only for a fresh install that
+  // requested nothing, so track whether a path was explicitly requested.
+  const explicitPath = path ?? process.env.CLAUDE_PEERS_CONFIG;
+  const configPath = explicitPath ?? DEFAULT_CONFIG_PATH;
   let raw: string;
   try {
     raw = readFileSync(configPath, "utf-8");
-  } catch {
-    throw new Error(`Config file not found: ${configPath}`);
+  } catch (err) {
+    // A present-but-unreadable config (a permission error, or a path that is a directory) is
+    // an explicit misconfiguration — re-throw so it fails loudly, never silently default.
+    if ((err as { code?: string }).code !== "ENOENT") throw err;
+    // An explicitly-requested path that is missing is also a real misconfiguration (a typo'd
+    // CLAUDE_PEERS_CONFIG, a deploy config that did not land) — fail loudly rather than boot a
+    // federated node as an isolated loopback island. Only the absent DEFAULT path means a
+    // fresh single-host install, which falls back to the zero-config default.
+    if (explicitPath !== undefined) throw err;
+    return singleHostDefault();
   }
 
   let parsed: unknown;
