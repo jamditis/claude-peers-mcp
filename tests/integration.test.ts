@@ -1254,3 +1254,146 @@ describe("cli send authenticates via an ephemeral registration", () => {
     expect(peers.filter((p) => !p.is_remote).length).toBe(1);
   }, 15_000);
 });
+
+// Issue #14: a cross-broker send must report the sibling's per-message delivery disposition,
+// not a blanket "queued". When the receiving broker pushes the forward into a live tmux pane the
+// originator should learn "accepted"; when the receiving broker floors the forward it should
+// learn the honest "queued". Two broker pairs because floor_remote_forwards is a broker-wide
+// config: pair (A,B) leaves B unfloored with a stub tmux to exercise the accepted path; pair
+// (C,D) leaves D floored (the default) to exercise the queued path.
+describe("cross-broker send reports the remote delivery disposition", () => {
+  const A_PORT = 17923, B_PORT = 17924; // unfloored sibling -> accepted
+  const C_PORT = 17925, D_PORT = 17926; // floored sibling   -> queued
+  let pA: any, pB: any, pC: any, pD: any;
+  let stub: { dir: string; logFile: string };
+
+  const cfgA = {
+    machine: "fwd-a", tailscale_ip: "127.0.0.1", port: A_PORT, id_prefix: "fwa",
+    siblings: [{ machine: "fwd-b", url: `http://127.0.0.1:${B_PORT}` }], allowed_ips: ["127.0.0.1"],
+  };
+  const cfgB = {
+    machine: "fwd-b", tailscale_ip: "127.0.0.1", port: B_PORT, id_prefix: "fwb",
+    siblings: [{ machine: "fwd-a", url: `http://127.0.0.1:${A_PORT}` }], allowed_ips: ["127.0.0.1"],
+    floor_remote_forwards: false,
+  };
+  const cfgC = {
+    machine: "fwd-c", tailscale_ip: "127.0.0.1", port: C_PORT, id_prefix: "fwc",
+    siblings: [{ machine: "fwd-d", url: `http://127.0.0.1:${D_PORT}` }], allowed_ips: ["127.0.0.1"],
+  };
+  const cfgD = {
+    machine: "fwd-d", tailscale_ip: "127.0.0.1", port: D_PORT, id_prefix: "fwd",
+    siblings: [{ machine: "fwd-c", url: `http://127.0.0.1:${C_PORT}` }], allowed_ips: ["127.0.0.1"],
+    // floor_remote_forwards omitted -> defaults to true (floored).
+  };
+
+  async function waitHealth(port: number) {
+    for (let i = 0; i < 30; i++) {
+      try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) return; } catch {}
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    throw new Error(`broker on ${port} not ready`);
+  }
+
+  // Poll broker `port` until a remote peer with the given id shows up via gossip, so
+  // resolveTargetBroker on the originating broker can route the forward.
+  async function waitRemotePeer(port: number, id: string) {
+    const start = Date.now();
+    while (Date.now() - start < 15_000) {
+      const peers = await brokerFetch(port, "/list-peers", { scope: "machine", cwd: "/", git_root: null }) as any[];
+      const found = peers.find((p: any) => p.id === id);
+      if (found?.is_remote) return;
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    throw new Error(`remote peer ${id} never gossiped to ${port}`);
+  }
+
+  beforeAll(async () => {
+    stub = makeStubTmux();
+    await Bun.write("/tmp/config-fwa.json", JSON.stringify(cfgA));
+    await Bun.write("/tmp/config-fwb.json", JSON.stringify(cfgB));
+    await Bun.write("/tmp/config-fwc.json", JSON.stringify(cfgC));
+    await Bun.write("/tmp/config-fwd.json", JSON.stringify(cfgD));
+    for (const f of ["fwa", "fwb", "fwc", "fwd"]) {
+      try { unlinkSync(`/tmp/broker-${f}.db`); } catch {}
+    }
+
+    pA = Bun.spawn(["bun", "broker.ts"], {
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-fwa.json", CLAUDE_PEERS_DB: "/tmp/broker-fwa.db" },
+      stdout: "ignore", stderr: "inherit",
+    });
+    // Broker B pushes the forward, so its tmux backend must be the deterministic stub.
+    pB = Bun.spawn(["bun", "broker.ts"], {
+      env: {
+        ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-fwb.json", CLAUDE_PEERS_DB: "/tmp/broker-fwb.db",
+        PATH: `${stub.dir}:${process.env.PATH}`,
+      },
+      stdout: "ignore", stderr: "inherit",
+    });
+    pC = Bun.spawn(["bun", "broker.ts"], {
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-fwc.json", CLAUDE_PEERS_DB: "/tmp/broker-fwc.db" },
+      stdout: "ignore", stderr: "inherit",
+    });
+    pD = Bun.spawn(["bun", "broker.ts"], {
+      env: {
+        ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-fwd.json", CLAUDE_PEERS_DB: "/tmp/broker-fwd.db",
+        PATH: `${stub.dir}:${process.env.PATH}`,
+      },
+      stdout: "ignore", stderr: "inherit",
+    });
+
+    await Promise.all([waitHealth(A_PORT), waitHealth(B_PORT), waitHealth(C_PORT), waitHealth(D_PORT)]);
+  }, FED_TIMEOUT_MS);
+
+  afterAll(() => {
+    pA?.kill(); pB?.kill(); pC?.kill(); pD?.kill();
+    for (const f of ["fwa", "fwb", "fwc", "fwd"]) {
+      try { unlinkSync(`/tmp/broker-${f}.db`); } catch {}
+      try { unlinkSync(`/tmp/config-${f}.json`); } catch {}
+    }
+  });
+
+  it("reports accepted when the sibling pushes the forward into a live tmux pane", async () => {
+    const sender = await registerAndGetToken(A_PORT, { cwd: "/tmp/fwa-s", machine: "fwd-a" });
+    const recip = await brokerFetch(B_PORT, "/register", {
+      pid: process.pid, cwd: "/tmp/fwb-r", git_root: null, tty: null, summary: "",
+      machine: "fwd-b", tailscale_ip: "127.0.0.1", tmux_pane: "%7", tmux_socket: null,
+    }) as any;
+
+    await waitRemotePeer(A_PORT, recip.id);
+
+    const send = await brokerFetch(A_PORT, "/send-message", {
+      from_id: sender.id, to_id: recip.id, text: "push me across",
+    }, sender.token) as any;
+    expect(send.ok).toBe(true);
+    expect(send.routed).toBe("remote");
+    // The load-bearing assertion: the sibling pushed the message, so the disposition is accepted.
+    expect(send.delivery).toBe("accepted");
+
+    // Corroborate the push really landed in the recipient's pane.
+    const log = readFileSync(stub.logFile, "utf-8");
+    expect(log).toContain("%7");
+    expect(log).toContain("push me across");
+  }, FED_TIMEOUT_MS);
+
+  it("reports queued when the sibling floors the forward", async () => {
+    const sender = await registerAndGetToken(C_PORT, { cwd: "/tmp/fwc-s", machine: "fwd-c" });
+    const recip = await brokerFetch(D_PORT, "/register", {
+      pid: process.pid, cwd: "/tmp/fwd-r", git_root: null, tty: null, summary: "",
+      machine: "fwd-d", tailscale_ip: "127.0.0.1", tmux_pane: "%8", tmux_socket: null,
+    }) as any;
+
+    await waitRemotePeer(C_PORT, recip.id);
+
+    const send = await brokerFetch(C_PORT, "/send-message", {
+      from_id: sender.id, to_id: recip.id, text: "hold me for pickup",
+    }, sender.token) as any;
+    expect(send.ok).toBe(true);
+    expect(send.routed).toBe("remote");
+    expect(send.delivery).toBe("queued");
+
+    // A floored forward stays retrievable on the receiving broker.
+    const poll = await brokerFetch(D_PORT, "/poll-messages", { id: recip.id }, recip.token) as any;
+    expect(poll.messages).toHaveLength(1);
+    expect(poll.messages[0].text).toBe("hold me for pickup");
+  }, FED_TIMEOUT_MS);
+});

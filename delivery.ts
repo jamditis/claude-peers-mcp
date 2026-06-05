@@ -106,6 +106,19 @@ export function resetDeliveringOnStart(db: Database): number {
   return res.changes;
 }
 
+/**
+ * Whether one specific message row reached the 'delivered' state. Used to report a forward's
+ * own disposition rather than the recipient queue head's: deliverNext/drainAfterDelivery work
+ * down the queue head-first, so the just-forwarded row may have ridden out behind older
+ * backlog or still be queued — its own state is the honest answer (issue #14).
+ */
+export function isMessageDelivered(db: Database, id: number): boolean {
+  const row = db.query("SELECT delivery_state FROM messages WHERE id=?").get(id) as
+    | { delivery_state: string }
+    | null;
+  return row?.delivery_state === "delivered";
+}
+
 export const PASTE_START = "\x1b[200~";
 export const PASTE_END = "\x1b[201~";
 
