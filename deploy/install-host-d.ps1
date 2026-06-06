@@ -19,6 +19,10 @@
 #
 # Must be run in an elevated PowerShell window (step 5 needs admin rights to
 # create the firewall rule).
+#
+# NOTE: This is a TEMPLATE. The bundled deploy/configs/host-d.json holds example
+# placeholder IPs; the script refuses to run until you replace them with your real
+# Tailscale values (see the guard in step 4).
 
 $ErrorActionPreference = "Stop"
 
@@ -74,6 +78,11 @@ Pop-Location
 $SOURCE_CONFIG = Join-Path $REPO_PATH "deploy\configs\host-d.json"
 if (-not (Test-Path $SOURCE_CONFIG)) {
     throw "Source config missing: $SOURCE_CONFIG (repo may be out of date — git pull)"
+}
+# Refuse the repo's example config: it ships placeholder 100.64.0.x IPs. Installing it
+# would advertise the wrong broker address and allowlist dummy peers (steps 4 and 5).
+if ((Get-Content $SOURCE_CONFIG -Raw) -match '100\.64\.0\.[1-4]') {
+    throw "$SOURCE_CONFIG holds the example placeholder values (100.64.0.x sample IPs). Edit it — or point this script at your own config — with your real Tailscale IPs and machine name before running."
 }
 if (Test-Path $CONFIG_TARGET) {
     $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
