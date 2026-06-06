@@ -1,3 +1,6 @@
+# REFERENCE TEMPLATE — deploy/install.sh renders the real unit from your account
+# and clone path at install time. The User=, HOME=, and ExecStart values below are
+# placeholders; only edit and use this file directly if you install the unit by hand.
 [Unit]
 Description=Claude Peers Broker
 After=network-online.target tailscaled.service
@@ -5,7 +8,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=jamditis
+User=peer
 ExecStart=/home/peer/.bun/bin/bun /home/peer/projects/claude-peers-mcp/broker.ts
 Restart=always
 RestartSec=5

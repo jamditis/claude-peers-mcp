@@ -27,6 +27,12 @@ if [ ! -f "$CONFIG_FILE" ]; then
   echo "No config found for $MACHINE — create deploy/configs/${MACHINE}.json first"
   exit 1
 fi
+# Refuse the shipped example configs — they carry placeholder 100.64.0.x IPs, and
+# installing them would advertise the wrong broker address and allowlist dummy peers.
+if grep -q '100\.64\.0\.[1-4]' "$CONFIG_FILE"; then
+  echo "$CONFIG_FILE still has the example placeholder IPs (100.64.0.x). Replace them with your real Tailscale values before installing."
+  exit 1
+fi
 TARGET_CONFIG="$HOME/.claude-peers.json"
 if [ -f "$TARGET_CONFIG" ]; then
   BACKUP_CONFIG="${TARGET_CONFIG}.bak.$(date +%Y%m%d-%H%M%S)"
@@ -36,12 +42,33 @@ fi
 cp "$CONFIG_FILE" "$TARGET_CONFIG"
 echo "Config installed to $TARGET_CONFIG"
 
-# 4. Install systemd service (Linux only)
+# 4. Install systemd service (Linux only) — rendered from THIS account and layout.
+# The committed claude-peers-broker.service is a reference template with placeholder
+# values; copying it verbatim would start the broker under a non-existent user.
 if [ "$(uname)" = "Linux" ]; then
-  sudo cp "$SCRIPT_DIR/claude-peers-broker.service" /etc/systemd/system/
+  BUN_BIN="$(command -v bun)"
+  sudo tee /etc/systemd/system/claude-peers-broker.service >/dev/null <<UNIT
+[Unit]
+Description=Claude Peers Broker
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$(id -un)
+ExecStart=${BUN_BIN} ${PROJECT_DIR}/broker.ts
+Restart=always
+RestartSec=5
+Environment=HOME=${HOME}
+# Supervised broker: never self-exit when idle or it would restart-loop.
+Environment=CLAUDE_PEERS_IDLE_EXIT_MS=0
+
+[Install]
+WantedBy=multi-user.target
+UNIT
   sudo systemctl daemon-reload
   sudo systemctl enable --now claude-peers-broker
-  echo "Broker service installed and started"
+  echo "Broker service installed and started (rendered for user $(id -un))"
 fi
 
 # 5. Register MCP server with Claude Code
