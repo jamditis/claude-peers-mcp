@@ -1,0 +1,12 @@
+{
+  "machine": "host-b",
+  "tailscale_ip": "100.64.0.2",
+  "port": 7899,
+  "id_prefix": "ofj",
+  "siblings": [
+    { "machine": "host-a", "url": "http://100.64.0.1:7899" },
+    { "machine": "host-c", "url": "http://100.64.0.3:7899" },
+    { "machine": "host-d", "url": "http://100.64.0.4:7899" }
+  ],
+  "allowed_ips": ["127.0.0.1", "100.64.0.1", "100.64.0.2", "100.64.0.3", "100.64.0.4"]
+}

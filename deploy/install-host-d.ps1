@@ -1,18 +1,18 @@
-# install-a4000.ps1 — onboard A4000 (Windows) to claude-peers
+# install-host-d.ps1 — onboard HOST-D (Windows) to claude-peers
 #
 # Usage (run in PowerShell, NOT cmd.exe):
 #   Set-ExecutionPolicy -Scope Process Bypass -Force
-#   .\install-a4000.ps1
+#   .\install-host-d.ps1
 #
 # Or directly from GitHub once committed + pushed:
-#   irm https://raw.githubusercontent.com/jamditis/claude-peers-mcp/main/deploy/install-a4000.ps1 | iex
+#   irm https://raw.githubusercontent.com/jamditis/claude-peers-mcp/main/deploy/install-host-d.ps1 | iex
 #
 # What it does (in order):
 #   0. Verifies preconditions: git available, running elevated
 #   1. Installs Bun if missing
 #   2. Clones jamditis/claude-peers-mcp if missing
 #   3. Runs `bun install`
-#   4. Copies deploy/configs/a4000.json to %USERPROFILE%\.claude-peers.json
+#   4. Copies deploy/configs/host-d.json to %USERPROFILE%\.claude-peers.json
 #   5. Adds Windows Firewall rule for inbound TCP 7899, restricted to sibling IPs
 #   6. Registers the MCP server with Claude Code
 #   7. Prints next steps to start the broker (manual for now; Task Scheduler later)
@@ -27,7 +27,7 @@ $REPO_URL = "https://github.com/jamditis/claude-peers-mcp.git"
 $CONFIG_TARGET = Join-Path $env:USERPROFILE ".claude-peers.json"
 $BUN_BIN = Join-Path $env:USERPROFILE ".bun\bin\bun.exe"
 
-Write-Host "===== claude-peers A4000 install =====" -ForegroundColor Cyan
+Write-Host "===== claude-peers HOST-D install =====" -ForegroundColor Cyan
 Write-Host ""
 
 # 0. Preconditions: git installed, elevated shell
@@ -71,7 +71,7 @@ Push-Location $REPO_PATH
 Pop-Location
 
 # 4. Install config
-$SOURCE_CONFIG = Join-Path $REPO_PATH "deploy\configs\a4000.json"
+$SOURCE_CONFIG = Join-Path $REPO_PATH "deploy\configs\host-d.json"
 if (-not (Test-Path $SOURCE_CONFIG)) {
     throw "Source config missing: $SOURCE_CONFIG (repo may be out of date — git pull)"
 }
@@ -140,9 +140,9 @@ Write-Host "  curl http://127.0.0.1:7899/health"
 Write-Host "  cd '$REPO_PATH'; & '$BUN_BIN' cli.ts ping-siblings"
 Write-Host ""
 Write-Host "To make broker permanent (run as scheduled task at logon):" -ForegroundColor White
-Write-Host "  See deploy\install-a4000-broker-task.ps1 (separate script)"
+Write-Host "  See deploy\install-host-d-broker-task.ps1 (separate script)"
 Write-Host ""
 Write-Host "Once broker is up, in any new Claude Code session, you can:" -ForegroundColor White
 Write-Host "  - List peers across the tailnet"
-Write-Host "  - Send messages to houseofjawn (hoj-*), officejawn (ofj-*), legion2025 (leg-*)"
+Write-Host "  - Send messages to host-a (hoj-*), host-b (ofj-*), host-c (leg-*)"
 Write-Host "  - Be reachable as a40-* peer ID"

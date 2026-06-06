@@ -143,15 +143,15 @@ To federate, give each node a config that lists the others as `siblings` and all
 
 ```json
 {
-  "machine": "officejawn",
-  "tailscale_ip": "100.84.214.24",
+  "machine": "host-b",
+  "tailscale_ip": "100.64.0.2",
   "port": 7899,
   "id_prefix": "ofj",
   "siblings": [
-    { "machine": "houseofjawn", "url": "http://100.122.208.15:7899" },
-    { "machine": "legion2025",  "url": "http://100.108.24.67:7899" }
+    { "machine": "host-a", "url": "http://100.64.0.1:7899" },
+    { "machine": "host-c",  "url": "http://100.64.0.3:7899" }
   ],
-  "allowed_ips": ["127.0.0.1", "100.122.208.15", "100.108.24.67"]
+  "allowed_ips": ["127.0.0.1", "100.64.0.1", "100.64.0.3"]
 }
 ```
 
@@ -159,7 +159,7 @@ Each node lists the other nodes under `siblings` and puts those nodes' IPs (plus
 
 By default a forward arriving from another machine is left queued for `check_messages` rather than auto-pasted into your live pane (`floor_remote_forwards`, see [Configuration](#configuration)) — a remote machine cannot type into your session until you opt in. The residual federation-auth gaps are tracked as [issue #15](https://github.com/jamditis/claude-peers-mcp/issues/15) and [issue #4](https://github.com/jamditis/claude-peers-mcp/issues/4).
 
-For a long-lived federated node, run the broker under a supervisor so it never idles out. [`deploy/install.sh`](deploy/install.sh) installs against the per-machine config files; [`deploy/claude-peers-broker.service`](deploy/) is a sample systemd unit. It hard-codes the maintainer's layout (`User=jamditis`, `HOME=/home/jamditis`, and the `broker.ts` path under `/home/jamditis/projects/`), so edit those for your own account and clone location before enabling it on any other host — otherwise the service starts under the wrong user or fails outright. A supervised broker sets `CLAUDE_PEERS_IDLE_EXIT_MS=0` so it never self-exits and restart-loops. On Windows, [`deploy/install-a4000-broker-task.ps1`](deploy/) registers the equivalent Task Scheduler entry. (Note: the tmux delivery path is POSIX-oriented today, but native Windows broker spawn and a Windows `kill-broker` landed via [PR #19](https://github.com/jamditis/claude-peers-mcp/pull/19), merged 2026-06-04.)
+For a long-lived federated node, run the broker under a supervisor so it never idles out. [`deploy/install.sh`](deploy/install.sh) installs against the per-machine config files; [`deploy/claude-peers-broker.service`](deploy/) is a sample systemd unit. It hard-codes the maintainer's layout (`User=peer`, `HOME=/home/peer`, and the `broker.ts` path under `/home/peer/projects/`), so edit those for your own account and clone location before enabling it on any other host — otherwise the service starts under the wrong user or fails outright. A supervised broker sets `CLAUDE_PEERS_IDLE_EXIT_MS=0` so it never self-exits and restart-loops. On Windows, [`deploy/install-host-d-broker-task.ps1`](deploy/) registers the equivalent Task Scheduler entry. (Note: the tmux delivery path is POSIX-oriented today, but native Windows broker spawn and a Windows `kill-broker` landed via [PR #19](https://github.com/jamditis/claude-peers-mcp/pull/19), merged 2026-06-04.)
 
 ## CLI
 

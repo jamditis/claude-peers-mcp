@@ -35,7 +35,7 @@ const config = loadConfig();
 const BROKER_PORT = config.port;
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const HEARTBEAT_INTERVAL_MS = 15_000;
-// fileURLToPath, not URL.pathname: on Windows .pathname yields "/C:/Users/Joe%20Amditis/..."
+// fileURLToPath, not URL.pathname: on Windows .pathname yields "/C:/Users/you/..."
 // (leading slash + percent-encoded spaces), which Bun.spawn cannot resolve. fileURLToPath
 // decodes and uses native separators on every platform.
 const BROKER_SCRIPT = fileURLToPath(new URL("./broker.ts", import.meta.url));

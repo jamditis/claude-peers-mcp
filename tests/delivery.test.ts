@@ -447,7 +447,7 @@ describe("isLoopback", () => {
     expect(isLoopback("::ffff:127.0.0.1")).toBe(true);
   });
   it("rejects non-loopback", () => {
-    expect(isLoopback("100.84.214.24")).toBe(false);
+    expect(isLoopback("100.64.0.2")).toBe(false);
     expect(isLoopback("192.168.1.5")).toBe(false);
   });
   it("rejects the broker's unknown-address sentinel", () => {
