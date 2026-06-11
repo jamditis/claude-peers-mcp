@@ -13,11 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `push_delay_ms` config field (optional, default `120000`) controlling the `normal`-urgency push deadline.
 - `--urgency` flag on `bun cli.ts send` (CLI default stays `interrupt` so existing scripts keep push-on-send).
 - The local `/send-message` route now reports the sent message's own delivery disposition (via its row id) instead of the queue head's, matching the cross-broker honesty fix from #14.
+- Auto-summary at registration: a fresh session's summary is seeded from git state (`[auto] <branch>; recent: <files>`, capped at 140 chars, empty outside a git repo) via `buildAutoSummary` in `shared/summarize.ts`, so peers can read what a session is touching without that session spending an inference turn on `set_summary` first. `set_summary` overwrites it once the task is clearer. The seed gossips to sibling brokers like any summary (same-class metadata as the `cwd`/`git_root` fields that already federate); `auto_summary: false` in the config disables it for nodes federating across a sensitive boundary.
 
 ### Changed
 
 - Rewrote the MCP `instructions` block ~60% smaller and replaced the respond-immediately rule with messaging norms: telegraphic style, no acknowledgment-only replies, file-pointer for long content, honest urgency selection, and `check_messages` at task boundaries.
 - The injected peer line carries the `(reply: send_message ...)` hint only on `interrupt` messages, and tags `fyi` ones; `send_message`'s tool result is terse (`Sent to <id> (pushed|queued)`).
+- `set_summary` no longer echoes the summary text back in its tool result (the caller just wrote it), and the instructions block describes the auto-seeded summary instead of demanding a `set_summary` call on start.
 
 ### Fixed
 

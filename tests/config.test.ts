@@ -105,6 +105,41 @@ describe("push_delay_ms", () => {
   });
 });
 
+describe("auto_summary", () => {
+  // The registration-time git snapshot ("[auto] branch; recent files") gossips to sibling
+  // brokers like any summary. Branch and file names are same-class metadata as the cwd and
+  // git_root fields that already federate, so the seed defaults on — but an operator
+  // federating across a sensitive boundary can switch it off without losing set_summary.
+  it("defaults to true when absent", async () => {
+    const path = "/tmp/cfg-autosum-absent.json";
+    await Bun.write(path, JSON.stringify({
+      machine: "m", tailscale_ip: "127.0.0.1", port: 19007,
+      id_prefix: "m", siblings: [], allowed_ips: ["127.0.0.1"],
+    }));
+    expect(loadConfig(path).auto_summary).toBe(true);
+  });
+
+  it("reads false when explicitly set (opt out of the git-seeded summary)", async () => {
+    const path = "/tmp/cfg-autosum-false.json";
+    await Bun.write(path, JSON.stringify({
+      machine: "m", tailscale_ip: "127.0.0.1", port: 19008,
+      id_prefix: "m", siblings: [], allowed_ips: ["127.0.0.1"],
+      auto_summary: false,
+    }));
+    expect(loadConfig(path).auto_summary).toBe(false);
+  });
+
+  it("treats a non-boolean value as the default (tuning knob, not a startup gate)", async () => {
+    const path = "/tmp/cfg-autosum-bad.json";
+    await Bun.write(path, JSON.stringify({
+      machine: "m", tailscale_ip: "127.0.0.1", port: 19009,
+      id_prefix: "m", siblings: [], allowed_ips: ["127.0.0.1"],
+      auto_summary: "nope",
+    }));
+    expect(loadConfig(path).auto_summary).toBe(true);
+  });
+});
+
 describe("single-host default (zero-config fresh install)", () => {
   // A fresh single-host install requests no config and has no ~/.claude-peers.json yet, so
   // loadConfig returns this loopback-only default. The default is tested directly because the

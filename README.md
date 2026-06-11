@@ -86,7 +86,7 @@ The other Claude receives it immediately and responds.
 | ---------------- | ------------------------------------------------------------------------------------------- |
 | `list_peers`     | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo`. With `machine` scope, remote peers from federated nodes are included and tagged `[remote]`. |
 | `send_message`   | Send a message to another instance by ID. `urgency` picks the delivery tier: `interrupt` pushes into their tmux session now; `normal` (the tool default) queues until they poll or the push deadline passes; `fyi` is poll-only, no reply expected. Cross-machine targets route automatically to the owning broker. |
-| `set_summary`    | Describe what you're working on (visible to other peers)                                    |
+| `set_summary`    | Describe what you're working on (visible to other peers). The summary starts as an auto-generated git snapshot (`[auto] <branch>; recent: <files>`) seeded at registration; this tool overwrites it. |
 | `check_messages` | Read and clear messages that were queued instead of pushed. A poll marks the returned messages delivered, so a second call won't re-return them. |
 
 ## How it works
@@ -196,6 +196,7 @@ These live in `~/.claude-peers.json` (or the path in `CLAUDE_PEERS_CONFIG`). The
 | `db_path`               | no       | SQLite database path. Falls back to `CLAUDE_PEERS_DB`, then `~/.claude-peers.db`.             |
 | `floor_remote_forwards` | no       | Default `true`. A message forwarded from a sibling broker is left queued for `check_messages` rather than pushed into your live pane (its `push_after` is NULL, so neither the immediate inject nor a later heartbeat drain or flush can auto-paste it). Set `false` to opt in to cross-node push. Local same-machine peers always push. This is the secure default — a remote machine can't auto-paste into your session unless you opt in, because the federation routes are authenticated only by the source-IP allowlist ([issue #15](https://github.com/jamditis/claude-peers-mcp/issues/15), [issue #4](https://github.com/jamditis/claude-peers-mcp/issues/4)). |
 | `push_delay_ms`         | no       | Default `120000` (2 minutes). How long a `normal`-urgency message stays queued before the broker pushes it anyway. The window gives the recipient a chance to drain it via `check_messages` at a task boundary — the cheap path that doesn't interrupt their session. |
+| `auto_summary`          | no       | Default `true`. Seed each session's summary at registration from git state (`[auto] <branch>; recent: <files>`). Summaries gossip to sibling brokers like `cwd` and `git_root` already do; set `false` to keep summaries empty until a session calls `set_summary`. |
 
 `~/.claude-peers.json` and the SQLite database are gitignored — the database holds per-session capability tokens, so it must never be committed.
 
