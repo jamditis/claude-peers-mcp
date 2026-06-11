@@ -4,11 +4,18 @@ export type PeerId = string;
 export type DeliveryKind = "tmux" | "launcher" | "none";
 export type DeliveryState = "queued" | "delivering" | "delivered";
 
+// How a message reaches the recipient. "interrupt" pushes into their session at once
+// (and flushes their pending pushable mail with it). "normal" queues: delivered at the
+// recipient's next check_messages, or auto-pushed once push_delay_ms elapses. "fyi"
+// never auto-pushes — poll-only, no reply expected. Absent on the wire = "interrupt",
+// so a pre-urgency client keeps its old push-on-send behavior.
+export type Urgency = "interrupt" | "normal" | "fyi";
+
 // Broker wire-protocol version. Bumped to 2 for the delivery_state schema and
 // delivery backends; to 3 for per-session capability tokens (a registered peer may
-// act only as the id it holds the token for). server.ts requires at least this from
-// a running broker.
-export const PROTOCOL_VERSION = 3;
+// act only as the id it holds the token for); to 4 for urgency tiers and the
+// push_after deadline column. server.ts requires at least this from a running broker.
+export const PROTOCOL_VERSION = 4;
 
 export interface Peer {
   id: PeerId;
@@ -37,6 +44,10 @@ export interface Message {
   delivery_state: DeliveryState;
   lease_expires_at: number | null;
   lease_token: string | null;
+  urgency: Urgency;
+  // Epoch ms when this row becomes push-eligible; NULL = never auto-push (fyi, and
+  // floored remote forwards). 0/past = due now. See pushAfterFor in delivery.ts.
+  push_after: number | null;
 }
 
 // --- Broker API types ---
@@ -81,6 +92,8 @@ export interface SendMessageRequest {
   from_id: PeerId;
   to_id: PeerId;
   text: string;
+  // Absent = "interrupt" (wire back-compat with pre-urgency clients).
+  urgency?: Urgency;
 }
 
 export interface SendResult {
@@ -115,6 +128,9 @@ export interface ForwardMessageRequest {
   to_id: PeerId;
   text: string;
   from_machine: string;
+  // Absent = "interrupt" (a pre-urgency sibling broker). The receiving broker applies
+  // its own push_delay_ms; floor_remote_forwards overrides to never-push regardless.
+  urgency?: Urgency;
 }
 
 export interface ForwardMessageResponse {

@@ -5,6 +5,24 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Message urgency tiers (protocol version 4): `send_message` takes `urgency` — `interrupt` pushes into the recipient's session at once and flushes their pending pushable mail with it; `normal` (the MCP tool default) queues with a `push_after` deadline, delivered free at the recipient's next `check_messages` or pushed by their heartbeat once `push_delay_ms` (default 2 minutes) lapses; `fyi` never auto-pushes, is poll-only, and is tagged `[fyi]` with no reply expected. Absent urgency on the wire still means `interrupt`, so pre-urgency clients and sibling brokers keep their old push-on-send behavior. The point is token economics: a pushed message costs the recipient a full inference turn over their whole context, a polled one costs only its own text, and a flush batches a backlog into one turn instead of several.
+- `push_delay_ms` config field (optional, default `120000`) controlling the `normal`-urgency push deadline.
+- `--urgency` flag on `bun cli.ts send` (CLI default stays `interrupt` so existing scripts keep push-on-send).
+- The local `/send-message` route now reports the sent message's own delivery disposition (via its row id) instead of the queue head's, matching the cross-broker honesty fix from #14.
+
+### Changed
+
+- Rewrote the MCP `instructions` block ~60% smaller and replaced the respond-immediately rule with messaging norms: telegraphic style, no acknowledgment-only replies, file-pointer for long content, honest urgency selection, and `check_messages` at task boundaries.
+- The injected peer line carries the `(reply: send_message ...)` hint only on `interrupt` messages, and tags `fyi` ones; `send_message`'s tool result is terse (`Sent to <id> (pushed|queued)`).
+
+### Fixed
+
+- `floor_remote_forwards` now actually floors: a floored forward gets `push_after` NULL, keeping it out of the push channel entirely. Previously the floor only skipped the immediate inject and the recipient's next heartbeat drain (~15s later) pushed the remote text into the pane anyway.
+
 ## [0.2.0] - 2026-06-04
 
 This release turns claude-peers from a single-machine discovery tool into a federated, security-gated peer messaging fabric: cross-machine gossip across four broker nodes, broker-side tmux delivery backed by a per-message lease state machine, and per-session capability-token auth (protocol version 3) that closes the `from_id` forgery hole.

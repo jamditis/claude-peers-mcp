@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+
 /**
  * claude-peers CLI
  *
@@ -7,13 +8,13 @@
  * Usage:
  *   bun cli.ts status          — Show broker status and all peers
  *   bun cli.ts peers           — List all peers
- *   bun cli.ts send <id> <msg> — Send a message to a peer
+ *   bun cli.ts send <id> [--urgency <tier>] <msg> — Send a message to a peer
  *   bun cli.ts ping-siblings   — Ping all sibling brokers and report latency
  *   bun cli.ts kill-broker     — Stop the broker daemon
  */
 
-import { loadConfig } from "./shared/config.ts";
 import type { PeersConfig } from "./shared/config.ts";
+import { loadConfig } from "./shared/config.ts";
 
 // Load config once; CLI may run without it for basic commands
 let config: PeersConfig | null = null;
@@ -139,9 +140,23 @@ switch (cmd) {
 
   case "send": {
     const toId = process.argv[3];
-    const msg = process.argv.slice(4).join(" ");
+    let rest = process.argv.slice(4);
+    // The CLI keeps push-on-send as its default: existing scripts (wake announcements,
+    // ops nudges) rely on the message landing in the pane now. The flag opts into the
+    // cheaper tiers; agents going through the MCP tool default to "normal" instead.
+    let urgency: "interrupt" | "normal" | "fyi" = "interrupt";
+    if (rest[0] === "--urgency") {
+      const tier = rest[1];
+      if (tier !== "interrupt" && tier !== "normal" && tier !== "fyi") {
+        console.error("--urgency must be interrupt, normal, or fyi");
+        process.exit(1);
+      }
+      urgency = tier;
+      rest = rest.slice(2);
+    }
+    const msg = rest.join(" ");
     if (!toId || !msg) {
-      console.error("Usage: bun cli.ts send <peer-id> <message>");
+      console.error("Usage: bun cli.ts send <peer-id> [--urgency interrupt|normal|fyi] <message>");
       process.exit(1);
     }
     // The control plane authenticates the sender, so the CLI registers an ephemeral
@@ -165,6 +180,7 @@ switch (cmd) {
         from_id: reg.id,
         to_id: toId,
         text: msg,
+        urgency,
       }, reg.token);
       if (result.ok) {
         console.log(`Message sent to ${toId}`);
@@ -301,7 +317,7 @@ switch (cmd) {
 Usage:
   bun cli.ts status          Show broker status and all peers
   bun cli.ts peers           List all peers
-  bun cli.ts send <id> <msg> Send a message to a peer
+  bun cli.ts send <id> [--urgency interrupt|normal|fyi] <msg> Send a message to a peer
   bun cli.ts ping-siblings   Ping all sibling brokers and report latency
   bun cli.ts kill-broker     Stop the broker daemon`);
 }

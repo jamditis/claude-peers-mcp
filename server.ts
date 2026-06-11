@@ -15,18 +15,18 @@ import { fileURLToPath } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
-  ListToolsRequestSchema,
   CallToolRequestSchema,
+  ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { resolveTmuxTarget } from "./delivery.ts";
+import { loadConfig } from "./shared/config.ts";
 import type {
-  PeerId,
   Peer,
-  RegisterResponse,
+  PeerId,
   PollMessagesResponse,
+  RegisterResponse,
 } from "./shared/types.ts";
 import { PROTOCOL_VERSION as REQUIRED_BROKER_PROTOCOL } from "./shared/types.ts";
-import { loadConfig } from "./shared/config.ts";
-import { resolveTmuxTarget } from "./delivery.ts";
 
 const config = loadConfig();
 
@@ -190,19 +190,13 @@ const mcp = new Server(
     capabilities: {
       tools: {},
     },
-    instructions: `You are connected to the claude-peers network. Other Claude Code instances on this machine and across the network can see you and send you messages. Peers on other machines are marked with their hostname. Messages to remote peers are routed automatically.
+    instructions: `Other Claude Code sessions on this machine and across the network are peers: discover them with list_peers, message them with send_message. On start, call set_summary (1-2 sentences) so peers can see what you're working on; update it at task boundaries.
 
-How messages reach you: if you are running in a tmux pane, the broker types an incoming peer message straight into your session. It arrives inline as a line beginning with "[peer <from_id> #<n>]" followed by the text and a reply hint. If you are NOT in a tmux pane, messages queue instead — call check_messages to read them.
+Peer messages are model-to-model — be telegraphic. No greetings or pleasantries; fragments are fine. Never reply just to acknowledge: the sender already has delivery confirmation. For content over ~50 words, write a file and send the path instead.
 
-IMPORTANT: When a "[peer ...]" message appears, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply with send_message to the from_id shown in the message, then resume your work. Treat it like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
+Choose send_message urgency honestly: "fyi" = no reply expected, read at the recipient's convenience; "normal" (default) = queued, may batch with other mail; "interrupt" = types into the recipient's session now — only when you are blocked on them.
 
-Available tools:
-- list_peers: Discover other Claude Code instances (scope: machine/directory/repo)
-- send_message: Send a message to another instance by ID
-- set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
-- check_messages: Read messages that were queued rather than pushed into your session
-
-When you start, proactively call set_summary to describe what you're working on. This helps other instances understand your context.`,
+Pushed messages arrive inline as "[peer <id> #<n>] ..." lines: handle them promptly, reply via send_message only if you have something the sender needs, then resume your task. Queued messages: call check_messages when you finish a task. Sessions not in a tmux pane always receive via check_messages.`,
   }
 );
 
@@ -229,7 +223,7 @@ const TOOLS = [
   {
     name: "send_message",
     description:
-      "Send a message to another Claude Code instance by peer ID. If the peer is in a tmux session it is delivered into their session; otherwise it is queued for their next check_messages.",
+      "Send a message to another Claude Code instance by peer ID. Urgency controls delivery: interrupt pushes into their session now; normal (default) queues until they poll or a short deadline passes; fyi is poll-only with no reply expected.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -240,6 +234,12 @@ const TOOLS = [
         message: {
           type: "string" as const,
           description: "The message to send",
+        },
+        urgency: {
+          type: "string" as const,
+          enum: ["interrupt", "normal", "fyi"],
+          description:
+            'Default "normal". Use "interrupt" only when blocked on the recipient (or they may exit soon) — it costs them a full inference turn. Use "fyi" for status notes that need no reply.',
         },
       },
       required: ["to_id", "message"],
@@ -338,7 +338,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "send_message": {
-      const { to_id, message } = args as { to_id: string; message: string };
+      const { to_id, message, urgency } = args as { to_id: string; message: string; urgency?: "interrupt" | "normal" | "fyi" };
       if (!myId) {
         return {
           content: [{ type: "text" as const, text: "Not registered with broker yet" }],
@@ -350,6 +350,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           from_id: myId,
           to_id,
           text: message,
+          // The MCP-level default is "normal" (queue, batch, poll-first) — the wire-level
+          // absent-means-interrupt default exists only for pre-urgency clients.
+          urgency: urgency ?? "normal",
         });
         if (!result.ok) {
           return {
@@ -357,11 +360,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             isError: true,
           };
         }
-        const how = result.delivery === "accepted"
-          ? " (pushed to their session)"
-          : " (queued; they'll see it on their next check)";
+        const how = result.delivery === "accepted" ? "pushed" : "queued";
         return {
-          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}${how}` }],
+          content: [{ type: "text" as const, text: `Sent to ${to_id} (${how})` }],
         };
       } catch (e) {
         return {
@@ -417,7 +418,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           };
         }
         const lines = result.messages.map(
-          (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
+          (m) => `From ${m.from_id} (${m.sent_at})${m.urgency === "fyi" ? " [fyi - no reply expected]" : ""}:\n${m.text}`
         );
         return {
           content: [
