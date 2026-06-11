@@ -41,6 +41,7 @@ const blockedPatterns = [
   ["old alp node prefix", `\\b${["h", "oj"].join("")}-[a-z0-9]+\\b`],
   ["old beta node prefix", `\\b${["o", "fj"].join("")}-[a-z0-9]+\\b`],
   ["old windows node prefix", `\\b${["a", "40"].join("")}-[a-z0-9]+\\b`],
+  ["old gam node prefix", `\\b${["l", "eg"].join("")}-[a-z0-9]+\\b`],
 ] as const;
 
 describe("privacy scrub", () => {
