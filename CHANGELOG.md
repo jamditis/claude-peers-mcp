@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-11
+
+This release cuts the token cost of running the peer network: message delivery is urgency-tiered so most mail no longer costs the recipient an inference turn, summaries seed themselves from git at registration, and the per-call tool output is a fraction of its old size.
+
 ### Added
 
 - Message urgency tiers (protocol version 4): `send_message` takes `urgency` — `interrupt` pushes into the recipient's session at once and flushes their pending pushable mail with it; `normal` (the MCP tool default) queues with a `push_after` deadline, delivered free at the recipient's next `check_messages` or pushed by their heartbeat once `push_delay_ms` (default 2 minutes) lapses; `fyi` never auto-pushes, is poll-only, and is tagged `[fyi]` with no reply expected. Absent urgency on the wire still means `interrupt`, so pre-urgency clients and sibling brokers keep their old push-on-send behavior. The point is token economics: a pushed message costs the recipient a full inference turn over their whole context, a polled one costs only its own text, and a flush batches a backlog into one turn instead of several.
@@ -58,4 +62,5 @@ This release turns claude-peers from a single-machine discovery tool into a fede
 - Drain an in-flight remote forward before a retire or idle-exit so cross-machine mail is not dropped on shutdown (#16).
 - Strip C0/C1 control characters (including ESC and the C1 CSI byte) before injection to neutralize bracketed-paste escape injection (#16).
 
+[0.3.0]: https://github.com/jamditis/claude-peers-mcp/releases/tag/v0.3.0
 [0.2.0]: https://github.com/jamditis/claude-peers-mcp/releases/tag/v0.2.0
