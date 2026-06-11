@@ -502,7 +502,7 @@ ESC[200~[peer <from_id> #<id>] <text>  (reply: send_message to_id="<from_id>")ES
 
 ## Resource hygiene and cross-platform safety
 
-The fleet includes Windows broker nodes (host-d, host-c) where tmux does not
+The fleet includes Windows broker nodes (node-d, node-c) where tmux does not
 exist, so the design must spawn sparingly, reap every child, and never depend on
 tmux being present. M1 push works only where tmux exists; Windows/macOS sessions
 without tmux use the `check_messages` floor in M1 and get the launcher backend in

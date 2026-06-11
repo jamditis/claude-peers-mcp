@@ -77,7 +77,7 @@ export function resolveTargetBroker(
   if (!remote) return null;
   // Match case-insensitively: the sibling config and the remote's gossiped machine
   // name come from independently-edited config files, so casing can drift (e.g. a
-  // sibling configured "host-d" vs a broker that broadcasts "HOST-D"). A case-sensitive
+  // sibling configured "node-d" vs a broker that broadcasts "NODE-D"). A case-sensitive
   // compare here silently drops delivery as "Peer not found" while the peer still
   // shows in list_peers. See issue #17.
   const target = remote.machine.toLowerCase();

@@ -1,18 +1,18 @@
-# install-host-d.ps1 — onboard HOST-D (Windows) to claude-peers
+# install-windows-node.ps1 — onboard NODE-D (Windows) to claude-peers
 #
 # Usage (run in PowerShell, NOT cmd.exe):
 #   Set-ExecutionPolicy -Scope Process Bypass -Force
-#   .\install-host-d.ps1
+#   .\install-windows-node.ps1
 #
 # Or directly from GitHub once committed + pushed:
-#   irm https://raw.githubusercontent.com/jamditis/claude-peers-mcp/main/deploy/install-host-d.ps1 | iex
+#   irm https://raw.githubusercontent.com/example-org/claude-peers-mcp/main/deploy/install-windows-node.ps1 | iex
 #
 # What it does (in order):
 #   0. Verifies preconditions: git available, running elevated
 #   1. Installs Bun if missing
-#   2. Clones jamditis/claude-peers-mcp if missing
+#   2. Clones example-org/claude-peers-mcp if missing
 #   3. Runs `bun install`
-#   4. Copies deploy/configs/host-d.json to %USERPROFILE%\.claude-peers.json
+#   4. Copies deploy/configs/node-d.json to %USERPROFILE%\.claude-peers.json
 #   5. Adds Windows Firewall rule for inbound TCP 7899, restricted to sibling IPs
 #   6. Registers the MCP server with Claude Code
 #   7. Prints next steps to start the broker (manual for now; Task Scheduler later)
@@ -20,18 +20,18 @@
 # Must be run in an elevated PowerShell window (step 5 needs admin rights to
 # create the firewall rule).
 #
-# NOTE: This is a TEMPLATE. The bundled deploy/configs/host-d.json holds example
+# NOTE: This is a TEMPLATE. The bundled deploy/configs/node-d.json holds example
 # placeholder IPs; the script refuses to run until you replace them with your real
 # Tailscale values (see the guard in step 4).
 
 $ErrorActionPreference = "Stop"
 
 $REPO_PATH = Join-Path $env:USERPROFILE "claude-peers-mcp"
-$REPO_URL = "https://github.com/jamditis/claude-peers-mcp.git"
+$REPO_URL = "https://github.com/example-org/claude-peers-mcp.git"
 $CONFIG_TARGET = Join-Path $env:USERPROFILE ".claude-peers.json"
 $BUN_BIN = Join-Path $env:USERPROFILE ".bun\bin\bun.exe"
 
-Write-Host "===== claude-peers HOST-D install =====" -ForegroundColor Cyan
+Write-Host "===== claude-peers NODE-D install =====" -ForegroundColor Cyan
 Write-Host ""
 
 # 0. Preconditions: git installed, elevated shell
@@ -75,7 +75,7 @@ Push-Location $REPO_PATH
 Pop-Location
 
 # 4. Install config
-$SOURCE_CONFIG = Join-Path $REPO_PATH "deploy\configs\host-d.json"
+$SOURCE_CONFIG = Join-Path $REPO_PATH "deploy\configs\node-d.json"
 if (-not (Test-Path $SOURCE_CONFIG)) {
     throw "Source config missing: $SOURCE_CONFIG (repo may be out of date — git pull)"
 }
@@ -149,9 +149,9 @@ Write-Host "  curl http://127.0.0.1:7899/health"
 Write-Host "  cd '$REPO_PATH'; & '$BUN_BIN' cli.ts ping-siblings"
 Write-Host ""
 Write-Host "To make broker permanent (run as scheduled task at logon):" -ForegroundColor White
-Write-Host "  See deploy\install-host-d-broker-task.ps1 (separate script)"
+Write-Host "  See deploy\install-windows-broker-task.ps1 (separate script)"
 Write-Host ""
 Write-Host "Once broker is up, in any new Claude Code session, you can:" -ForegroundColor White
 Write-Host "  - List peers across the tailnet"
-Write-Host "  - Send messages to host-a (hoj-*), host-b (ofj-*), host-c (leg-*)"
-Write-Host "  - Be reachable as a40-* peer ID"
+Write-Host "  - Send messages to node-a (alp-*), node-b (bet-*), node-c (gam-*)"
+Write-Host "  - Be reachable as win-* peer ID"

@@ -1,0 +1,12 @@
+{
+  "machine": "node-c",
+  "tailscale_ip": "100.64.0.3",
+  "port": 7899,
+  "id_prefix": "gam",
+  "siblings": [
+    { "machine": "node-a", "url": "http://100.64.0.1:7899" },
+    { "machine": "node-b", "url": "http://100.64.0.2:7899" },
+    { "machine": "node-d", "url": "http://100.64.0.4:7899" }
+  ],
+  "allowed_ips": ["127.0.0.1", "100.64.0.1", "100.64.0.2", "100.64.0.3", "100.64.0.4"]
+}

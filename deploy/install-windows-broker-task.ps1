@@ -1,4 +1,4 @@
-# install-host-d-broker-task.ps1 — register the broker as a Windows scheduled task
+# install-windows-broker-task.ps1 — register the broker as a Windows scheduled task
 # that starts at user logon and KEEPS RUNNING after the user logs out.
 #
 # Uses LogonType S4U (Service-for-User): runs as the current user without
@@ -10,9 +10,9 @@
 # requires admin rights).
 #
 # Usage:
-#   .\install-host-d-broker-task.ps1
+#   .\install-windows-broker-task.ps1
 #
-# This is OPTIONAL — install-host-d.ps1 leaves the broker as a manual-start
+# This is OPTIONAL — install-windows-node.ps1 leaves the broker as a manual-start
 # process. Use this once you've confirmed the broker works end-to-end.
 
 $ErrorActionPreference = "Stop"
@@ -20,8 +20,8 @@ $ErrorActionPreference = "Stop"
 $BUN = Join-Path $env:USERPROFILE ".bun\bin\bun.exe"
 $BROKER = Join-Path $env:USERPROFILE "claude-peers-mcp\broker.ts"
 
-if (-not (Test-Path $BUN)) { throw "Bun not found at $BUN — run install-host-d.ps1 first" }
-if (-not (Test-Path $BROKER)) { throw "broker.ts not found at $BROKER — run install-host-d.ps1 first" }
+if (-not (Test-Path $BUN)) { throw "Bun not found at $BUN — run install-windows-node.ps1 first" }
+if (-not (Test-Path $BROKER)) { throw "broker.ts not found at $BROKER — run install-windows-node.ps1 first" }
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {

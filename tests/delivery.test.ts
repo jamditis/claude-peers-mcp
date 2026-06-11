@@ -332,11 +332,11 @@ describe("resolveTmuxTarget", () => {
 
 describe("formatPeerMessage", () => {
   it("wraps in bracketed paste with the id tag and reply hint", () => {
-    const out = formatPeerMessage({ id: 7, from_id: "ofj-abc", text: "ping" });
+    const out = formatPeerMessage({ id: 7, from_id: "bet-abc", text: "ping" });
     expect(out.startsWith(PASTE_START)).toBe(true);
     expect(out.endsWith(PASTE_END)).toBe(true);
-    expect(out).toContain("[peer ofj-abc #7] ping");
-    expect(out).toContain('(reply: send_message to_id="ofj-abc")');
+    expect(out).toContain("[peer bet-abc #7] ping");
+    expect(out).toContain('(reply: send_message to_id="bet-abc")');
   });
   it("keeps embedded newlines inside the paste wrap", () => {
     const out = formatPeerMessage({ id: 1, from_id: "x", text: "a\nb" });
@@ -587,7 +587,7 @@ describe("isLoopback", () => {
   });
   it("rejects non-loopback", () => {
     expect(isLoopback("100.64.0.2")).toBe(false);
-    expect(isLoopback("192.168.1.5")).toBe(false);
+    expect(isLoopback("198.51.100.5")).toBe(false);
   });
   it("rejects the broker's unknown-address sentinel", () => {
     // broker.ts falls back to "unknown" when server.requestIP returns null;

@@ -38,7 +38,7 @@ This release turns claude-peers from a single-machine discovery tool into a fede
 
 - Federated cross-machine peer discovery: each node's broker POSTs its live local peer list to every sibling on a 5s gossip loop over Tailscale and TTLs remote rows out after 30s, so `list_peers` scope:machine merges local and remote peers (#1).
 - Cross-machine message routing: `send_message` to a non-local peer resolves the owning broker from gossiped machine names and forwards over `/forward-message`, which the receiver queues for the local peer (#1, #16).
-- HOST-D (Tailscale name `host-d`, 100.64.0.4) as a 4th broker node, with symmetric sibling configs for all four machines and two PowerShell installers (Bun + clone + firewall rule for inbound TCP 7899, and a logon Task Scheduler entry) (#2).
+- NODE-D (Tailscale name `node-d`, 100.64.0.4) as a 4th broker node, with symmetric sibling configs for all four machines and two PowerShell installers (Bun + clone + firewall rule for inbound TCP 7899, and a logon Task Scheduler entry) (#2).
 - Reliable broker-side tmux delivery: the broker types each message into the recipient's pane via `tmux send-keys` bracketed-paste, tracked by a per-message `queued -> delivering -> delivered` lease machine that re-probes liveness before confirming and requeues on failure so a message is never silently lost (#16).
 - Per-session capability-token auth (protocol version 3): `/register` mints a 256-bit token bound to the peer, and every mutating control-plane call must present `Authorization: Bearer` matching its principal, so a forged `from_id` returns 401 (#16, closes #13).
 - `CLAUDE_PEERS_ALLOW_UNSIGNED=1` upgrade-grace flag that forgives only a missing token on a pre-v3 NULL-token row during the v2-to-v3 window; a wrong token always 401s (#16).
@@ -48,7 +48,7 @@ This release turns claude-peers from a single-machine discovery tool into a fede
 
 ### Changed
 
-- Match peer machine names case-insensitively in broker routing, so config casing drift (a node broadcasting `HOST-D` listed as sibling `host-d`) no longer returns a null forward URL (#18, closes #17).
+- Match peer machine names case-insensitively in broker routing, so config casing drift (a node broadcasting `NODE-D` listed as sibling `node-d`) no longer returns a null forward URL (#18, closes #17).
 - Collapse repeated gossip failures into periodic summaries: log the first failure, stay silent within a 5-minute window, then emit one `still failing` summary per interval and a `recovered` line on recovery, replacing the ~17,280 log lines/day a single dead sibling produced (#3).
 - Drop the OpenAI auto-summary dependency in favor of each instance setting its own summary via the `set_summary` tool (#1).
 - Gate the broker control plane to loopback only, exempting just the two federation routes (`/gossip`, `/forward-message`), so off-machine traffic cannot reach the mutating endpoints (#16).
@@ -62,5 +62,5 @@ This release turns claude-peers from a single-machine discovery tool into a fede
 - Drain an in-flight remote forward before a retire or idle-exit so cross-machine mail is not dropped on shutdown (#16).
 - Strip C0/C1 control characters (including ESC and the C1 CSI byte) before injection to neutralize bracketed-paste escape injection (#16).
 
-[0.3.0]: https://github.com/jamditis/claude-peers-mcp/releases/tag/v0.3.0
-[0.2.0]: https://github.com/jamditis/claude-peers-mcp/releases/tag/v0.2.0
+[0.3.0]: https://github.com/example-org/claude-peers-mcp/releases/tag/v0.3.0
+[0.2.0]: https://github.com/example-org/claude-peers-mcp/releases/tag/v0.2.0

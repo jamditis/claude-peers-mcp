@@ -1029,15 +1029,15 @@ describe("idle self-exit announces an empty peer list to siblings", () => {
         return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
       },
     });
-    await Bun.write("/tmp/config-idlegossip.json", JSON.stringify({
+    await Bun.write("/tmp/config-idgamossip.json", JSON.stringify({
       machine: "ig-a", tailscale_ip: "127.0.0.1", port: PORT, id_prefix: "iga",
       siblings: [{ machine: "ig-stub", url: `http://127.0.0.1:${STUB_PORT}` }],
       allowed_ips: ["127.0.0.1"],
     }));
-    try { unlinkSync("/tmp/broker-idlegossip.db"); } catch {}
+    try { unlinkSync("/tmp/broker-idgamossip.db"); } catch {}
     proc = Bun.spawn(["bun", "broker.ts"], {
-      env: { ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-idlegossip.json",
-             CLAUDE_PEERS_DB: "/tmp/broker-idlegossip.db", CLAUDE_PEERS_IDLE_EXIT_MS: "1500" },
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: "/tmp/config-idgamossip.json",
+             CLAUDE_PEERS_DB: "/tmp/broker-idgamossip.db", CLAUDE_PEERS_IDLE_EXIT_MS: "1500" },
       stdout: "ignore", stderr: "ignore",
     });
     for (let i = 0; i < 20; i++) { try { if ((await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(300) })).ok) break; } catch {} await new Promise((r) => setTimeout(r, 200)); }
@@ -1046,8 +1046,8 @@ describe("idle self-exit announces an empty peer list to siblings", () => {
   afterAll(() => {
     proc?.kill();
     stub?.stop(true);
-    try { unlinkSync("/tmp/broker-idlegossip.db"); } catch {}
-    try { unlinkSync("/tmp/config-idlegossip.json"); } catch {}
+    try { unlinkSync("/tmp/broker-idgamossip.db"); } catch {}
+    try { unlinkSync("/tmp/config-idgamossip.json"); } catch {}
   });
 
   it("posts an empty-peer gossip on idle teardown", async () => {
@@ -1359,7 +1359,7 @@ describe("cross-broker send reports the remote delivery disposition", () => {
   });
 
   it("reports accepted when the sibling pushes the forward into a live tmux pane", async () => {
-    const sender = await registerAndGetToken(A_PORT, { cwd: "/tmp/fwa-s", machine: "fwd-a" });
+    const sender = await registerAndGetToken(A_PORT, { pid: process.pid, cwd: "/tmp/fwa-s", machine: "fwd-a" });
     const recip = await brokerFetch(B_PORT, "/register", {
       pid: process.pid, cwd: "/tmp/fwb-r", git_root: null, tty: null, summary: "",
       machine: "fwd-b", tailscale_ip: "127.0.0.1", tmux_pane: "%7", tmux_socket: null,
@@ -1382,7 +1382,7 @@ describe("cross-broker send reports the remote delivery disposition", () => {
   }, FED_TIMEOUT_MS);
 
   it("reports queued when the sibling floors the forward", async () => {
-    const sender = await registerAndGetToken(C_PORT, { cwd: "/tmp/fwc-s", machine: "fwd-c" });
+    const sender = await registerAndGetToken(C_PORT, { pid: process.pid, cwd: "/tmp/fwc-s", machine: "fwd-c" });
     const recip = await brokerFetch(D_PORT, "/register", {
       pid: process.pid, cwd: "/tmp/fwd-r", git_root: null, tty: null, summary: "",
       machine: "fwd-d", tailscale_ip: "127.0.0.1", tmux_pane: "%8", tmux_socket: null,
@@ -1401,7 +1401,7 @@ describe("cross-broker send reports the remote delivery disposition", () => {
     // recipient must not auto-paste a floored forward into the pane. Before push_after,
     // the floor only skipped the immediate inject and the next heartbeat pushed anyway.
     await brokerFetch(D_PORT, "/heartbeat", { id: recip.id }, recip.token);
-    const log = readFileSync(stub.logFile, "utf-8");
+    const log = existsSync(stub.logFile) ? readFileSync(stub.logFile, "utf-8") : "";
     expect(log).not.toContain("hold me for pickup");
 
     // A floored forward stays retrievable on the receiving broker.
