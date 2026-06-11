@@ -20,7 +20,7 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 
 ## Running
 
-Both the broker and the MCP server read their settings from a config file — `~/.claude-peers.json` by default, overridable with `CLAUDE_PEERS_CONFIG` — not from environment variables. A missing or incomplete config throws on startup, so a valid one is required to run a session. Required fields: `machine`, `tailscale_ip`, `port`, `id_prefix`, `siblings`, `allowed_ips`. Optional: `db_path`, `floor_remote_forwards`, `push_delay_ms` (default 120000 — how long a `normal`-urgency message waits queued before the broker pushes it anyway). Per-host samples live under `deploy/configs/`.
+Both the broker and the MCP server read their settings from a config file — `~/.claude-peers.json` by default, overridable with `CLAUDE_PEERS_CONFIG` — not from environment variables. A missing or incomplete config throws on startup, so a valid one is required to run a session. Required fields: `machine`, `tailscale_ip`, `port`, `id_prefix`, `siblings`, `allowed_ips`. Optional: `db_path`, `floor_remote_forwards`, `push_delay_ms` (default 120000 — how long a `normal`-urgency message waits queued before the broker pushes it anyway), `auto_summary` (default true — seed each session's summary from git state at registration; false keeps summaries empty until `set_summary`). Per-host samples live under `deploy/configs/`.
 
 ```bash
 # Plain MCP — no channel flags needed. Delivery into a session works when Claude

@@ -19,6 +19,10 @@ export interface PeersConfig {
   // anyway (epoch-ms window). The wait gives the recipient a chance to drain it via
   // check_messages at a task boundary — the cheap path, no inference turn spent.
   push_delay_ms: number;
+  // Seed each session's summary at registration from git state (branch + recent
+  // files). Summaries gossip to sibling brokers like cwd and git_root already do;
+  // set false to keep new sessions' summaries empty until they call set_summary.
+  auto_summary: boolean;
 }
 
 const DEFAULT_PUSH_DELAY_MS = 120_000;
@@ -48,6 +52,7 @@ export function singleHostDefault(): PeersConfig {
     db_path: process.env.CLAUDE_PEERS_DB ?? DEFAULT_DB_PATH,
     floor_remote_forwards: true,
     push_delay_ms: DEFAULT_PUSH_DELAY_MS,
+    auto_summary: true,
   };
 }
 
@@ -101,6 +106,9 @@ export function loadConfig(path?: string): PeersConfig {
     typeof obj.push_delay_ms === "number" && Number.isFinite(obj.push_delay_ms) && obj.push_delay_ms >= 0
       ? obj.push_delay_ms
       : DEFAULT_PUSH_DELAY_MS;
+  // Defaults on: the seed is same-class metadata as the cwd/git_root fields that already
+  // federate. Only an explicit false disables it (mirrors floor_remote_forwards parsing).
+  const auto_summary = obj.auto_summary !== false;
 
-  return { ...obj, db_path, floor_remote_forwards, push_delay_ms } as PeersConfig;
+  return { ...obj, db_path, floor_remote_forwards, push_delay_ms, auto_summary } as PeersConfig;
 }

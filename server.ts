@@ -473,7 +473,7 @@ async function main() {
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
-    summary: await buildAutoSummary(myCwd),
+    summary: config.auto_summary ? await buildAutoSummary(myCwd) : "",
     machine: config.machine,
     tailscale_ip: config.tailscale_ip,
     tmux_pane: tmuxTarget?.pane ?? null,
