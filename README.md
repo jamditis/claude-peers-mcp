@@ -121,6 +121,20 @@ The broker binds each call to its principal: `from_id` for `/send-message`, `id`
 
 To neutralize bracketed-paste escape injection, the broker strips C0/C1 control characters (including `ESC` and the C1 CSI byte) from every message body before it reaches a pane.
 
+## Upgrading
+
+The install is a git clone, so an upgrade is a pull:
+
+```bash
+cd ~/claude-peers-mcp && git pull
+```
+
+Nothing else is required. The next Claude Code session to start spawns an MCP server from the new code, which checks the running broker's protocol version on `/health` and retires a stale broker automatically before launching the new one. Existing sessions keep working against their broker until they restart.
+
+During the window where some machines have pulled and others have not, a pre-v4 node ignores message urgency and pushes on send — exactly the old behavior, no message loss. Pull all federated nodes to close the window (tracked in [#30](https://github.com/jamditis/claude-peers-mcp/issues/30)).
+
+Watch [releases](https://github.com/jamditis/claude-peers-mcp/releases) to be notified of new versions; the [changelog](CHANGELOG.md) records what each one changes.
+
 ## Upgrading a live broker to v3
 
 v3 is the protocol that added the capability token. A fresh install gets it with no action — every v3 server mints and presents a token. The care is only for rolling a broker that already has **running** pre-v3 sessions: those registered before the token column existed, so their rows carry a `NULL` token and they present no `Authorization` header. A plain v3 broker would `401` their next heartbeat.
