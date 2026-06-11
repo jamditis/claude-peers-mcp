@@ -20,6 +20,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { resolveTmuxTarget } from "./delivery.ts";
 import { loadConfig } from "./shared/config.ts";
+import { formatPeerList } from "./shared/format-peers.ts";
 import { buildAutoSummary } from "./shared/summarize.ts";
 import type {
   Peer,
@@ -303,25 +304,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           };
         }
 
-        const lines = peers.map((p) => {
-          const parts = [
-            `ID: ${p.id}`,
-          ];
-          if (p.machine) parts.push(`Machine: ${p.machine} (${p.tailscale_ip})`);
-          if (p.is_remote) parts.push(`[REMOTE]`);
-          parts.push(`CWD: ${p.cwd}`);
-          if (p.git_root) parts.push(`Repo: ${p.git_root}`);
-          if (p.tty) parts.push(`TTY: ${p.tty}`);
-          if (p.summary) parts.push(`Summary: ${p.summary}`);
-          parts.push(`Last seen: ${p.last_seen}`);
-          return parts.join("\n  ");
-        });
-
         return {
           content: [
             {
               type: "text" as const,
-              text: `Found ${peers.length} peer(s) (scope: ${scope}):\n\n${lines.join("\n\n")}`,
+              text: formatPeerList(peers, scope, Date.now()),
             },
           ],
         };
