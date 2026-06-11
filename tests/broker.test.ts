@@ -1,6 +1,7 @@
 // tests/broker.test.ts
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+
 import { Database } from "bun:sqlite";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { unlinkSync } from "node:fs";
 import {
   generatePeerId,

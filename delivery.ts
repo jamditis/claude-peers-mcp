@@ -3,6 +3,7 @@
 // these; tests import them directly (the broker daemon body is not importable).
 
 import type { Database } from "bun:sqlite";
+import type { Urgency } from "./shared/types.ts";
 
 /**
  * Create the messages table in the M1 target schema if it does not exist. The CHECK
@@ -14,11 +15,16 @@ import type { Database } from "bun:sqlite";
  * (null-lease) case on those tables.
  */
 export function ensureMessagesTable(db: Database): void {
+  // push_after: epoch ms when the row becomes push-eligible. DEFAULT 0 (due now) so a
+  // write that does not know about urgency keeps the old push-on-sight behavior; an
+  // explicit NULL means never auto-push (fyi, floored remote forwards) — poll-only.
   db.run(`CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT NOT NULL, to_id TEXT NOT NULL,
     text TEXT NOT NULL, sent_at TEXT NOT NULL,
     delivery_state TEXT NOT NULL DEFAULT 'queued',
     lease_expires_at INTEGER, lease_token TEXT,
+    urgency TEXT NOT NULL DEFAULT 'interrupt',
+    push_after INTEGER DEFAULT 0,
     CHECK (delivery_state <> 'delivering' OR (lease_expires_at IS NOT NULL AND lease_token IS NOT NULL))
   )`);
 }
@@ -34,13 +40,19 @@ export function ensureMessagesTable(db: Database): void {
 export function migrateMessagesSchema(db: Database): void {
   const names = (db.query("PRAGMA table_info(messages)").all() as { name: string }[]).map((c) => c.name);
   const has = (c: string) => names.includes(c);
-  if (!has("delivered") && has("delivery_state")) return; // already migrated
+  if (!has("delivered") && has("delivery_state") && has("urgency") && has("push_after")) return; // already migrated
 
   db.run("BEGIN IMMEDIATE");
   try {
     if (!has("delivery_state")) db.run("ALTER TABLE messages ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'queued'");
     if (!has("lease_expires_at")) db.run("ALTER TABLE messages ADD COLUMN lease_expires_at INTEGER");
     if (!has("lease_token")) db.run("ALTER TABLE messages ADD COLUMN lease_token TEXT");
+    if (!has("urgency")) db.run("ALTER TABLE messages ADD COLUMN urgency TEXT NOT NULL DEFAULT 'interrupt'");
+    // DEFAULT 0 backfills the pre-urgency rows as due-now: they were all push-on-sight,
+    // so never-push (NULL) would strand them. The DEFAULT applies only at ADD COLUMN
+    // time — a NULL written explicitly afterwards (fyi) survives later runs because the
+    // has() guard above skips this branch once the column exists.
+    if (!has("push_after")) db.run("ALTER TABLE messages ADD COLUMN push_after INTEGER DEFAULT 0");
     if (has("delivered")) {
       db.run("UPDATE messages SET delivery_state = CASE WHEN delivered = 1 THEN 'delivered' ELSE 'queued' END");
       db.run("ALTER TABLE messages DROP COLUMN delivered");
@@ -50,6 +62,46 @@ export function migrateMessagesSchema(db: Database): void {
     db.run("ROLLBACK");
     throw e;
   }
+}
+
+/**
+ * Map an urgency tier to the row's push deadline. "interrupt" is due at once;
+ * "normal" waits delayMs so the recipient can drain it via check_messages first (the
+ * cheap path — no inference turn); "fyi" never auto-pushes (NULL), poll-only.
+ */
+export function pushAfterFor(urgency: Urgency, nowMs: number, delayMs: number): number | null {
+  switch (urgency) {
+    case "interrupt": return nowMs;
+    case "normal": return nowMs + delayMs;
+    case "fyi": return null;
+  }
+}
+
+/**
+ * Whether the recipient has any pending row that is push-due now — the gate that
+ * decides if a delivery attempt may interrupt their session at all. A due
+ * 'delivering' row counts: it is a retry in progress, still due work. NULL
+ * push_after rows never trigger (fyi, floored forwards).
+ */
+export function hasDuePush(db: Database, toId: string, nowMs: number): boolean {
+  const row = db.query(
+    "SELECT 1 AS one FROM messages WHERE to_id=? AND delivery_state IN ('queued','delivering') AND push_after IS NOT NULL AND push_after<=? LIMIT 1",
+  ).get(toId, nowMs);
+  return row !== null;
+}
+
+/**
+ * Once one row is due, the turn is being paid anyway — promote the recipient's
+ * future-due queued rows to now so they ride the same flush instead of buying their
+ * own interruption later. NULL rows are deliberately left alone: fyi and floored
+ * remote forwards stay poll-only even during a flush (for floored forwards this is
+ * a security property, not a courtesy — remote text must never be auto-pasted).
+ */
+export function promoteQueuedForFlush(db: Database, toId: string, nowMs: number): void {
+  db.run(
+    "UPDATE messages SET push_after=? WHERE to_id=? AND delivery_state='queued' AND push_after IS NOT NULL AND push_after>?",
+    [nowMs, toId, nowMs],
+  );
 }
 
 const LEASE_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -195,11 +247,21 @@ function stripControl(s: string): string {
   return s.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
 }
 
-/** Build the bracketed-paste-wrapped peer line. A single trailing Enter submits it. */
-export function formatPeerMessage(msg: { id: number; from_id: string; text: string }): string {
+/**
+ * Build the bracketed-paste-wrapped peer line. A single trailing Enter submits it.
+ * Only "interrupt" carries the reply hint — it marks "the sender is blocked on you";
+ * the recipient's system prompt already explains how to reply, and repeating the hint
+ * on every message both costs tokens and nudges reflexive acknowledgment replies.
+ * "fyi" is tagged so the recipient knows no reply is expected. Urgency defaults to
+ * "interrupt" for rows that predate the column.
+ */
+export function formatPeerMessage(msg: { id: number; from_id: string; text: string; urgency?: Urgency | string }): string {
   const from = stripControl(msg.from_id);
   const text = stripControl(msg.text);
-  const body = `[peer ${from} #${msg.id}] ${text}  (reply: send_message to_id="${from}")`;
+  const urgency = msg.urgency ?? "interrupt";
+  const tag = urgency === "fyi" ? ` fyi` : "";
+  const hint = urgency === "interrupt" ? `  (reply: send_message to_id="${from}")` : "";
+  const body = `[peer ${from} #${msg.id}${tag}] ${text}${hint}`;
   return `${PASTE_START}${body}${PASTE_END}`;
 }
 
@@ -233,6 +295,7 @@ export async function deliverViaTmux(
 export interface DeliverableRow {
   id: number; from_id: string; to_id: string; text: string; sent_at: string;
   delivery_state: string; lease_expires_at: number | null; lease_token: string | null;
+  urgency: string; push_after: number | null;
 }
 
 /**
@@ -246,9 +309,12 @@ export function nextDeliverable(
 ): DeliverableRow | null {
   // Only the head-of-line row matters: a younger message must never overtake an older
   // one, so we fetch the single oldest queued-or-delivering row and decide on it alone.
+  // NULL push_after rows (fyi, floored forwards) live outside the push channel entirely —
+  // they are skipped here so a poll-only row cannot jam pushable mail behind it. FIFO
+  // holds within each channel (push vs poll), not across them.
   // Column list mirrors DeliverableRow exactly — keep them in sync if the schema changes.
   const row = db.query(
-    "SELECT id, from_id, to_id, text, sent_at, delivery_state, lease_expires_at, lease_token FROM messages WHERE to_id=? AND delivery_state IN ('queued','delivering') ORDER BY id ASC LIMIT 1",
+    "SELECT id, from_id, to_id, text, sent_at, delivery_state, lease_expires_at, lease_token, urgency, push_after FROM messages WHERE to_id=? AND delivery_state IN ('queued','delivering') AND push_after IS NOT NULL ORDER BY id ASC LIMIT 1",
   ).get(toId) as DeliverableRow | null;
   if (!row) return null;
   if (row.delivery_state === "queued") return row;

@@ -8,19 +8,21 @@
  */
 
 import { Database } from "bun:sqlite";
+import {
+  claimForDelivery, confirmDelivered, deliverViaTmux, ensureMessagesTable,
+  formatPeerMessage, generateAuthToken, generateLeaseToken, hasDuePush,
+  isFederationRoute, isLoopback, isMessageDelivered, isPidDead,
+  migrateMessagesSchema, nextDeliverable, pidProbe, promoteQueuedForFlush,
+  pruneMessages, pushAfterFor, reclaimIfExpired, reclaimLeaklessDelivering,
+  releasableQueuedPrefix, releaseToQueued, resetDeliveringOnStart, type TmuxSpawn,
+} from "./delivery.ts";
 import { loadConfig, type SiblingConfig } from "./shared/config.ts";
 import type {
-  RegisterRequest, RegisterResponse, ListPeersRequest, SendMessageRequest,
-  PollMessagesRequest, PollMessagesResponse, Peer, Message,
-  GossipRequest, ForwardMessageRequest, ForwardMessageResponse, SendResult,
-  ControlPlaneRequest,
+  ControlPlaneRequest, ForwardMessageRequest, ForwardMessageResponse,
+  GossipRequest, ListPeersRequest, Message, Peer,
+  PollMessagesRequest, PollMessagesResponse,
+  RegisterRequest, RegisterResponse, SendMessageRequest, SendResult,
 } from "./shared/types.ts";
-import {
-  ensureMessagesTable, migrateMessagesSchema, resetDeliveringOnStart, reclaimLeaklessDelivering,
-  generateLeaseToken, generateAuthToken, claimForDelivery, confirmDelivered, releaseToQueued,
-  reclaimIfExpired, nextDeliverable, formatPeerMessage, releasableQueuedPrefix, isMessageDelivered,
-  deliverViaTmux, isLoopback, isFederationRoute, isPidDead, pidProbe, pruneMessages, type TmuxSpawn,
-} from "./delivery.ts";
 import { PROTOCOL_VERSION } from "./shared/types.ts";
 
 const GOSSIP_INTERVAL_MS = 5_000;
@@ -211,7 +213,7 @@ if (import.meta.main) {
   const selectPeersByGitRoot = db.prepare("SELECT * FROM peers WHERE git_root = ?");
   const selectAllRemotePeers = db.prepare("SELECT * FROM remote_peers");
   const insertMessage = db.prepare(
-    "INSERT INTO messages (from_id, to_id, text, sent_at) VALUES (?, ?, ?, ?)"
+    "INSERT INTO messages (from_id, to_id, text, sent_at, urgency, push_after) VALUES (?, ?, ?, ?, ?, ?)"
   );
   // Poll reads pending (queued OR delivering) in id order so it can stop at an in-flight head
   // and never release a younger message ahead of an older one a tmux send still owns.
@@ -391,6 +393,13 @@ if (import.meta.main) {
     if (!row) return null;
     const target = peerDelivery(toId);
     if (target?.kind !== "tmux" || !target.pane || !tmuxAvailable()) return "queued";
+    // The urgency gate: interrupt the recipient only when some pending row is push-due
+    // (an interrupt send, or a normal row whose push_delay window has lapsed). Until
+    // then everything stays queued for their next check_messages — the cheap path.
+    // Once one row is due, the turn is being paid anyway, so promote the rest of the
+    // pushable backlog to ride the same flush instead of buying its own interruption.
+    if (!hasDuePush(db, toId, now)) return "queued";
+    promoteQueuedForFlush(db, toId, now);
 
     if (row.delivery_state === "delivering") {
       if (!reclaimIfExpired(db, row.id, now)) return null; // someone else owns it
@@ -502,11 +511,19 @@ if (import.meta.main) {
     // under either is a false positive: no valid session polls it, and the deferred delete or next
     // sweep wipes it. Treat both as absent so the caller gets an honest result (a sibling, or "not
     // found") instead of an ok that silently drops the message.
+    const urgency = body.urgency ?? "interrupt"; // absent = pre-urgency client, keep its old push-on-send
     if (localTarget && peerStillLive(body.to_id) && !pendingPeerDeletes.has(body.to_id)) {
-      insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
-      const disposition = (await deliverNext(body.to_id)) ?? "queued";
-      if (disposition === "accepted") await drainAfterDelivery(body.to_id);
-      return { ok: true, routed: "local", delivery: disposition };
+      const inserted = insertMessage.run(
+        body.from_id, body.to_id, body.text, new Date().toISOString(),
+        urgency, pushAfterFor(urgency, Date.now(), config.push_delay_ms),
+      );
+      const ownRowId = Number(inserted.lastInsertRowid);
+      if ((await deliverNext(body.to_id)) === "accepted") await drainAfterDelivery(body.to_id);
+      // Report THIS message's own disposition, not the queue head's (the local edition of
+      // issue #14): deliverNext works head-first, so the row just inserted may have ridden
+      // out behind older backlog, still be queued (normal/fyi), or had its own push fail
+      // after the head's succeeded.
+      return { ok: true, routed: "local", delivery: isMessageDelivered(db, ownRowId) ? "accepted" : "queued" };
     }
     const siblingUrl = resolveTargetBroker(db, body.to_id, config.siblings);
     if (!siblingUrl) return { ok: false, error: `Peer ${body.to_id} not found` };
@@ -521,6 +538,7 @@ if (import.meta.main) {
         body: JSON.stringify({
           protocol_version: PROTOCOL_VERSION, from_id: body.from_id,
           to_id: body.to_id, text: body.text, from_machine: config.machine,
+          urgency,
         } satisfies ForwardMessageRequest),
         signal: AbortSignal.timeout(FORWARD_TIMEOUT_MS),
       });
@@ -549,7 +567,15 @@ if (import.meta.main) {
       console.error(`[claude-peers broker] Dropping forwarded message: no live local peer ${body.to_id}`);
       return { ok: false };
     }
-    const inserted = insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
+    // A floored forward is poll-only: push_after NULL keeps it out of the push channel
+    // entirely, so neither the heartbeat drain nor a flush can auto-paste remote text
+    // into a local pane. (Before push_after, the floor only skipped the immediate
+    // inject here and the recipient's next heartbeat pushed the row anyway.)
+    const urgency = body.urgency ?? "interrupt"; // absent = pre-urgency sibling broker
+    const pushAfter = config.floor_remote_forwards
+      ? null
+      : pushAfterFor(urgency, Date.now(), config.push_delay_ms);
+    const inserted = insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString(), urgency, pushAfter);
     const forwardedRowId = Number(inserted.lastInsertRowid);
     // floor_remote_forwards leaves a forwarded message queued for pull-only retrieval;
     // by default a forward auto-injects into the recipient's backend like a local send.

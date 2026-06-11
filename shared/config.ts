@@ -15,7 +15,13 @@ export interface PeersConfig {
   allowed_ips: string[];
   db_path: string;
   floor_remote_forwards: boolean;
+  // How long a "normal"-urgency message waits queued before the broker pushes it
+  // anyway (epoch-ms window). The wait gives the recipient a chance to drain it via
+  // check_messages at a task boundary — the cheap path, no inference turn spent.
+  push_delay_ms: number;
 }
+
+const DEFAULT_PUSH_DELAY_MS = 120_000;
 
 const REQUIRED_FIELDS = ["machine", "tailscale_ip", "port", "id_prefix", "siblings", "allowed_ips"] as const;
 
@@ -41,6 +47,7 @@ export function singleHostDefault(): PeersConfig {
     allowed_ips: ["127.0.0.1"],
     db_path: process.env.CLAUDE_PEERS_DB ?? DEFAULT_DB_PATH,
     floor_remote_forwards: true,
+    push_delay_ms: DEFAULT_PUSH_DELAY_MS,
   };
 }
 
@@ -88,6 +95,12 @@ export function loadConfig(path?: string): PeersConfig {
   // check_messages) so a remote machine cannot auto-paste into a live pane until
   // federation traffic is authenticated. Local same-machine peers still push.
   const floor_remote_forwards = obj.floor_remote_forwards !== false;
+  // A non-numeric or negative value falls back rather than throwing: the field is an
+  // optional tuning knob, and a typo should not keep a whole node's sessions from starting.
+  const push_delay_ms =
+    typeof obj.push_delay_ms === "number" && Number.isFinite(obj.push_delay_ms) && obj.push_delay_ms >= 0
+      ? obj.push_delay_ms
+      : DEFAULT_PUSH_DELAY_MS;
 
-  return { ...obj, db_path, floor_remote_forwards } as PeersConfig;
+  return { ...obj, db_path, floor_remote_forwards, push_delay_ms } as PeersConfig;
 }

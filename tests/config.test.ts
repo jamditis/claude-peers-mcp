@@ -1,4 +1,4 @@
-import { describe, it, expect } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import { loadConfig, singleHostDefault } from "../shared/config.ts";
 
 describe("loadConfig", () => {
@@ -62,6 +62,46 @@ describe("floor_remote_forwards", () => {
       floor_remote_forwards: true,
     }));
     expect(loadConfig(path).floor_remote_forwards).toBe(true);
+  });
+});
+
+describe("push_delay_ms", () => {
+  // The window a "normal"-urgency message waits queued before the broker pushes it
+  // anyway. Long enough for the recipient to hit a task boundary and poll (the cheap
+  // path — no inference turn), short enough that unpolled mail still arrives promptly.
+  it("defaults to 120000 when absent", async () => {
+    const path = "/tmp/cfg-delay-absent.json";
+    await Bun.write(path, JSON.stringify({
+      machine: "m", tailscale_ip: "127.0.0.1", port: 19004,
+      id_prefix: "m", siblings: [], allowed_ips: ["127.0.0.1"],
+    }));
+    expect(loadConfig(path).push_delay_ms).toBe(120_000);
+  });
+
+  it("reads an explicit number", async () => {
+    const path = "/tmp/cfg-delay-set.json";
+    await Bun.write(path, JSON.stringify({
+      machine: "m", tailscale_ip: "127.0.0.1", port: 19005,
+      id_prefix: "m", siblings: [], allowed_ips: ["127.0.0.1"],
+      push_delay_ms: 5_000,
+    }));
+    expect(loadConfig(path).push_delay_ms).toBe(5_000);
+  });
+
+  it("falls back to the default on a negative or non-numeric value", async () => {
+    const path = "/tmp/cfg-delay-bad.json";
+    await Bun.write(path, JSON.stringify({
+      machine: "m", tailscale_ip: "127.0.0.1", port: 19006,
+      id_prefix: "m", siblings: [], allowed_ips: ["127.0.0.1"],
+      push_delay_ms: "soon",
+    }));
+    expect(loadConfig(path).push_delay_ms).toBe(120_000);
+    await Bun.write(path, JSON.stringify({
+      machine: "m", tailscale_ip: "127.0.0.1", port: 19006,
+      id_prefix: "m", siblings: [], allowed_ips: ["127.0.0.1"],
+      push_delay_ms: -1,
+    }));
+    expect(loadConfig(path).push_delay_ms).toBe(120_000);
   });
 });
 

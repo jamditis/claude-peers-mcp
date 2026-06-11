@@ -1,15 +1,15 @@
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { unlinkSync } from "node:fs";
-import { ensureMessagesTable, migrateMessagesSchema } from "../delivery.ts";
 import {
-  claimForDelivery, confirmDelivered, isMessageDelivered,
-  releaseToQueued, resetDeliveringOnStart, reclaimIfExpired, findLeaklessDelivering,
-  reclaimLeaklessDelivering,
+  buildTmuxArgs, claimForDelivery, confirmDelivered, deliverViaTmux,
+  ensureMessagesTable, findLeaklessDelivering, formatPeerMessage, hasDuePush,
+  isFederationRoute, isLoopback, isMessageDelivered, isPidDead,
+  migrateMessagesSchema, nextDeliverable, PASTE_END, PASTE_START,
+  promoteQueuedForFlush, pruneMessages, pushAfterFor, reclaimIfExpired,
+  reclaimLeaklessDelivering, releasableQueuedPrefix, releaseToQueued,
+  resetDeliveringOnStart, resolveTmuxTarget, type TmuxSpawn,
 } from "../delivery.ts";
-import { resolveTmuxTarget, formatPeerMessage, PASTE_START, PASTE_END } from "../delivery.ts";
-import { deliverViaTmux, buildTmuxArgs, type TmuxSpawn } from "../delivery.ts";
-import { nextDeliverable, isLoopback, isFederationRoute, isPidDead, pruneMessages, releasableQueuedPrefix } from "../delivery.ts";
 
 const DB = "/tmp/test-delivery-migration.db";
 
@@ -29,6 +29,8 @@ describe("migrateMessagesSchema", () => {
     expect(c).toContain("delivery_state");
     expect(c).toContain("lease_expires_at");
     expect(c).toContain("lease_token");
+    expect(c).toContain("urgency");
+    expect(c).toContain("push_after");
     expect(c).not.toContain("delivered");
     db.close();
   });
@@ -51,6 +53,39 @@ describe("migrateMessagesSchema", () => {
     const rows = db.query("SELECT text, delivery_state FROM messages ORDER BY id").all() as any[];
     expect(rows[0].delivery_state).toBe("delivered");
     expect(rows[1].delivery_state).toBe("queued");
+    db.close();
+  });
+
+  it("adds urgency and push_after to a pre-urgency table, with legacy rows due immediately", () => {
+    // A v3-era table: delivery_state schema, no urgency tiers yet. Its pending rows were
+    // all push-on-sight, so they must come out due-now (push_after 0), not never-push.
+    const db = new Database(DB);
+    db.run(`CREATE TABLE messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT NOT NULL, to_id TEXT NOT NULL,
+      text TEXT NOT NULL, sent_at TEXT NOT NULL,
+      delivery_state TEXT NOT NULL DEFAULT 'queued', lease_expires_at INTEGER, lease_token TEXT
+    )`);
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at) VALUES ('a','b','hi',?)", [new Date().toISOString()]);
+
+    migrateMessagesSchema(db);
+
+    const c = cols(db);
+    expect(c).toContain("urgency");
+    expect(c).toContain("push_after");
+    const row = db.query("SELECT urgency, push_after FROM messages").get() as { urgency: string; push_after: number | null };
+    expect(row.urgency).toBe("interrupt");
+    expect(row.push_after).toBe(0);
+    db.close();
+  });
+
+  it("preserves an explicit NULL push_after (never auto-push) across a re-run", () => {
+    const db = new Database(DB);
+    ensureMessagesTable(db);
+    migrateMessagesSchema(db);
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,urgency,push_after) VALUES ('a','b','fyi-row',?,'fyi',NULL)", [new Date().toISOString()]);
+    migrateMessagesSchema(db);
+    const row = db.query("SELECT push_after FROM messages").get() as { push_after: number | null };
+    expect(row.push_after).toBeNull();
     db.close();
   });
 
@@ -322,6 +357,16 @@ describe("formatPeerMessage", () => {
     const out = formatPeerMessage({ id: 2, from_id: "x\x1b[201~", text: "hi" });
     expect(out.indexOf(PASTE_END)).toBe(out.lastIndexOf(PASTE_END)); // still only the wrapper
   });
+  it("omits the reply hint for normal urgency (the system prompt already explains replying)", () => {
+    const out = formatPeerMessage({ id: 9, from_id: "x", text: "hi", urgency: "normal" });
+    expect(out).toContain("[peer x #9] hi");
+    expect(out).not.toContain("reply: send_message");
+  });
+  it("tags fyi and omits the hint — no reply is expected", () => {
+    const out = formatPeerMessage({ id: 9, from_id: "x", text: "hi", urgency: "fyi" });
+    expect(out).toContain("[peer x #9 fyi] hi");
+    expect(out).not.toContain("reply: send_message");
+  });
   it("strips the C1 single-byte CSI (0x9b) so it cannot stand in for ESC[ paste-END", () => {
     // 0x9b is CSI; on an 8-bit-clean terminal "\x9b201~" closes bracketed paste just
     // like "\x1b[201~". Stripping ESC alone would miss it.
@@ -329,6 +374,92 @@ describe("formatPeerMessage", () => {
     expect(out).not.toContain("\x9b");
     expect(out.indexOf(PASTE_END)).toBe(out.lastIndexOf(PASTE_END)); // only the wrapper
     expect(out).toContain("rm -rf safe");
+  });
+});
+
+describe("pushAfterFor", () => {
+  it("interrupt is due at once", () => {
+    expect(pushAfterFor("interrupt", 5_000, 120_000)).toBe(5_000);
+  });
+  it("normal is due after the delay", () => {
+    expect(pushAfterFor("normal", 5_000, 120_000)).toBe(125_000);
+  });
+  it("fyi never auto-pushes", () => {
+    expect(pushAfterFor("fyi", 5_000, 120_000)).toBeNull();
+  });
+});
+
+const UDB = "/tmp/test-delivery-urgency.db";
+function urgencyDb(): Database {
+  try { unlinkSync(UDB); } catch {}
+  const db = new Database(UDB); ensureMessagesTable(db); return db;
+}
+function insAt(db: Database, toId: string, pushAfter: number | null): number {
+  db.run("INSERT INTO messages (from_id,to_id,text,sent_at,push_after) VALUES ('a',?,?,?,?)",
+    [toId, "m", new Date().toISOString(), pushAfter]);
+  return (db.query("SELECT last_insert_rowid() AS id").get() as { id: number }).id;
+}
+
+describe("hasDuePush", () => {
+  let db: Database;
+  beforeEach(() => { db = urgencyDb(); });
+  afterEach(() => { db.close(); try { unlinkSync(UDB); } catch {} });
+
+  it("is false with no pending rows", () => {
+    expect(hasDuePush(db, "b", 1000)).toBe(false);
+  });
+  it("is false when pending rows are future-due or never-push", () => {
+    insAt(db, "b", 9_999);
+    insAt(db, "b", null);
+    expect(hasDuePush(db, "b", 1000)).toBe(false);
+  });
+  it("is true when any pending row is due", () => {
+    insAt(db, "b", 9_999);
+    insAt(db, "b", 1000);
+    expect(hasDuePush(db, "b", 1000)).toBe(true);
+  });
+  it("counts a due delivering row (a retry in progress is still due work)", () => {
+    const a = insAt(db, "b", 500);
+    claimForDelivery(db, a, 1000, 5000, "t");
+    expect(hasDuePush(db, "b", 2000)).toBe(true);
+  });
+  it("ignores other recipients and delivered rows", () => {
+    insAt(db, "other", 0);
+    const a = insAt(db, "b", 0);
+    claimForDelivery(db, a, 1000, 5000, "t");
+    confirmDelivered(db, a, "t");
+    expect(hasDuePush(db, "b", 2000)).toBe(false);
+  });
+});
+
+describe("promoteQueuedForFlush", () => {
+  let db: Database;
+  beforeEach(() => { db = urgencyDb(); });
+  afterEach(() => { db.close(); try { unlinkSync(UDB); } catch {} });
+
+  const pushAfterOf = (db: Database, id: number) =>
+    (db.query("SELECT push_after FROM messages WHERE id=?").get(id) as { push_after: number | null }).push_after;
+
+  it("promotes future-due queued rows to now so they ride the flush", () => {
+    const a = insAt(db, "b", 99_999);
+    promoteQueuedForFlush(db, "b", 2000);
+    expect(pushAfterOf(db, a)).toBe(2000);
+  });
+  it("leaves never-push (NULL) rows alone — fyi and floored forwards stay poll-only", () => {
+    const a = insAt(db, "b", null);
+    promoteQueuedForFlush(db, "b", 2000);
+    expect(pushAfterOf(db, a)).toBeNull();
+  });
+  it("leaves already-due rows, delivered rows, and other recipients alone", () => {
+    const due = insAt(db, "b", 100);
+    const other = insAt(db, "c", 99_999);
+    const done = insAt(db, "b", 99_999);
+    claimForDelivery(db, done, 1000, 5000, "t");
+    confirmDelivered(db, done, "t");
+    promoteQueuedForFlush(db, "b", 2000);
+    expect(pushAfterOf(db, due)).toBe(100);
+    expect(pushAfterOf(db, other)).toBe(99_999);
+    expect(pushAfterOf(db, done)).toBe(99_999);
   });
 });
 
@@ -401,6 +532,14 @@ describe("nextDeliverable", () => {
   it("ignores other recipients", () => {
     ins(db, "other");
     expect(nextDeliverable(db, "b", 1000, new Set())).toBeNull();
+  });
+
+  it("skips a never-push head so due mail behind it is not jammed", () => {
+    // A NULL push_after row (fyi / floored forward) is poll-only; it must not block
+    // the push channel head-of-line. Push FIFO holds among pushable rows only.
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,push_after) VALUES ('a','b','fyi',?,NULL)", [new Date().toISOString()]);
+    const due = ins(db, "b");
+    expect(nextDeliverable(db, "b", 1000, new Set())!.id).toBe(due);
   });
 
   // Issue #10: an orphaned NULL-lease delivering head must be reclaimable so younger mail

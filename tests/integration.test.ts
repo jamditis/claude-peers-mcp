@@ -1,9 +1,11 @@
 // tests/integration.test.ts
-import { describe, it, expect, beforeAll, afterAll } from "bun:test";
+
 import { Database } from "bun:sqlite";
-import { unlinkSync, mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync } from "node:fs";
+import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROTOCOL_VERSION } from "../shared/types.ts";
 
 // Create a directory holding a fake `tmux` executable that records its argv and
 // exits 0, so the broker's tmux backend is deterministic without a real tmux.
@@ -402,7 +404,7 @@ describe("broker version handshake", () => {
 
   it("reports protocol_version on /health", async () => {
     const h = await (await fetch(`http://127.0.0.1:${PORT}/health`)).json() as any;
-    expect(h.protocol_version).toBe(3);
+    expect(h.protocol_version).toBe(PROTOCOL_VERSION);
   });
 
   it("retire drains and exits even with a peer registered", async () => {
@@ -1395,9 +1397,146 @@ describe("cross-broker send reports the remote delivery disposition", () => {
     expect(send.routed).toBe("remote");
     expect(send.delivery).toBe("queued");
 
+    // The floor must hold against the deadline-push path too: a heartbeat drain on the
+    // recipient must not auto-paste a floored forward into the pane. Before push_after,
+    // the floor only skipped the immediate inject and the next heartbeat pushed anyway.
+    await brokerFetch(D_PORT, "/heartbeat", { id: recip.id }, recip.token);
+    const log = readFileSync(stub.logFile, "utf-8");
+    expect(log).not.toContain("hold me for pickup");
+
     // A floored forward stays retrievable on the receiving broker.
     const poll = await brokerFetch(D_PORT, "/poll-messages", { id: recip.id }, recip.token) as any;
     expect(poll.messages).toHaveLength(1);
     expect(poll.messages[0].text).toBe("hold me for pickup");
   }, FED_TIMEOUT_MS);
+});
+
+// Urgency tiers: "interrupt" pushes at once (and flushes pending pushable mail with it),
+// "normal" queues until the recipient polls or the push deadline passes (the heartbeat
+// drain enforces the deadline), "fyi" never auto-pushes and is poll-only.
+describe("urgency tiers and deadline push", () => {
+  const PORT = 17931;
+  const PUSH_DELAY_MS = 500;
+  let proc: any;
+  let stub: { dir: string; logFile: string };
+
+  const cfg = {
+    machine: "urg-a", tailscale_ip: "127.0.0.1", port: PORT,
+    id_prefix: "urg", siblings: [], allowed_ips: ["127.0.0.1"],
+    push_delay_ms: PUSH_DELAY_MS,
+  };
+
+  beforeAll(async () => {
+    stub = makeStubTmux();
+    await Bun.write("/tmp/config-urg.json", JSON.stringify(cfg));
+    try { unlinkSync("/tmp/broker-urg.db"); } catch {}
+    proc = Bun.spawn(["bun", "broker.ts"], {
+      env: {
+        ...process.env,
+        CLAUDE_PEERS_CONFIG: "/tmp/config-urg.json",
+        CLAUDE_PEERS_DB: "/tmp/broker-urg.db",
+        PATH: `${stub.dir}:${process.env.PATH}`, // stub tmux wins
+      },
+      stdout: "ignore", stderr: "inherit",
+    });
+    for (let i = 0; i < 20; i++) {
+      try { if ((await fetch(`http://127.0.0.1:${PORT}/health`)).ok) break; } catch {}
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  });
+
+  afterAll(() => {
+    proc?.kill();
+    try { unlinkSync("/tmp/broker-urg.db"); } catch {}
+    try { unlinkSync("/tmp/config-urg.json"); } catch {}
+  });
+
+  it("normal urgency queues instead of pushing", async () => {
+    const recip = await brokerFetch(PORT, "/register", {
+      pid: process.pid, cwd: "/tmp/u1", git_root: null, tty: null, summary: "",
+      machine: "urg-a", tailscale_ip: "127.0.0.1", tmux_pane: "%21", tmux_socket: null,
+    }) as any;
+    const sender = await registerAndGetToken(PORT, { cwd: "/tmp/u1-s" });
+    const send = await brokerFetch(PORT, "/send-message", {
+      from_id: sender.id, to_id: recip.id, text: "calm normal note", urgency: "normal",
+    }, sender.token) as any;
+    expect(send.ok).toBe(true);
+    expect(send.delivery).toBe("queued");
+    const log = readFileSync(stub.logFile, "utf-8");
+    expect(log).not.toContain("calm normal note");
+    // And it is retrievable by poll before the deadline — the cheap path.
+    const poll = await brokerFetch(PORT, "/poll-messages", { id: recip.id }, recip.token) as any;
+    expect(poll.messages).toHaveLength(1);
+    expect(poll.messages[0].text).toBe("calm normal note");
+  });
+
+  it("a normal row past its deadline is pushed by the recipient's heartbeat", async () => {
+    const recip = await brokerFetch(PORT, "/register", {
+      pid: process.pid, cwd: "/tmp/u2", git_root: null, tty: null, summary: "",
+      machine: "urg-a", tailscale_ip: "127.0.0.1", tmux_pane: "%22", tmux_socket: null,
+    }) as any;
+    const sender = await registerAndGetToken(PORT, { cwd: "/tmp/u2-s" });
+    await brokerFetch(PORT, "/send-message", {
+      from_id: sender.id, to_id: recip.id, text: "deadline note", urgency: "normal",
+    }, sender.token);
+    await new Promise((r) => setTimeout(r, PUSH_DELAY_MS + 300));
+    await brokerFetch(PORT, "/heartbeat", { id: recip.id }, recip.token);
+    const log = readFileSync(stub.logFile, "utf-8");
+    expect(log).toContain("deadline note");
+    const poll = await brokerFetch(PORT, "/poll-messages", { id: recip.id }, recip.token) as any;
+    expect(poll.messages).toHaveLength(0);
+  });
+
+  it("an interrupt send flushes pending pushable mail with it, in order", async () => {
+    const recip = await brokerFetch(PORT, "/register", {
+      pid: process.pid, cwd: "/tmp/u3", git_root: null, tty: null, summary: "",
+      machine: "urg-a", tailscale_ip: "127.0.0.1", tmux_pane: "%23", tmux_socket: null,
+    }) as any;
+    const sender = await registerAndGetToken(PORT, { cwd: "/tmp/u3-s" });
+    await brokerFetch(PORT, "/send-message", {
+      from_id: sender.id, to_id: recip.id, text: "older normal rides along", urgency: "normal",
+    }, sender.token);
+    const send = await brokerFetch(PORT, "/send-message", {
+      from_id: sender.id, to_id: recip.id, text: "urgent now", urgency: "interrupt",
+    }, sender.token) as any;
+    // The disposition reports THIS message's own fate — it rode out behind the flushed backlog.
+    expect(send.delivery).toBe("accepted");
+    const log = readFileSync(stub.logFile, "utf-8");
+    expect(log).toContain("older normal rides along");
+    expect(log).toContain("urgent now");
+    expect(log.indexOf("older normal rides along")).toBeLessThan(log.indexOf("urgent now"));
+  });
+
+  it("fyi is never auto-pushed but is pollable with its urgency", async () => {
+    const recip = await brokerFetch(PORT, "/register", {
+      pid: process.pid, cwd: "/tmp/u4", git_root: null, tty: null, summary: "",
+      machine: "urg-a", tailscale_ip: "127.0.0.1", tmux_pane: "%24", tmux_socket: null,
+    }) as any;
+    const sender = await registerAndGetToken(PORT, { cwd: "/tmp/u4-s" });
+    const send = await brokerFetch(PORT, "/send-message", {
+      from_id: sender.id, to_id: recip.id, text: "fyi only", urgency: "fyi",
+    }, sender.token) as any;
+    expect(send.delivery).toBe("queued");
+    await new Promise((r) => setTimeout(r, PUSH_DELAY_MS + 300));
+    await brokerFetch(PORT, "/heartbeat", { id: recip.id }, recip.token);
+    const log = readFileSync(stub.logFile, "utf-8");
+    expect(log).not.toContain("fyi only");
+    const poll = await brokerFetch(PORT, "/poll-messages", { id: recip.id }, recip.token) as any;
+    expect(poll.messages).toHaveLength(1);
+    expect(poll.messages[0].urgency).toBe("fyi");
+  });
+
+  it("a send without urgency behaves as interrupt (wire back-compat)", async () => {
+    const recip = await brokerFetch(PORT, "/register", {
+      pid: process.pid, cwd: "/tmp/u5", git_root: null, tty: null, summary: "",
+      machine: "urg-a", tailscale_ip: "127.0.0.1", tmux_pane: "%25", tmux_socket: null,
+    }) as any;
+    const sender = await registerAndGetToken(PORT, { cwd: "/tmp/u5-s" });
+    const send = await brokerFetch(PORT, "/send-message", {
+      from_id: sender.id, to_id: recip.id, text: "legacy push",
+    }, sender.token) as any;
+    expect(send.delivery).toBe("accepted");
+    const log = readFileSync(stub.logFile, "utf-8");
+    expect(log).toContain("legacy push");
+  });
 });
