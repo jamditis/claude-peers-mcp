@@ -86,7 +86,7 @@ The other Claude receives it immediately and responds.
 | ---------------- | ------------------------------------------------------------------------------------------- |
 | `list_peers`     | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo`. With `machine` scope, remote peers from federated nodes are included and tagged `[remote]`. |
 | `send_message`   | Send a message to another instance by ID. `urgency` picks the delivery tier: `interrupt` pushes into their tmux session now; `normal` (the tool default) queues until they poll or the push deadline passes; `fyi` is poll-only, no reply expected. Cross-machine targets route automatically to the owning broker. |
-| `set_summary`    | Describe what you're working on (visible to other peers)                                    |
+| `set_summary`    | Describe what you're working on (visible to other peers). The summary starts as an auto-generated git snapshot (`[auto] <branch>; recent: <files>`) seeded at registration; this tool overwrites it. |
 | `check_messages` | Read and clear messages that were queued instead of pushed. A poll marks the returned messages delivered, so a second call won't re-return them. |
 
 ## How it works

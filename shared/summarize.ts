@@ -1,8 +1,36 @@
 /**
  * Git context helpers for gathering peer context.
- * Auto-summary generation was removed — Claude sets its own summary
- * via the set_summary MCP tool.
+ * buildAutoSummary seeds a peer's summary at registration from git state alone,
+ * so a fresh session is discoverable without spending an inference turn on
+ * set_summary. The set_summary MCP tool overwrites it once the task is clearer.
  */
+
+/** Hard cap on the auto summary — it rides in every list_peers response and gossips
+ * across machines, so it must stay cheap to read. */
+export const AUTO_SUMMARY_MAX_CHARS = 140;
+
+/**
+ * Build a one-line summary from git state: "[auto] <branch>; recent: f1, f2, f3".
+ * Returns "" outside a git repo (cwd is already a list_peers field — a non-git
+ * summary would add nothing) and never throws: registration must not fail over
+ * a cosmetic field.
+ */
+export async function buildAutoSummary(cwd: string): Promise<string> {
+  try {
+    const branch = await getGitBranch(cwd);
+    if (!branch) return "";
+    let summary = `[auto] ${branch}`;
+    for (const file of await getRecentFiles(cwd, 3)) {
+      const next = summary.includes("; recent: ") ? `${summary}, ${file}` : `${summary}; recent: ${file}`;
+      // Whole-file truncation: a path that does not fit is dropped, never cut mid-name.
+      if (next.length > AUTO_SUMMARY_MAX_CHARS) break;
+      summary = next;
+    }
+    return summary.slice(0, AUTO_SUMMARY_MAX_CHARS);
+  } catch {
+    return "";
+  }
+}
 
 /**
  * Get the current git branch name for a directory.

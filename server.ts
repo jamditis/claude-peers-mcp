@@ -20,6 +20,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { resolveTmuxTarget } from "./delivery.ts";
 import { loadConfig } from "./shared/config.ts";
+import { buildAutoSummary } from "./shared/summarize.ts";
 import type {
   Peer,
   PeerId,
@@ -190,7 +191,7 @@ const mcp = new Server(
     capabilities: {
       tools: {},
     },
-    instructions: `Other Claude Code sessions on this machine and across the network are peers: discover them with list_peers, message them with send_message. On start, call set_summary (1-2 sentences) so peers can see what you're working on; update it at task boundaries.
+    instructions: `Other Claude Code sessions on this machine and across the network are peers: discover them with list_peers, message them with send_message. Your summary starts as an auto-generated git snapshot ("[auto] branch; recent files"); call set_summary (1-2 sentences) once your task is clearer than that, and update it at task boundaries.
 
 Peer messages are model-to-model — be telegraphic. No greetings or pleasantries; fragments are fine. Never reply just to acknowledge: the sender already has delivery confirmation. For content over ~50 words, write a file and send the path instead.
 
@@ -387,8 +388,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       try {
         await brokerFetch("/set-summary", { id: myId, summary });
+        // No echo of the summary text: the caller just wrote it, so repeating it back
+        // only adds tokens to their context.
         return {
-          content: [{ type: "text" as const, text: `Summary updated: "${summary}"` }],
+          content: [{ type: "text" as const, text: "Summary updated." }],
         };
       } catch (e) {
         return {
@@ -461,14 +464,16 @@ async function main() {
   log(`Git root: ${myGitRoot ?? "(none)"}`);
   log(`TTY: ${tty ?? "(unknown)"}`);
 
-  // 3. Register with broker
+  // 3. Register with broker. The summary starts as a git snapshot so peers can read
+  // branch + recent files immediately — no inference turn spent on set_summary just
+  // to become discoverable. set_summary overwrites it once the actual task is known.
   const tmuxTarget = resolveTmuxTarget(process.env);
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
-    summary: "",
+    summary: await buildAutoSummary(myCwd),
     machine: config.machine,
     tailscale_ip: config.tailscale_ip,
     tmux_pane: tmuxTarget?.pane ?? null,
