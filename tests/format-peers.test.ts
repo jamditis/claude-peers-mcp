@@ -1,0 +1,97 @@
+import { describe, expect, it } from "bun:test";
+import {
+  formatAge,
+  formatPeerList,
+  SUMMARY_DISPLAY_MAX_CHARS,
+} from "../shared/format-peers.ts";
+import type { Peer } from "../shared/types.ts";
+
+const NOW = Date.parse("2026-06-11T12:00:00.000Z");
+
+function peer(overrides: Partial<Peer>): Peer {
+  return {
+    id: "hoj-abc",
+    pid: 1234,
+    machine: "houseofjawn",
+    tailscale_ip: "100.122.208.15",
+    cwd: "/home/jamditis/projects/foo",
+    git_root: "/home/jamditis/projects/foo",
+    tty: "pts/3",
+    summary: "",
+    registered_at: "2026-06-11T11:00:00.000Z",
+    last_seen: "2026-06-11T11:59:52.000Z",
+    ...overrides,
+  };
+}
+
+describe("formatAge", () => {
+  it("scales seconds -> minutes -> hours -> days", () => {
+    expect(formatAge("2026-06-11T11:59:52.000Z", NOW)).toBe("8s");
+    expect(formatAge("2026-06-11T11:57:00.000Z", NOW)).toBe("3m");
+    expect(formatAge("2026-06-11T09:00:00.000Z", NOW)).toBe("3h");
+    expect(formatAge("2026-06-09T12:00:00.000Z", NOW)).toBe("2d");
+  });
+
+  it("clamps a future timestamp (clock skew) to 0s and hides an unparseable one", () => {
+    expect(formatAge("2026-06-11T12:00:30.000Z", NOW)).toBe("0s");
+    expect(formatAge("not-a-date", NOW)).toBeNull();
+  });
+});
+
+describe("formatPeerList", () => {
+  it("renders one head line per peer: id, machine, cwd, age", () => {
+    const text = formatPeerList([peer({})], "machine", NOW);
+    expect(text).toBe("1 peer (scope: machine):\nhoj-abc  houseofjawn  /home/jamditis/projects/foo  (seen 8s)");
+  });
+
+  it("indents a non-empty summary on its own line under the head line", () => {
+    const text = formatPeerList([peer({ summary: "[auto] main; recent: server.ts" })], "machine", NOW);
+    expect(text).toContain("\nhoj-abc  houseofjawn  /home/jamditis/projects/foo  (seen 8s)\n  [auto] main; recent: server.ts");
+  });
+
+  it("tags remote peers and shows the repo only when it differs from cwd", () => {
+    const remote = peer({
+      id: "leg-xyz",
+      machine: "legion2025",
+      is_remote: true,
+      cwd: "/work/render/scenes",
+      git_root: "/work/render",
+    });
+    const text = formatPeerList([remote], "machine", NOW);
+    expect(text).toContain("leg-xyz  legion2025 [remote]  /work/render/scenes  (repo /work/render)  (seen 8s)");
+  });
+
+  it("omits the repo annotation when git_root equals cwd or is null", () => {
+    const text = formatPeerList([peer({ git_root: null })], "machine", NOW);
+    expect(text).not.toContain("(repo");
+  });
+
+  it("collapses newlines in a summary and truncates past the display cap", () => {
+    const long = `Pattern: slack-brain DM auto-reply.\n${"x".repeat(SUMMARY_DISPLAY_MAX_CHARS)}`;
+    const text = formatPeerList([peer({ summary: long })], "machine", NOW);
+    const summaryLine = text.split("\n").find((l) => l.startsWith("  Pattern"));
+    expect(summaryLine).toBeDefined();
+    expect(summaryLine?.includes("\n")).toBe(false);
+    // 2-space indent + capped text + ellipsis
+    expect((summaryLine as string).length).toBeLessThanOrEqual(2 + SUMMARY_DISPLAY_MAX_CHARS + 1);
+    expect(summaryLine?.endsWith("…")).toBe(true);
+    // The protected-session marker at the head of the summary survives truncation.
+    expect(summaryLine).toContain("Pattern: slack-brain");
+  });
+
+  it("pluralizes the header and separates peers by single newlines", () => {
+    const text = formatPeerList(
+      [peer({}), peer({ id: "hoj-def", summary: "reviewing PR #7" })],
+      "repo",
+      NOW,
+    );
+    expect(text.startsWith("2 peers (scope: repo):\n")).toBe(true);
+    expect(text.split("\n")).toHaveLength(4); // header + head line + head line + summary line
+  });
+
+  it("hides the age when last_seen is unparseable rather than rendering NaN", () => {
+    const text = formatPeerList([peer({ last_seen: "garbage" })], "machine", NOW);
+    expect(text).not.toContain("NaN");
+    expect(text).not.toContain("(seen");
+  });
+});

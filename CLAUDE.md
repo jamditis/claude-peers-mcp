@@ -16,6 +16,7 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 - `shared/types.ts` — Shared types for the broker API, including `PROTOCOL_VERSION`, the `delivery_state` schema, and the per-session capability `token` field on `RegisterResponse`.
 - `shared/config.ts` — Config loader. Notable: `floor_remote_forwards` (default true, secure-by-default) leaves cross-machine forwards queued for `check_messages` instead of pushing them into the local pane; set it `false` to opt in to cross-node push. Local same-machine peers always push.
 - `shared/summarize.ts` — Git-context helpers (`getGitBranch`, `getRecentFiles`) and `buildAutoSummary`, which seeds a peer's summary at registration from git state (`[auto] <branch>; recent: <files>`, ≤140 chars, empty outside a git repo, never throws). `set_summary` overwrites the seed once the session knows its task.
+- `shared/format-peers.ts` — Compact `list_peers` rendering: `formatPeerList` (one head line per peer + indented summary, 200-char display cap that keeps the head of the summary, newlines collapsed) and `formatAge` (relative ages, clock-skew clamp, null on unparseable).
 - `cli.ts` — CLI utility for inspecting broker state and sending messages. `send` registers an ephemeral queued-only peer (no tmux pane, so never a delivery target), authenticates the send with that peer's token, and unregisters in a `finally`.
 
 ## Running

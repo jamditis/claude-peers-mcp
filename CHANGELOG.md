@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rewrote the MCP `instructions` block ~60% smaller and replaced the respond-immediately rule with messaging norms: telegraphic style, no acknowledgment-only replies, file-pointer for long content, honest urgency selection, and `check_messages` at task boundaries.
 - The injected peer line carries the `(reply: send_message ...)` hint only on `interrupt` messages, and tags `fyi` ones; `send_message`'s tool result is terse (`Sent to <id> (pushed|queued)`).
 - `set_summary` no longer echoes the summary text back in its tool result (the caller just wrote it), and the instructions block describes the auto-seeded summary instead of demanding a `set_summary` call on start.
+- Compact `list_peers` rendering (`shared/format-peers.ts`): one head line per peer (`<id>  <machine> [remote]  <cwd>  (repo <git_root-when-different>)  (seen <relative-age>)`) plus an indented summary line, replacing the ~8-line block per peer. Dropped fields were redundant or rarely consulted (repo when equal to cwd, tty, tailscale_ip — routing is by id) and raw ISO timestamps became relative ages. Summaries display capped at 200 chars (truncation keeps the head, where identifying markers live) with newlines collapsed.
 
 ### Fixed
 
