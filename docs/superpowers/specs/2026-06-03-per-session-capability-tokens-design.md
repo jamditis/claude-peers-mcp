@@ -18,7 +18,7 @@ plane trusts the `from_id`/`id` in each request body. So a local process can:
    victim's pane. *(NOT closed by tokens — needs uid-gating the transport; tracked as a separate
    issue)*
 
-Tokens close (1) completely. On a **single-user host** (host-b) that is the whole surface.
+Tokens close (1) completely. On a **single-user host** (node-b) that is the whole surface.
 On a **multi-user host** the residual (2) remains and is filed as a follow-up — uid-gating the
 control plane (per-uid Unix socket) is a transport change that touches the live broker and is out
 of scope here.

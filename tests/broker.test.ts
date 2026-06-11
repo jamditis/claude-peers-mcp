@@ -43,8 +43,8 @@ function createTestDb(): Database {
 
 describe("generatePeerId", () => {
   it("generates IDs with the correct prefix", () => {
-    const id = generatePeerId("hoj");
-    expect(id).toMatch(/^hoj-[a-z0-9]{8}$/);
+    const id = generatePeerId("alp");
+    expect(id).toMatch(/^alp-[a-z0-9]{8}$/);
   });
 
   it("generates different IDs across calls", () => {
@@ -62,7 +62,7 @@ describe("isAllowedIp", () => {
   });
 
   it("rejects unlisted IPs", () => {
-    expect(isAllowedIp("192.168.1.100", ALLOWED)).toBe(false);
+    expect(isAllowedIp("198.51.100.100", ALLOWED)).toBe(false);
     expect(isAllowedIp("8.8.8.8", ALLOWED)).toBe(false);
   });
 
@@ -80,30 +80,30 @@ describe("mergeGossipPeers", () => {
   it("inserts new remote peers", () => {
     const now = new Date().toISOString();
     mergeGossipPeers(db, [
-      { id: "ofj-aaaa1111", pid: 1000, machine: "host-b", tailscale_ip: "100.64.0.2",
+      { id: "bet-aaaa1111", pid: 1000, machine: "node-b", tailscale_ip: "100.64.0.2",
         cwd: "/home/peer", git_root: null, tty: null, summary: "working on bot",
         registered_at: now, last_seen: now, is_remote: false },
-    ], "host-b", "100.64.0.2");
+    ], "node-b", "100.64.0.2");
 
     const result = db.query("SELECT * FROM remote_peers").all() as any[];
     expect(result).toHaveLength(1);
-    expect(result[0].id).toBe("ofj-aaaa1111");
+    expect(result[0].id).toBe("bet-aaaa1111");
     expect(result[0].summary).toBe("working on bot");
   });
 
   it("updates existing remote peers on re-gossip", () => {
     const now = new Date().toISOString();
     mergeGossipPeers(db, [
-      { id: "ofj-aaaa1111", pid: 1000, machine: "host-b", tailscale_ip: "100.64.0.2",
+      { id: "bet-aaaa1111", pid: 1000, machine: "node-b", tailscale_ip: "100.64.0.2",
         cwd: "/tmp/old", git_root: null, tty: null, summary: "old summary",
         registered_at: now, last_seen: now, is_remote: false },
-    ], "host-b", "100.64.0.2");
+    ], "node-b", "100.64.0.2");
 
     mergeGossipPeers(db, [
-      { id: "ofj-aaaa1111", pid: 1000, machine: "host-b", tailscale_ip: "100.64.0.2",
+      { id: "bet-aaaa1111", pid: 1000, machine: "node-b", tailscale_ip: "100.64.0.2",
         cwd: "/tmp/new", git_root: null, tty: null, summary: "new summary",
         registered_at: now, last_seen: now, is_remote: false },
-    ], "host-b", "100.64.0.2");
+    ], "node-b", "100.64.0.2");
 
     const result = db.query("SELECT * FROM remote_peers").all() as any[];
     expect(result).toHaveLength(1);
@@ -122,16 +122,16 @@ describe("pruneRemotePeers", () => {
     const fresh = new Date().toISOString();
 
     db.run("INSERT INTO remote_peers (id, machine, tailscale_ip, pid, cwd, summary, registered_at, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      ["ofj-stale111", "host-b", "100.64.0.2", 1000, "/tmp", "", stale, stale]);
+      ["bet-stale111", "node-b", "100.64.0.2", 1000, "/tmp", "", stale, stale]);
     db.run("INSERT INTO remote_peers (id, machine, tailscale_ip, pid, cwd, summary, registered_at, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      ["leg-fresh222", "host-c", "100.64.0.3", 2000, "/tmp", "", fresh, fresh]);
+      ["gam-fresh222", "node-c", "100.64.0.3", 2000, "/tmp", "", fresh, fresh]);
 
     const pruned = pruneRemotePeers(db, 30_000);
     expect(pruned).toBe(1);
 
     const remaining = db.query("SELECT * FROM remote_peers").all() as any[];
     expect(remaining).toHaveLength(1);
-    expect(remaining[0].id).toBe("leg-fresh222");
+    expect(remaining[0].id).toBe("gam-fresh222");
   });
 });
 
@@ -140,24 +140,24 @@ describe("recordGossipResult", () => {
   const T0 = 1_000_000_000_000;
 
   it("healthy stays silent", () => {
-    const result = recordGossipResult(null, true, "", "host-b", T0, SUMMARY_INTERVAL_MS);
+    const result = recordGossipResult(null, true, "", "node-b", T0, SUMMARY_INTERVAL_MS);
     expect(result.state).toBeNull();
     expect(result.logLine).toBeNull();
   });
 
   it("first failure logs immediately and initializes state", () => {
-    const result = recordGossipResult(null, false, "The operation timed out.", "host-c", T0, SUMMARY_INTERVAL_MS);
+    const result = recordGossipResult(null, false, "The operation timed out.", "node-c", T0, SUMMARY_INTERVAL_MS);
     expect(result.state).toEqual({
       firstFailureAt: T0,
       lastSummaryAt: T0,
       failureCount: 1,
     });
-    expect(result.logLine).toBe("Gossip to host-c failed: The operation timed out.");
+    expect(result.logLine).toBe("Gossip to node-c failed: The operation timed out.");
   });
 
   it("continuing failure within summary interval is silent", () => {
     const prev = { firstFailureAt: T0, lastSummaryAt: T0, failureCount: 1 };
-    const result = recordGossipResult(prev, false, "timeout", "host-c", T0 + 5_000, SUMMARY_INTERVAL_MS);
+    const result = recordGossipResult(prev, false, "timeout", "node-c", T0 + 5_000, SUMMARY_INTERVAL_MS);
     expect(result.state).toEqual({
       firstFailureAt: T0,
       lastSummaryAt: T0,
@@ -168,66 +168,66 @@ describe("recordGossipResult", () => {
 
   it("continuing failure past summary interval logs a summary and updates lastSummaryAt", () => {
     const prev = { firstFailureAt: T0, lastSummaryAt: T0, failureCount: 60 };
-    const result = recordGossipResult(prev, false, "timeout", "host-c", T0 + SUMMARY_INTERVAL_MS, SUMMARY_INTERVAL_MS);
+    const result = recordGossipResult(prev, false, "timeout", "node-c", T0 + SUMMARY_INTERVAL_MS, SUMMARY_INTERVAL_MS);
     expect(result.state?.lastSummaryAt).toBe(T0 + SUMMARY_INTERVAL_MS);
     expect(result.state?.failureCount).toBe(61);
-    expect(result.logLine).toBe("Gossip to host-c still failing: 61 failures over 5m (latest: timeout)");
+    expect(result.logLine).toBe("Gossip to node-c still failing: 61 failures over 5m (latest: timeout)");
   });
 
   it("recovery logs and clears state", () => {
     const prev = { firstFailureAt: T0, lastSummaryAt: T0, failureCount: 60 };
-    const result = recordGossipResult(prev, true, "", "host-c", T0 + 5 * 60_000, SUMMARY_INTERVAL_MS);
+    const result = recordGossipResult(prev, true, "", "node-c", T0 + 5 * 60_000, SUMMARY_INTERVAL_MS);
     expect(result.state).toBeNull();
-    expect(result.logLine).toBe("Gossip to host-c recovered after 60 failures over 5m");
+    expect(result.logLine).toBe("Gossip to node-c recovered after 60 failures over 5m");
   });
 
   it("recovery after a single failure pluralizes correctly", () => {
     const prev = { firstFailureAt: T0, lastSummaryAt: T0, failureCount: 1 };
-    const result = recordGossipResult(prev, true, "", "host-b", T0 + 5_000, SUMMARY_INTERVAL_MS);
-    expect(result.logLine).toBe("Gossip to host-b recovered after 1 failure over 5s");
+    const result = recordGossipResult(prev, true, "", "node-b", T0 + 5_000, SUMMARY_INTERVAL_MS);
+    expect(result.logLine).toBe("Gossip to node-b recovered after 1 failure over 5s");
   });
 
   it("formats sub-minute durations in seconds", () => {
     const prev = { firstFailureAt: T0, lastSummaryAt: T0, failureCount: 5 };
-    const result = recordGossipResult(prev, true, "", "host-b", T0 + 30_000, SUMMARY_INTERVAL_MS);
+    const result = recordGossipResult(prev, true, "", "node-b", T0 + 30_000, SUMMARY_INTERVAL_MS);
     expect(result.logLine).toContain("over 30s");
   });
 
   it("formats sub-hour durations in minutes", () => {
     const prev = { firstFailureAt: T0, lastSummaryAt: T0, failureCount: 50 };
-    const result = recordGossipResult(prev, true, "", "host-b", T0 + 47 * 60_000, SUMMARY_INTERVAL_MS);
+    const result = recordGossipResult(prev, true, "", "node-b", T0 + 47 * 60_000, SUMMARY_INTERVAL_MS);
     expect(result.logLine).toContain("over 47m");
   });
 
   it("formats multi-hour durations in hours with one decimal", () => {
     const prev = { firstFailureAt: T0, lastSummaryAt: T0, failureCount: 999 };
-    const result = recordGossipResult(prev, true, "", "host-b", T0 + 90 * 60_000, SUMMARY_INTERVAL_MS);
+    const result = recordGossipResult(prev, true, "", "node-b", T0 + 90 * 60_000, SUMMARY_INTERVAL_MS);
     expect(result.logLine).toContain("over 1.5h");
   });
 
   it("formats just-under-a-minute as Xs, never rounding up to 60s", () => {
     const prev = { firstFailureAt: T0, lastSummaryAt: T0, failureCount: 5 };
-    const result = recordGossipResult(prev, true, "", "host-b", T0 + 59_999, SUMMARY_INTERVAL_MS);
+    const result = recordGossipResult(prev, true, "", "node-b", T0 + 59_999, SUMMARY_INTERVAL_MS);
     expect(result.logLine).toContain("over 59s");
     expect(result.logLine).not.toContain("over 60s");
   });
 
   it("formats just-under-an-hour as Xm, never rounding up to 60m", () => {
     const prev = { firstFailureAt: T0, lastSummaryAt: T0, failureCount: 5 };
-    const result = recordGossipResult(prev, true, "", "host-b", T0 + 3_599_999, SUMMARY_INTERVAL_MS);
+    const result = recordGossipResult(prev, true, "", "node-b", T0 + 3_599_999, SUMMARY_INTERVAL_MS);
     expect(result.logLine).toContain("over 59m");
     expect(result.logLine).not.toContain("over 60m");
   });
 
   it("formats exactly-one-minute as 1m (boundary into minute branch)", () => {
     const prev = { firstFailureAt: T0, lastSummaryAt: T0, failureCount: 5 };
-    const result = recordGossipResult(prev, true, "", "host-b", T0 + 60_000, SUMMARY_INTERVAL_MS);
+    const result = recordGossipResult(prev, true, "", "node-b", T0 + 60_000, SUMMARY_INTERVAL_MS);
     expect(result.logLine).toContain("over 1m");
   });
 
   it("formats exactly-one-hour as 1.0h (boundary into hour branch)", () => {
     const prev = { firstFailureAt: T0, lastSummaryAt: T0, failureCount: 5 };
-    const result = recordGossipResult(prev, true, "", "host-b", T0 + 3_600_000, SUMMARY_INTERVAL_MS);
+    const result = recordGossipResult(prev, true, "", "node-b", T0 + 3_600_000, SUMMARY_INTERVAL_MS);
     expect(result.logLine).toContain("over 1.0h");
   });
 });
@@ -238,15 +238,15 @@ describe("resolveTargetBroker", () => {
   afterEach(() => { db.close(); try { unlinkSync(TEST_DB); } catch {} });
 
   const siblings = [
-    { machine: "host-b", url: "http://100.64.0.2:7899" },
-    { machine: "host-c", url: "http://100.64.0.3:7899" },
+    { machine: "node-b", url: "http://100.64.0.2:7899" },
+    { machine: "node-c", url: "http://100.64.0.3:7899" },
   ];
 
   it("returns sibling URL for a known remote peer", () => {
     db.run("INSERT INTO remote_peers (id, machine, tailscale_ip, pid, cwd, summary, registered_at, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      ["ofj-target11", "host-b", "100.64.0.2", 1000, "/tmp", "", new Date().toISOString(), new Date().toISOString()]);
+      ["bet-target11", "node-b", "100.64.0.2", 1000, "/tmp", "", new Date().toISOString(), new Date().toISOString()]);
 
-    expect(resolveTargetBroker(db, "ofj-target11", siblings)).toBe("http://100.64.0.2:7899");
+    expect(resolveTargetBroker(db, "bet-target11", siblings)).toBe("http://100.64.0.2:7899");
   });
 
   it("returns null for unknown peer ID", () => {
@@ -257,19 +257,19 @@ describe("resolveTargetBroker", () => {
   // bounces "Peer not found" because the sibling config's machine casing differs
   // from the name the remote broker broadcasts in its gossip.
   it("resolves when sibling config casing differs from the broadcast machine name", () => {
-    // The HOST-D (2026-06-04) broadcasts machine "HOST-D"; the sibling was configured "host-d".
-    const lowercaseSiblings = [{ machine: "host-d", url: "http://100.64.0.4:7899" }];
+    // The NODE-D (2026-06-04) broadcasts machine "NODE-D"; the sibling was configured "node-d".
+    const lowercaseSiblings = [{ machine: "node-d", url: "http://100.64.0.4:7899" }];
     db.run("INSERT INTO remote_peers (id, machine, tailscale_ip, pid, cwd, summary, registered_at, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      ["a40-8qp0moq4", "HOST-D", "100.64.0.4", 3000, "C:\\WINDOWS\\system32", "", new Date().toISOString(), new Date().toISOString()]);
+      ["win-8qp0moq4", "NODE-D", "100.64.0.4", 3000, "C:\\WINDOWS\\system32", "", new Date().toISOString(), new Date().toISOString()]);
 
-    expect(resolveTargetBroker(db, "a40-8qp0moq4", lowercaseSiblings)).toBe("http://100.64.0.4:7899");
+    expect(resolveTargetBroker(db, "win-8qp0moq4", lowercaseSiblings)).toBe("http://100.64.0.4:7899");
   });
 
   it("matches machine names case-insensitively regardless of which side is uppercase", () => {
-    const uppercaseSiblings = [{ machine: "HOST-B", url: "http://100.64.0.2:7899" }];
+    const uppercaseSiblings = [{ machine: "NODE-B", url: "http://100.64.0.2:7899" }];
     db.run("INSERT INTO remote_peers (id, machine, tailscale_ip, pid, cwd, summary, registered_at, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      ["ofj-mixed111", "host-b", "100.64.0.2", 4000, "/tmp", "", new Date().toISOString(), new Date().toISOString()]);
+      ["bet-mixed111", "node-b", "100.64.0.2", 4000, "/tmp", "", new Date().toISOString(), new Date().toISOString()]);
 
-    expect(resolveTargetBroker(db, "ofj-mixed111", uppercaseSiblings)).toBe("http://100.64.0.2:7899");
+    expect(resolveTargetBroker(db, "bet-mixed111", uppercaseSiblings)).toBe("http://100.64.0.2:7899");
   });
 });

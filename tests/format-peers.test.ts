@@ -10,12 +10,12 @@ const NOW = Date.parse("2026-06-11T12:00:00.000Z");
 
 function peer(overrides: Partial<Peer>): Peer {
   return {
-    id: "hoj-abc",
+    id: "alp-abc",
     pid: 1234,
-    machine: "houseofjawn",
-    tailscale_ip: "100.122.208.15",
-    cwd: "/home/jamditis/projects/foo",
-    git_root: "/home/jamditis/projects/foo",
+    machine: "node-alpha",
+    tailscale_ip: "100.64.0.10",
+    cwd: "/workspace/projects/foo",
+    git_root: "/workspace/projects/foo",
     tty: "pts/3",
     summary: "",
     registered_at: "2026-06-11T11:00:00.000Z",
@@ -41,24 +41,24 @@ describe("formatAge", () => {
 describe("formatPeerList", () => {
   it("renders one head line per peer: id, machine, cwd, age", () => {
     const text = formatPeerList([peer({})], "machine", NOW);
-    expect(text).toBe("1 peer (scope: machine):\nhoj-abc  houseofjawn  /home/jamditis/projects/foo  (seen 8s)");
+    expect(text).toBe("1 peer (scope: machine):\nalp-abc  node-alpha  /workspace/projects/foo  (seen 8s)");
   });
 
   it("indents a non-empty summary on its own line under the head line", () => {
     const text = formatPeerList([peer({ summary: "[auto] main; recent: server.ts" })], "machine", NOW);
-    expect(text).toContain("\nhoj-abc  houseofjawn  /home/jamditis/projects/foo  (seen 8s)\n  [auto] main; recent: server.ts");
+    expect(text).toContain("\nalp-abc  node-alpha  /workspace/projects/foo  (seen 8s)\n  [auto] main; recent: server.ts");
   });
 
   it("tags remote peers and shows the repo only when it differs from cwd", () => {
     const remote = peer({
-      id: "leg-xyz",
-      machine: "legion2025",
+      id: "gam-xyz",
+      machine: "node-gamma",
       is_remote: true,
       cwd: "/work/render/scenes",
       git_root: "/work/render",
     });
     const text = formatPeerList([remote], "machine", NOW);
-    expect(text).toContain("leg-xyz  legion2025 [remote]  /work/render/scenes  (repo /work/render)  (seen 8s)");
+    expect(text).toContain("gam-xyz  node-gamma [remote]  /work/render/scenes  (repo /work/render)  (seen 8s)");
   });
 
   it("omits the repo annotation when git_root equals cwd or is null", () => {
@@ -81,7 +81,7 @@ describe("formatPeerList", () => {
 
   it("pluralizes the header and separates peers by single newlines", () => {
     const text = formatPeerList(
-      [peer({}), peer({ id: "hoj-def", summary: "reviewing PR #7" })],
+      [peer({}), peer({ id: "alp-def", summary: "reviewing PR #7" })],
       "repo",
       NOW,
     );
