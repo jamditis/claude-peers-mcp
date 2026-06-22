@@ -78,7 +78,7 @@ The delivery logic in `delivery.ts` is written to be pure and testable so the te
 
 ### POSIX-only test suite (issue #22)
 
-The test suite is POSIX-only and does not run on native Windows ([#22](https://github.com/example-org/claude-peers-mcp/issues/22)). `integration.test.ts` writes shell-based `tmux` stub scripts (shebang + executable bit), uses named pipes and Unix temp paths, and the delivery/broker tests rely on signal-based liveness checks with no native-Windows equivalent. On native Windows, `bun test` fails the `integration.test.ts` cases that wait on a marker the `tmux` stub never writes. This is a known limitation, not a regression — the broker daemon runs on Windows; only the harness is POSIX-bound. Develop and run the suite on Linux or macOS (or WSL).
+The test suite is POSIX-only and does not run on native Windows ([#22](https://github.com/jamditis/claude-peers-mcp/issues/22)). `integration.test.ts` writes shell-based `tmux` stub scripts (shebang + executable bit), uses named pipes and Unix temp paths, and the delivery/broker tests rely on signal-based liveness checks with no native-Windows equivalent. On native Windows, `bun test` fails the `integration.test.ts` cases that wait on a marker the `tmux` stub never writes. This is a known limitation, not a regression — the broker daemon runs on Windows; only the harness is POSIX-bound. Develop and run the suite on Linux or macOS (or WSL).
 
 ## CI gate
 

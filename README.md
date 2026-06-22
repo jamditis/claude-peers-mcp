@@ -1,6 +1,6 @@
 # claude-peers
 
-[![CI](https://github.com/example-org/claude-peers-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/example-org/claude-peers-mcp/actions/workflows/ci.yml)
+[![CI](https://github.com/jamditis/claude-peers-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/jamditis/claude-peers-mcp/actions/workflows/ci.yml)
 
 Let your Claude Code instances find each other and talk. When you're running several sessions across different projects — or across several machines — any Claude can discover the others and send messages that get typed straight into the recipient's session.
 
@@ -20,7 +20,7 @@ Let your Claude Code instances find each other and talk. When you're running sev
 ### 1. Install
 
 ```bash
-git clone https://github.com/example-org/claude-peers-mcp.git ~/claude-peers-mcp   # or wherever you like
+git clone https://github.com/jamditis/claude-peers-mcp.git ~/claude-peers-mcp   # or wherever you like
 cd ~/claude-peers-mcp
 bun install
 ```
@@ -40,7 +40,7 @@ The broker and MCP server read their settings from a JSON config file, not from 
 }
 ```
 
-All six fields shown are required. `siblings: []` and `allowed_ips: ["127.0.0.1"]` keep everything on one machine — see [Multi-machine setup](#multi-machine-setup) to federate across hosts. The default path is `~/.claude-peers.json`; override it with `CLAUDE_PEERS_CONFIG`. See [Configuration](#configuration) for the full field reference. (A future single-host default that removes this step is tracked as [issue #21](https://github.com/example-org/claude-peers-mcp/issues/21).)
+All six fields shown are required. `siblings: []` and `allowed_ips: ["127.0.0.1"]` keep everything on one machine — see [Multi-machine setup](#multi-machine-setup) to federate across hosts. The default path is `~/.claude-peers.json`; override it with `CLAUDE_PEERS_CONFIG`. See [Configuration](#configuration) for the full field reference. (A future single-host default that removes this step is tracked as [issue #21](https://github.com/jamditis/claude-peers-mcp/issues/21).)
 
 ### 3. Register the MCP server
 
@@ -117,7 +117,7 @@ The control plane is authenticated per session. When a Claude Code session regis
 
 The broker binds each call to its principal: `from_id` for `/send-message`, `id` for the rest. A call must present the token that matches that principal or it gets a `401`. So a local process can no longer forge another peer's `from_id` to drive a message — and the tmux-pane injection that rides on it — into that peer's session: the forged id looks up the wrong token and fails the gate. (Before this, the broker trusted `from_id` outright.)
 
-`/list-peers` is read-only and token-exempt, but it strips the token column from its output so the secret is never serialized to a caller. The federation routes (`/gossip`, `/forward-message`) are also token-exempt — tokens never cross a machine boundary — and stay gated only by the source-IP allowlist. On a single host that allowlist must include `127.0.0.1`, so a local process can still reach a federation route to queue a forged-sender message without a token; that residual is tracked as [issue #15](https://github.com/example-org/claude-peers-mcp/issues/15) and is mitigated today by `floor_remote_forwards` defaulting true (a forward only queues — it never auto-pastes into a pane). Full cross-machine federation auth is [issue #4](https://github.com/example-org/claude-peers-mcp/issues/4).
+`/list-peers` is read-only and token-exempt, but it strips the token column from its output so the secret is never serialized to a caller. The federation routes (`/gossip`, `/forward-message`) are also token-exempt — tokens never cross a machine boundary — and stay gated only by the source-IP allowlist. On a single host that allowlist must include `127.0.0.1`, so a local process can still reach a federation route to queue a forged-sender message without a token; that residual is tracked as [issue #15](https://github.com/jamditis/claude-peers-mcp/issues/15) and is mitigated today by `floor_remote_forwards` defaulting true (a forward only queues — it never auto-pastes into a pane). Full cross-machine federation auth is [issue #4](https://github.com/jamditis/claude-peers-mcp/issues/4).
 
 To neutralize bracketed-paste escape injection, the broker strips C0/C1 control characters (including `ESC` and the C1 CSI byte) from every message body before it reaches a pane.
 
@@ -131,9 +131,9 @@ cd ~/claude-peers-mcp && git pull
 
 Nothing else is required. The next Claude Code session to start spawns an MCP server from the new code, which checks the running broker's protocol version on `/health` and retires a stale broker automatically before launching the new one. Existing sessions keep working against their broker until they restart.
 
-During the window where some machines have pulled and others have not, a pre-v4 node ignores message urgency and pushes on send — exactly the old behavior, no message loss. Pull all federated nodes to close the window (tracked in [#30](https://github.com/example-org/claude-peers-mcp/issues/30)).
+During the window where some machines have pulled and others have not, a pre-v4 node ignores message urgency and pushes on send — exactly the old behavior, no message loss. Pull all federated nodes to close the window (tracked in [#30](https://github.com/jamditis/claude-peers-mcp/issues/30)).
 
-Watch [releases](https://github.com/example-org/claude-peers-mcp/releases) to be notified of new versions; the [changelog](CHANGELOG.md) records what each one changes.
+Watch [releases](https://github.com/jamditis/claude-peers-mcp/releases) to be notified of new versions; the [changelog](CHANGELOG.md) records what each one changes.
 
 ## Upgrading a live broker to v3
 
@@ -173,9 +173,9 @@ To federate, give each node a config that lists the others as `siblings` and all
 
 Each node lists the other nodes under `siblings` and puts those nodes' IPs (plus `127.0.0.1`) in `allowed_ips`, so brokers accept each other's gossip and forwards. The allowlists must be symmetric. Per-host example configs live in [`deploy/configs/`](deploy/configs/).
 
-By default a forward arriving from another machine is left queued for `check_messages` rather than auto-pasted into your live pane (`floor_remote_forwards`, see [Configuration](#configuration)) — a remote machine cannot type into your session until you opt in. The residual federation-auth gaps are tracked as [issue #15](https://github.com/example-org/claude-peers-mcp/issues/15) and [issue #4](https://github.com/example-org/claude-peers-mcp/issues/4).
+By default a forward arriving from another machine is left queued for `check_messages` rather than auto-pasted into your live pane (`floor_remote_forwards`, see [Configuration](#configuration)) — a remote machine cannot type into your session until you opt in. The residual federation-auth gaps are tracked as [issue #15](https://github.com/jamditis/claude-peers-mcp/issues/15) and [issue #4](https://github.com/jamditis/claude-peers-mcp/issues/4).
 
-For a long-lived federated node, run the broker under a supervisor so it never idles out. [`deploy/install.sh`](deploy/install.sh) installs against the per-machine config files; [`deploy/claude-peers-broker.service`](deploy/) is a sample systemd unit. It contains placeholder values (`User=peer`, `HOME=/home/peer`, and the `broker.ts` path under `/home/peer/projects/`), so edit those for your own account and clone location before enabling it — otherwise the service starts under the wrong user or fails outright. A supervised broker sets `CLAUDE_PEERS_IDLE_EXIT_MS=0` so it never self-exits and restart-loops. On Windows, [`deploy/install-windows-broker-task.ps1`](deploy/) registers the equivalent Task Scheduler entry. (Note: the tmux delivery path is POSIX-oriented today, but native Windows broker spawn and a Windows `kill-broker` landed via [PR #19](https://github.com/example-org/claude-peers-mcp/pull/19), merged 2026-06-04.)
+For a long-lived federated node, run the broker under a supervisor so it never idles out. [`deploy/install.sh`](deploy/install.sh) installs against the per-machine config files; [`deploy/claude-peers-broker.service`](deploy/) is a sample systemd unit. It contains placeholder values (`User=peer`, `HOME=/home/peer`, and the `broker.ts` path under `/home/peer/projects/`), so edit those for your own account and clone location before enabling it — otherwise the service starts under the wrong user or fails outright. A supervised broker sets `CLAUDE_PEERS_IDLE_EXIT_MS=0` so it never self-exits and restart-loops. On Windows, [`deploy/install-windows-broker-task.ps1`](deploy/) registers the equivalent Task Scheduler entry. (Note: the tmux delivery path is POSIX-oriented today, but native Windows broker spawn and a Windows `kill-broker` landed via [PR #19](https://github.com/jamditis/claude-peers-mcp/pull/19), merged 2026-06-04.)
 
 ## CLI
 
@@ -191,7 +191,7 @@ bun cli.ts ping-siblings     # ping each configured sibling broker, report laten
 bun cli.ts kill-broker       # stop the broker
 ```
 
-`bun cli.ts send` is authenticated like any other session: it registers a short-lived, queued-only ephemeral peer (no tmux pane, so it is never a delivery target) to obtain a capability token, sends under that identity, and unregisters automatically in a `finally`. It does not bypass the token gate. (The `cli.ts kill-broker` command locates the broker process via `netstat -ano` on Windows and `lsof` elsewhere, so it works on both ([PR #19](https://github.com/example-org/claude-peers-mcp/pull/19)); a supervised broker is better stopped through its service or Task Scheduler entry.)
+`bun cli.ts send` is authenticated like any other session: it registers a short-lived, queued-only ephemeral peer (no tmux pane, so it is never a delivery target) to obtain a capability token, sends under that identity, and unregisters automatically in a `finally`. It does not bypass the token gate. (The `cli.ts kill-broker` command locates the broker process via `netstat -ano` on Windows and `lsof` elsewhere, so it works on both ([PR #19](https://github.com/jamditis/claude-peers-mcp/pull/19)); a supervised broker is better stopped through its service or Task Scheduler entry.)
 
 ## Configuration
 
@@ -208,7 +208,7 @@ These live in `~/.claude-peers.json` (or the path in `CLAUDE_PEERS_CONFIG`). The
 | `siblings`              | yes      | Array of `{ "machine": "<name>", "url": "http://<ip>:<port>" }` for federated nodes. `[]` for single-host. |
 | `allowed_ips`           | yes      | Source IPs allowed to reach the federation routes. Include `127.0.0.1`; add each sibling's IP to federate. |
 | `db_path`               | no       | SQLite database path. Falls back to `CLAUDE_PEERS_DB`, then `~/.claude-peers.db`.             |
-| `floor_remote_forwards` | no       | Default `true`. A message forwarded from a sibling broker is left queued for `check_messages` rather than pushed into your live pane (its `push_after` is NULL, so neither the immediate inject nor a later heartbeat drain or flush can auto-paste it). Set `false` to opt in to cross-node push. Local same-machine peers always push. This is the secure default — a remote machine can't auto-paste into your session unless you opt in, because the federation routes are authenticated only by the source-IP allowlist ([issue #15](https://github.com/example-org/claude-peers-mcp/issues/15), [issue #4](https://github.com/example-org/claude-peers-mcp/issues/4)). |
+| `floor_remote_forwards` | no       | Default `true`. A message forwarded from a sibling broker is left queued for `check_messages` rather than pushed into your live pane (its `push_after` is NULL, so neither the immediate inject nor a later heartbeat drain or flush can auto-paste it). Set `false` to opt in to cross-node push. Local same-machine peers always push. This is the secure default — a remote machine can't auto-paste into your session unless you opt in, because the federation routes are authenticated only by the source-IP allowlist ([issue #15](https://github.com/jamditis/claude-peers-mcp/issues/15), [issue #4](https://github.com/jamditis/claude-peers-mcp/issues/4)). |
 | `push_delay_ms`         | no       | Default `120000` (2 minutes). How long a `normal`-urgency message stays queued before the broker pushes it anyway. The window gives the recipient a chance to drain it via `check_messages` at a task boundary — the cheap path that doesn't interrupt their session. |
 | `auto_summary`          | no       | Default `true`. Seed each session's summary at registration from git state (`[auto] <branch>; recent: <files>`). Summaries gossip to sibling brokers like `cwd` and `git_root` already do; set `false` to keep summaries empty until a session calls `set_summary`. |
 
@@ -238,8 +238,8 @@ bun run lint        # biome lint --error-on-warnings .
 bun test            # the test suite
 ```
 
-CI runs all three on every push and pull request, plus a CodeQL security scan, and treats them as required checks. The Biome formatter is left off on purpose so adopting the linter doesn't reflow the tree. The test suite is POSIX-only — it shells out to `tmux` — so on Windows `bun test` won't pass even though the broker itself runs there ([issue #22](https://github.com/example-org/claude-peers-mcp/issues/22)).
+CI runs all three on every push and pull request, plus a CodeQL security scan, and treats them as required checks. The Biome formatter is left off on purpose so adopting the linter doesn't reflow the tree. The test suite is POSIX-only — it shells out to `tmux` — so on Windows `bun test` won't pass even though the broker itself runs there ([issue #22](https://github.com/jamditis/claude-peers-mcp/issues/22)).
 
 ## Credits
 
-Forked from [upstream-author/claude-peers-mcp](https://github.com/upstream-author/claude-peers-mcp), which introduced peer discovery and messaging for Claude Code. This fork adds broker-side delivery: messages are typed straight into the recipient's tmux pane through a lease state machine, so a peer message arrives in a running session instead of waiting for a manual `check_messages`. It also adds per-session capability-token auth, cross-machine federation over Tailscale, and a CI/CodeQL/lint gate.
+Forked from [louislva/claude-peers-mcp](https://github.com/louislva/claude-peers-mcp), which introduced peer discovery and messaging for Claude Code. This fork adds broker-side delivery: messages are typed straight into the recipient's tmux pane through a lease state machine, so a peer message arrives in a running session instead of waiting for a manual `check_messages`. It also adds per-session capability-token auth, cross-machine federation over Tailscale, and a CI/CodeQL/lint gate.

@@ -62,5 +62,5 @@ This release turns claude-peers from a single-machine discovery tool into a fede
 - Drain an in-flight remote forward before a retire or idle-exit so cross-machine mail is not dropped on shutdown (#16).
 - Strip C0/C1 control characters (including ESC and the C1 CSI byte) before injection to neutralize bracketed-paste escape injection (#16).
 
-[0.3.0]: https://github.com/example-org/claude-peers-mcp/releases/tag/v0.3.0
-[0.2.0]: https://github.com/example-org/claude-peers-mcp/releases/tag/v0.2.0
+[0.3.0]: https://github.com/jamditis/claude-peers-mcp/releases/tag/v0.3.0
+[0.2.0]: https://github.com/jamditis/claude-peers-mcp/releases/tag/v0.2.0

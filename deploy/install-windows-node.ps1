@@ -5,12 +5,12 @@
 #   .\install-windows-node.ps1
 #
 # Or directly from GitHub once committed + pushed:
-#   irm https://raw.githubusercontent.com/example-org/claude-peers-mcp/main/deploy/install-windows-node.ps1 | iex
+#   irm https://raw.githubusercontent.com/jamditis/claude-peers-mcp/main/deploy/install-windows-node.ps1 | iex
 #
 # What it does (in order):
 #   0. Verifies preconditions: git available, running elevated
 #   1. Installs Bun if missing
-#   2. Clones example-org/claude-peers-mcp if missing
+#   2. Clones jamditis/claude-peers-mcp if missing
 #   3. Runs `bun install`
 #   4. Copies deploy/configs/node-d.json to %USERPROFILE%\.claude-peers.json
 #   5. Adds Windows Firewall rule for inbound TCP 7899, restricted to sibling IPs
@@ -27,7 +27,7 @@
 $ErrorActionPreference = "Stop"
 
 $REPO_PATH = Join-Path $env:USERPROFILE "claude-peers-mcp"
-$REPO_URL = "https://github.com/example-org/claude-peers-mcp.git"
+$REPO_URL = "https://github.com/jamditis/claude-peers-mcp.git"
 $CONFIG_TARGET = Join-Path $env:USERPROFILE ".claude-peers.json"
 $BUN_BIN = Join-Path $env:USERPROFILE ".bun\bin\bun.exe"
 
