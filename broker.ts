@@ -14,7 +14,7 @@ import {
   isFederationRoute, isLoopback, isMessageDelivered, isPidDead,
   migrateMessagesSchema, nextDeliverable, pidProbe, promoteQueuedForFlush,
   pruneMessages, pushAfterFor, reclaimIfExpired, reclaimLeaklessDelivering,
-  releasableQueuedPrefix, releaseToQueued, resetDeliveringOnStart, type TmuxSpawn,
+  releasableQueuedPrefix, releaseToQueued, resetDeliveringOnStart, type TmuxQuery, type TmuxSpawn,
 } from "./delivery.ts";
 import { loadConfig, type SiblingConfig } from "./shared/config.ts";
 import type {
@@ -370,6 +370,19 @@ if (import.meta.main) {
     finally { clearTimeout(timer); }
   };
 
+  // Same shape as realTmuxSpawn but pipes stdout so a readiness probe can read the pane's
+  // foreground command. Used only for the pre-send pane check (display-message), never for
+  // the inject itself. Subject to the same kill-timer so a hung probe cannot block delivery.
+  const realTmuxQuery: TmuxQuery = async (args) => {
+    const proc = Bun.spawn(args, { stdout: "pipe", stderr: "ignore" });
+    const timer = setTimeout(() => { try { proc.kill(); } catch {} }, TMUX_TIMEOUT_MS);
+    try {
+      const stdout = await new Response(proc.stdout).text();
+      const exitCode = await proc.exited;
+      return { exitCode, stdout };
+    } finally { clearTimeout(timer); }
+  };
+
   function peerDelivery(toId: string): { kind: string; pane: string | null; socket: string | null } | null {
     return db.query("SELECT delivery_kind AS kind, tmux_pane AS pane, tmux_socket AS socket FROM peers WHERE id = ?")
       .get(toId) as { kind: string; pane: string | null; socket: string | null } | null;
@@ -412,7 +425,12 @@ if (import.meta.main) {
     inFlightDeliveries++;
     try {
       const text = formatPeerMessage(row);
-      const ok = await deliverViaTmux(target.pane, target.socket, text, realTmuxSpawn);
+      // The query arg enables a pre-send readiness probe: if the pane's foreground process is
+      // a bare shell rather than a live Claude session, deliverViaTmux skips the inject and
+      // returns false, so the row stays queued instead of pasting into a shell. This catches
+      // the outlived-pane case below before the text lands; the post-send liveness re-probe
+      // still guards the narrower race where the peer dies during the await.
+      const ok = await deliverViaTmux(target.pane, target.socket, text, realTmuxSpawn, realTmuxQuery);
       // A 0 exit from send-keys is not proof a live peer consumed the text: the recipient can
       // die after the lease is claimed (before or during the await), leaving a pane that
       // outlived the Claude process — now a bare shell — that still accepts keystrokes and exits

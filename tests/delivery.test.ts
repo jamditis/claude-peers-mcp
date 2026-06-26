@@ -2,13 +2,14 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { unlinkSync } from "node:fs";
 import {
-  buildTmuxArgs, claimForDelivery, confirmDelivered, deliverViaTmux,
+  buildPaneCommandArgs, buildTmuxArgs, claimForDelivery, classifyPaneReadiness,
+  confirmDelivered, deliverViaTmux,
   ensureMessagesTable, findLeaklessDelivering, formatPeerMessage, hasDuePush,
   isFederationRoute, isLoopback, isMessageDelivered, isPidDead,
   migrateMessagesSchema, nextDeliverable, PASTE_END, PASTE_START,
-  promoteQueuedForFlush, pruneMessages, pushAfterFor, reclaimIfExpired,
+  probePaneReadiness, promoteQueuedForFlush, pruneMessages, pushAfterFor, reclaimIfExpired,
   reclaimLeaklessDelivering, releasableQueuedPrefix, releaseToQueued,
-  resetDeliveringOnStart, resolveTmuxTarget, type TmuxSpawn,
+  resetDeliveringOnStart, resolveTmuxTarget, type TmuxQuery, type TmuxSpawn,
 } from "../delivery.ts";
 
 const DB = "/tmp/test-delivery-migration.db";
@@ -489,6 +490,79 @@ describe("deliverViaTmux", () => {
   it("returns false when the spawn throws (timeout/abort)", async () => {
     const spawn: TmuxSpawn = async () => { throw new Error("timed out"); };
     expect(await deliverViaTmux("%1", null, "hi", spawn)).toBe(false);
+  });
+  it("injects when the readiness probe reports a Claude pane (node)", async () => {
+    let sent = false;
+    const spawn: TmuxSpawn = async () => { sent = true; return { exitCode: 0 }; };
+    const query: TmuxQuery = async () => ({ exitCode: 0, stdout: "node\n" });
+    expect(await deliverViaTmux("%1", null, "hi", spawn, query)).toBe(true);
+    expect(sent).toBe(true);
+  });
+  it("defers (false) and never injects when the pane is a bare shell", async () => {
+    let sent = false;
+    const spawn: TmuxSpawn = async () => { sent = true; return { exitCode: 0 }; };
+    const query: TmuxQuery = async () => ({ exitCode: 0, stdout: "bash\n" });
+    expect(await deliverViaTmux("%1", null, "hi", spawn, query)).toBe(false);
+    expect(sent).toBe(false); // the wrong text must not land in the shell
+  });
+  it("fails open and injects when the probe errors", async () => {
+    let sent = false;
+    const spawn: TmuxSpawn = async () => { sent = true; return { exitCode: 0 }; };
+    const query: TmuxQuery = async () => { throw new Error("probe blew up"); };
+    expect(await deliverViaTmux("%1", null, "hi", spawn, query)).toBe(true);
+    expect(sent).toBe(true);
+  });
+});
+
+describe("buildPaneCommandArgs", () => {
+  it("asks tmux for the pane foreground command, with -S when socketed", () => {
+    expect(buildPaneCommandArgs("%2", "/tmp/sock")).toEqual([
+      "tmux", "-S", "/tmp/sock", "display-message", "-p", "-t", "%2", "#{pane_current_command}",
+    ]);
+  });
+  it("omits -S when there is no socket", () => {
+    expect(buildPaneCommandArgs("%2", null)).toEqual([
+      "tmux", "display-message", "-p", "-t", "%2", "#{pane_current_command}",
+    ]);
+  });
+});
+
+describe("classifyPaneReadiness", () => {
+  it("treats a live Claude foreground (node/bun) as ready", () => {
+    expect(classifyPaneReadiness("node").ready).toBe(true);
+    expect(classifyPaneReadiness("bun").ready).toBe(true);
+  });
+  it("treats a bare shell as not ready", () => {
+    // POSIX shells plus the cross-platform fallbacks (PowerShell, nushell, xonsh, elvish).
+    for (const sh of ["bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh", "csh",
+      "pwsh", "powershell", "nu", "nushell", "xonsh", "elvish"]) {
+      expect(classifyPaneReadiness(sh).ready).toBe(false);
+    }
+  });
+  it("normalizes case and surrounding whitespace from tmux output", () => {
+    expect(classifyPaneReadiness("  BASH\n").ready).toBe(false);
+    expect(classifyPaneReadiness(" Node \n").ready).toBe(true);
+  });
+  it("fails open on an empty or unrecognized command", () => {
+    expect(classifyPaneReadiness("").ready).toBe(true);
+    expect(classifyPaneReadiness("python3").ready).toBe(true);
+  });
+});
+
+describe("probePaneReadiness", () => {
+  it("classifies a clean probe by its reported command", async () => {
+    const node: TmuxQuery = async () => ({ exitCode: 0, stdout: "node" });
+    const shell: TmuxQuery = async () => ({ exitCode: 0, stdout: "zsh" });
+    expect((await probePaneReadiness("%1", null, node)).ready).toBe(true);
+    expect((await probePaneReadiness("%1", null, shell)).ready).toBe(false);
+  });
+  it("fails open on a non-zero probe exit", async () => {
+    const query: TmuxQuery = async () => ({ exitCode: 1, stdout: "" });
+    expect((await probePaneReadiness("%1", null, query)).ready).toBe(true);
+  });
+  it("fails open when the probe throws", async () => {
+    const query: TmuxQuery = async () => { throw new Error("no tmux"); };
+    expect((await probePaneReadiness("%1", null, query)).ready).toBe(true);
   });
 });
 
