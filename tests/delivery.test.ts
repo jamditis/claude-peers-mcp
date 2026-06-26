@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { unlinkSync } from "node:fs";
 import {
   buildPaneCommandArgs, buildTmuxArgs, claimForDelivery, classifyPaneReadiness,
-  confirmDelivered, deliverViaTmux,
+  confirmDelivered, decideChannelPush, DEFAULT_CHANNEL_PUSH_CAP, deliverViaTmux,
   ensureMessagesTable, findLeaklessDelivering, formatPeerMessage, hasDuePush,
   isFederationRoute, isLoopback, isMessageDelivered, isPidDead,
   migrateMessagesSchema, nextDeliverable, PASTE_END, PASTE_START,
@@ -733,5 +733,43 @@ describe("pruneMessages", () => {
     expect(res.queuedPruned).toBe(0);
     const texts = (db.query("SELECT text FROM messages").all() as any[]).map((r) => r.text);
     expect(texts).toEqual(["in-flight"]);
+  });
+});
+
+describe("decideChannelPush", () => {
+  const CAP = 3;
+
+  it("pushes a queued row that is under the cap", () => {
+    expect(decideChannelPush("queued", 0, CAP).push).toBe(true);
+    expect(decideChannelPush("queued", CAP - 1, CAP).push).toBe(true);
+  });
+
+  it("stops at and past the cap (a never-reading session is not pushed forever)", () => {
+    expect(decideChannelPush("queued", CAP, CAP).push).toBe(false);
+    expect(decideChannelPush("queued", CAP + 5, CAP).push).toBe(false);
+    expect(decideChannelPush("queued", CAP, CAP).reason).toContain("cap");
+  });
+
+  it("never pushes a non-queued row, even under the cap", () => {
+    // 'delivering' already holds a live acked attempt; 'delivered' is done. The channel
+    // tier must not re-notify either, regardless of attempt count.
+    expect(decideChannelPush("delivering", 0, CAP).push).toBe(false);
+    expect(decideChannelPush("delivered", 0, CAP).push).toBe(false);
+  });
+
+  it("treats a cap of 0 or less as the tier disabled", () => {
+    expect(decideChannelPush("queued", 0, 0).push).toBe(false);
+    expect(decideChannelPush("queued", 0, -1).push).toBe(false);
+  });
+
+  // Never-ack is not asserted here: the decision shape ({push, reason}, no ack/lease/claim)
+  // is guaranteed by ChannelPushDecision at compile time, and the runtime invariant -- that
+  // nothing reaches 'delivered' without a lease token -- lives on confirmDelivered, covered
+  // by the "confirm requires the matching token" test in the lease-state-machine block.
+
+  it("ships a positive default cap so the bound is on by default", () => {
+    expect(DEFAULT_CHANNEL_PUSH_CAP).toBeGreaterThan(0);
+    expect(decideChannelPush("queued", 0, DEFAULT_CHANNEL_PUSH_CAP).push).toBe(true);
+    expect(decideChannelPush("queued", DEFAULT_CHANNEL_PUSH_CAP, DEFAULT_CHANNEL_PUSH_CAP).push).toBe(false);
   });
 });
