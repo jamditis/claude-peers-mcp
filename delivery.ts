@@ -283,13 +283,17 @@ export function buildTmuxArgs(pane: string, socket: string | null, text: string)
 // prove Claude was at its input box. If the pane's foreground process is a shell, the
 // injected Enter runs the pasted text as a shell command line instead of submitting a
 // Claude turn. Claude Code runs under node, so a live Claude pane reports node (or bun),
-// never one of these. The list covers the common POSIX shells plus the cross-platform ones
-// a pane can fall back to (PowerShell on the Windows install path, nushell, xonsh, elvish),
-// so the guard catches an outlived pane on every supported host, not just Unix ones.
-// Compared lowercased against pane_current_command, which tmux reports as the basename of
-// the pane's foreground command.
+// never one of these. The list covers the common POSIX shells, the BusyBox/embedded shells
+// a container or Alpine pane drops to (ash, hush, mksh), and the cross-platform fallbacks
+// (PowerShell on the Windows install path, nushell, xonsh, elvish), so the guard catches an
+// outlived pane on every supported host, not just a desktop Unix one. Compared lowercased
+// against pane_current_command, which tmux reports as the basename of the pane's foreground
+// command. The detector is a denylist on purpose: an unrecognized foreground fails open and
+// injects, so a live Claude pane is never starved by a name we did not anticipate; the cost
+// of a missing shell name is one stray paste into an already-dead session, not lost mail.
 const SHELL_COMMANDS = new Set([
   "bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh", "csh",
+  "ash", "hush", "mksh",
   "pwsh", "powershell", "nu", "nushell", "xonsh", "elvish",
 ]);
 

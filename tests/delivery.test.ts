@@ -533,8 +533,10 @@ describe("classifyPaneReadiness", () => {
     expect(classifyPaneReadiness("bun").ready).toBe(true);
   });
   it("treats a bare shell as not ready", () => {
-    // POSIX shells plus the cross-platform fallbacks (PowerShell, nushell, xonsh, elvish).
+    // POSIX shells, the BusyBox/embedded shells (ash, hush, mksh) a container or Alpine pane
+    // drops to, plus the cross-platform fallbacks (PowerShell, nushell, xonsh, elvish).
     for (const sh of ["bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh", "csh",
+      "ash", "hush", "mksh",
       "pwsh", "powershell", "nu", "nushell", "xonsh", "elvish"]) {
       expect(classifyPaneReadiness(sh).ready).toBe(false);
     }
