@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Stuck-pane escalation for tmux delivery (#42, follow-up to the #5 readiness probe): when a recipient pane stays a bare shell across `DEFAULT_DEFERRAL_ESCALATION_CAP` consecutive deferrals, the broker emits one louder structured log instead of only the per-attempt defer line, so a permanently shelled session — whose still-live pid the dead-pid sweep cannot reap — does not silently stop receiving mail. The streak is counted per recipient, resets on any delivered (or otherwise not-deferred) attempt and whenever the recipient drains its mail by polling, and is dropped when the peer is removed. The bound lives in the pure `decideDeferralEscalation` decision (fires once at the cap, never re-fires above it); `deliverViaTmux` gained an optional `onDefer` callback that the broker wires to the counter.
+
 ## [0.3.0] - 2026-06-11
 
 This release cuts the token cost of running the peer network: message delivery is urgency-tiered so most mail no longer costs the recipient an inference turn, summaries seed themselves from git at registration, and the per-call tool output is a fraction of its old size.

@@ -9,7 +9,8 @@
 
 import { Database } from "bun:sqlite";
 import {
-  claimForDelivery, confirmDelivered, deliverViaTmux, ensureMessagesTable,
+  claimForDelivery, confirmDelivered, DEFAULT_DEFERRAL_ESCALATION_CAP,
+  decideDeferralEscalation, deliverViaTmux, ensureMessagesTable,
   formatPeerMessage, generateAuthToken, generateLeaseToken, hasDuePush,
   isFederationRoute, isLoopback, isMessageDelivered, isPidDead,
   migrateMessagesSchema, nextDeliverable, pidProbe, promoteQueuedForFlush,
@@ -232,7 +233,13 @@ if (import.meta.main) {
   // deliverNext (further down) is what populates them.
   const activeRowIds = new Set<number>();
   const recipientsInFlight = new Set<string>();
-  // Peer ids whose removal is deferred because a delivery to them is in flight. The
+  // Consecutive not-ready deferrals per recipient, for the stuck-pane escalation (issue #42).
+  // A readiness-deferred attempt increments the recipient's streak; it resets on any delivered
+  // (or otherwise-not-deferred) tmux attempt, on a poll (handlePollMessages — the recipient is
+  // alive and draining mail through the floor), and on peer removal (deletePeerAndMail), so the
+  // map only ever holds peers currently wedged on a shell pane. deliverNext is serial per
+  // recipient, so a streak is only touched by one in-flight attempt at a time.
+  const deferralStreaks = new Map<string, number>();
   // delivery's lease must resolve first (see removePeerOrDefer); deliverNext's finally
   // drains this set the instant the lease frees.
   const pendingPeerDeletes = new Set<string>();
@@ -244,6 +251,7 @@ if (import.meta.main) {
   function deletePeerAndMail(id: string): void {
     deleteUndeliveredForPeer.run(id);
     deletePeer.run(id);
+    deferralStreaks.delete(id);
   }
 
   // Remove a peer now, or defer until its in-flight delivery's lease resolves. Deleting the
@@ -273,8 +281,7 @@ if (import.meta.main) {
       // under it would corrupt the lease and could drop a message the pane already
       // received. Defer this peer to the next sweep, after the attempt finishes.
       if (recipientsInFlight.has(peer.id)) continue;
-      deleteUndeliveredForPeer.run(peer.id);
-      deletePeer.run(peer.id);
+      deletePeerAndMail(peer.id);   // same two deletes, plus the deferralStreaks cleanup
     }
     pruneRemotePeers(db, REMOTE_TTL_MS);
     const pruned = pruneMessages(db, { deliveredTtlMs: DELIVERED_TTL_MS, queuedMaxAgeMs: QUEUED_MAX_AGE_MS, nowMs: Date.now() });
@@ -296,6 +303,7 @@ if (import.meta.main) {
   const TMUX_TIMEOUT_MS = 2_000;
   const FORWARD_TIMEOUT_MS = 5_000; // abort bound on an outbound cross-machine forward fetch
   const MAX_HEARTBEAT_DRAIN = 50; // upper bound on pushes drained per heartbeat
+  const DEFERRAL_ESCALATION_CAP = DEFAULT_DEFERRAL_ESCALATION_CAP; // not-ready deferrals before a stuck pane escalates (#42)
   // Deliveries currently being attempted. Read by the retire-drain (Task 9) and the
   // empty-broker self-exit (Task 14) so the broker never exits mid-delivery.
   let inFlightDeliveries = 0;
@@ -423,24 +431,44 @@ if (import.meta.main) {
     recipientsInFlight.add(toId);
     activeRowIds.add(row.id);
     inFlightDeliveries++;
+    let deferredThisAttempt = false;
     try {
       const text = formatPeerMessage(row);
       // The query arg enables a pre-send readiness probe: if the pane's foreground process is
       // a bare shell rather than a live Claude session, deliverViaTmux skips the inject and
       // returns false, so the row stays queued instead of pasting into a shell. This catches
       // the outlived-pane case below before the text lands; the post-send liveness re-probe
-      // still guards the narrower race where the peer dies during the await.
-      const ok = await deliverViaTmux(target.pane, target.socket, text, realTmuxSpawn, realTmuxQuery);
+      // still guards the narrower race where the peer dies during the await. onDefer fires on
+      // exactly that not-ready skip: count it toward this recipient's streak and, once the run
+      // of consecutive deferrals reaches the cap, escalate a pane that is stuck a shell louder
+      // than the per-attempt defer log (#42) — a permanently shelled pid is invisible to the
+      // dead-pid sweep, so its mail would otherwise stall in silence.
+      const ok = await deliverViaTmux(target.pane, target.socket, text, realTmuxSpawn, realTmuxQuery,
+        (reason) => {
+          deferredThisAttempt = true;
+          const streak = (deferralStreaks.get(toId) ?? 0) + 1;
+          deferralStreaks.set(toId, streak);
+          if (decideDeferralEscalation(streak, DEFERRAL_ESCALATION_CAP).escalate) {
+            console.error(`[claude-peers broker] escalation: pane ${target.pane} (peer ${toId}) deferred ${streak}x in a row (${reason}); no live Claude foreground seen, so its peer mail is not being delivered — if the session exited to a shell under a still-live pid the dead-pid sweep will not reap it`);
+          }
+        });
       // A 0 exit from send-keys is not proof a live peer consumed the text: the recipient can
       // die after the lease is claimed (before or during the await), leaving a pane that
       // outlived the Claude process — now a bare shell — that still accepts keystrokes and exits
       // 0. Re-probe liveness before confirming so a death (or a graceful unregister) mid-send is
       // not masked as a delivery. If the peer is gone, leave the row queued; cleanStalePeers
       // drops it honestly when it reaps the dead pid, and retention prune bounds an orphan.
-      if (ok && peerStillLive(toId) && confirmDelivered(db, row.id, token)) return "accepted";
+      if (ok && peerStillLive(toId) && confirmDelivered(db, row.id, token)) {
+        deferralStreaks.delete(toId);   // delivered: the pane is healthy, clear any streak
+        return "accepted";
+      }
+      // Any non-deferred miss (send failed, peer died mid-send) also breaks the not-ready run:
+      // only an unbroken streak of shell deferrals should accrue toward the stuck-pane escalation.
+      if (!deferredThisAttempt) deferralStreaks.delete(toId);
       releaseToQueued(db, row.id, token);
       return "queued";
     } catch {
+      deferralStreaks.delete(toId);   // a spawn fault is not a readiness deferral
       releaseToQueued(db, row.id, token);
       return "queued";
     } finally {
@@ -632,6 +660,14 @@ if (import.meta.main) {
   }
 
   function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
+    // A poll is proof of life that bypasses the tmux push path: check_messages is an MCP call
+    // from a live Claude (a bare shell pane cannot make it), and it drains queued mail through
+    // the floor. So a recipient that is polling is demonstrably alive and receiving its mail —
+    // the opposite of the stuck-shell-pane case the deferral streak escalates. Clear its streak
+    // here so deferrals it accrued before it recovered cannot carry over and trip a false
+    // escalation on a later, unrelated shell-out (#42). deliverNext resets on a tmux delivery;
+    // this resets on the poll path it never sees.
+    deferralStreaks.delete(body.id);
     // Release queued mail in id order, but stop at the first 'delivering' row. That row is
     // older pending mail a tmux send still owns and may requeue on failure; releasing the
     // queued rows behind it would let the caller observe message n+1 before message n, breaking
