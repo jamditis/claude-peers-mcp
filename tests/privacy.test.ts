@@ -27,9 +27,13 @@ function isTextFile(path: string): boolean {
   return textExtensions.has(ext);
 }
 
+// The repo owner and the upstream fork it credits are public by design — the
+// project is published under that account and OSS attribution requires naming
+// the upstream. Only genuinely private fleet identifiers (node names, the user
+// home path, host-specific installer scripts) belong on this blocklist. The
+// home-path entry below still catches the user dir as a leak; the bare owner
+// handle on its own is not private.
 const blockedLiterals = [
-  ["old repository owner", ["jam", "ditis"].join("")],
-  ["old upstream owner", ["louis", "lva"].join("")],
   ["old node name", ["house", "of", "jawn"].join("")],
   ["old node name", ["legion", "2025"].join("")],
   ["old user home", ["/home/", "jam", "ditis"].join("")],
