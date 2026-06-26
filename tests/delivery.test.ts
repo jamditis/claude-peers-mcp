@@ -3,7 +3,8 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { unlinkSync } from "node:fs";
 import {
   buildPaneCommandArgs, buildTmuxArgs, claimForDelivery, classifyPaneReadiness,
-  confirmDelivered, decideChannelPush, DEFAULT_CHANNEL_PUSH_CAP, deliverViaTmux,
+  confirmDelivered, DEFAULT_CHANNEL_PUSH_CAP,
+  DEFAULT_DEFERRAL_ESCALATION_CAP, decideChannelPush, decideDeferralEscalation, deliverViaTmux,
   ensureMessagesTable, findLeaklessDelivering, formatPeerMessage, hasDuePush,
   isFederationRoute, isLoopback, isMessageDelivered, isPidDead,
   migrateMessagesSchema, nextDeliverable, PASTE_END, PASTE_START,
@@ -512,6 +513,26 @@ describe("deliverViaTmux", () => {
     expect(await deliverViaTmux("%1", null, "hi", spawn, query)).toBe(true);
     expect(sent).toBe(true);
   });
+  it("calls onDefer with the readiness reason when it defers on a shell pane (#42)", async () => {
+    const spawn: TmuxSpawn = async () => ({ exitCode: 0 });
+    const query: TmuxQuery = async () => ({ exitCode: 0, stdout: "bash\n" });
+    const reasons: string[] = [];
+    expect(await deliverViaTmux("%1", null, "hi", spawn, query, (r) => reasons.push(r))).toBe(false);
+    expect(reasons.length).toBe(1);
+    expect(reasons[0]).toContain("shell");
+  });
+  it("does not call onDefer when the pane is ready, the probe faults, or there is no probe", async () => {
+    const spawn: TmuxSpawn = async () => ({ exitCode: 0 });
+    let calls = 0;
+    const onDefer = () => { calls++; };
+    // ready pane injects
+    await deliverViaTmux("%1", null, "hi", spawn, async () => ({ exitCode: 0, stdout: "node\n" }), onDefer);
+    // probe fault fails open and injects
+    await deliverViaTmux("%1", null, "hi", spawn, async () => { throw new Error("x"); }, onDefer);
+    // no probe at all
+    await deliverViaTmux("%1", null, "hi", spawn, undefined, onDefer);
+    expect(calls).toBe(0);
+  });
 });
 
 describe("buildPaneCommandArgs", () => {
@@ -771,5 +792,33 @@ describe("decideChannelPush", () => {
     expect(DEFAULT_CHANNEL_PUSH_CAP).toBeGreaterThan(0);
     expect(decideChannelPush("queued", 0, DEFAULT_CHANNEL_PUSH_CAP).push).toBe(true);
     expect(decideChannelPush("queued", DEFAULT_CHANNEL_PUSH_CAP, DEFAULT_CHANNEL_PUSH_CAP).push).toBe(false);
+  });
+});
+
+describe("decideDeferralEscalation", () => {
+  const CAP = 5;
+
+  it("stays quiet below the cap (a brief shell-out is still plausibly transient)", () => {
+    expect(decideDeferralEscalation(0, CAP).escalate).toBe(false);
+    expect(decideDeferralEscalation(CAP - 1, CAP).escalate).toBe(false);
+  });
+
+  it("escalates exactly once, on the attempt where the streak first reaches the cap", () => {
+    expect(decideDeferralEscalation(CAP, CAP).escalate).toBe(true);
+    expect(decideDeferralEscalation(CAP, CAP).reason).toContain("cap");
+    // Past the cap it must not re-fire — re-escalating every attempt restores the noise the cap cuts.
+    expect(decideDeferralEscalation(CAP + 1, CAP).escalate).toBe(false);
+    expect(decideDeferralEscalation(CAP + 99, CAP).escalate).toBe(false);
+  });
+
+  it("treats a cap of 0 or less as escalation disabled", () => {
+    expect(decideDeferralEscalation(10, 0).escalate).toBe(false);
+    expect(decideDeferralEscalation(10, -1).escalate).toBe(false);
+  });
+
+  it("ships a positive default cap so a stuck pane is escalated by default", () => {
+    expect(DEFAULT_DEFERRAL_ESCALATION_CAP).toBeGreaterThan(0);
+    expect(decideDeferralEscalation(DEFAULT_DEFERRAL_ESCALATION_CAP - 1, DEFAULT_DEFERRAL_ESCALATION_CAP).escalate).toBe(false);
+    expect(decideDeferralEscalation(DEFAULT_DEFERRAL_ESCALATION_CAP, DEFAULT_DEFERRAL_ESCALATION_CAP).escalate).toBe(true);
   });
 });

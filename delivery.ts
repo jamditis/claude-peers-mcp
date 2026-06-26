@@ -127,6 +127,42 @@ export function decideChannelPush(
   return { push: true, reason: `under cap (${attempts}/${cap})` };
 }
 
+export type DeferralEscalationDecision = { escalate: boolean; reason: string };
+
+/** Default consecutive not-ready deferrals before a stuck pane is escalated (issue #42). */
+export const DEFAULT_DEFERRAL_ESCALATION_CAP = 5;
+
+/**
+ * Decide whether a run of consecutive not-ready deferrals to one recipient should escalate
+ * to a louder surface than the per-attempt defer log (issue #42, follow-up to the #5 probe).
+ *
+ * The readiness probe (classifyPaneReadiness) skips a pane whose foreground is a shell and
+ * leaves the row queued, emitting one defer log per attempt. For a transient state — Claude
+ * briefly shelled out — that is correct and self-heals on the next attempt. But a pane that
+ * is *permanently* a shell (the registered pid still alive, Claude gone, so the dead-pid
+ * sweep never reaps it) defers on every attempt forever, and the per-attempt log is too quiet
+ * to notice that a protected long-running session is silently receiving no mail.
+ *
+ * This owns the FIRES-ONCE rule: escalate on exactly the attempt where the streak first
+ * reaches `cap`, and stay silent both below the cap (still plausibly transient) and above it
+ * (already escalated — re-escalating every attempt would just restore the noise the cap is
+ * meant to cut). A cap of 0 or less disables escalation.
+ *
+ * Pure and storage-agnostic, like decideChannelPush: the caller owns where the consecutive
+ * count lives (the broker keeps an in-memory per-recipient streak, reset on any delivered or
+ * otherwise-not-deferred attempt and dropped when the peer is removed) and what the louder
+ * surface is (a structured log today).
+ */
+export function decideDeferralEscalation(
+  consecutiveDeferrals: number,
+  cap: number,
+): DeferralEscalationDecision {
+  if (cap <= 0) return { escalate: false, reason: "escalation disabled (cap <= 0)" };
+  if (consecutiveDeferrals < cap) return { escalate: false, reason: `under cap (${consecutiveDeferrals}/${cap})` };
+  if (consecutiveDeferrals === cap) return { escalate: true, reason: `cap reached (${consecutiveDeferrals}/${cap})` };
+  return { escalate: false, reason: `already escalated (${consecutiveDeferrals}/${cap})` };
+}
+
 /**
  * Whether the recipient has any pending row that is push-due now — the gate that
  * decides if a delivery attempt may interrupt their session at all. A due
@@ -402,15 +438,22 @@ export async function probePaneReadiness(
  * rather than a live Claude session, the injection is skipped and false is returned so the
  * message stays queued for a later attempt instead of landing as a stray shell command.
  * Omitting `query` preserves the original inject-unconditionally behavior.
+ *
+ * `onDefer` fires only when a clean probe positively identifies a shell and the injection is
+ * skipped — not on a probe fault (which fails open and injects) nor on a send failure. The
+ * broker uses it to count consecutive not-ready deferrals per recipient and escalate a pane
+ * that is stuck a shell (issue #42); callers that do not track this omit it.
  */
 export async function deliverViaTmux(
   pane: string, socket: string | null, text: string, spawn: TmuxSpawn, query?: TmuxQuery,
+  onDefer?: (reason: string) => void,
 ): Promise<boolean> {
   try {
     if (query) {
       const readiness = await probePaneReadiness(pane, socket, query);
       if (!readiness.ready) {
         console.error(`[claude-peers broker] deferring tmux delivery to pane ${pane}: ${readiness.reason}`);
+        onDefer?.(readiness.reason);
         return false;
       }
     }
