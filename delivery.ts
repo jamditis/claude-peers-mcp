@@ -3,7 +3,7 @@
 // these; tests import them directly (the broker daemon body is not importable).
 
 import type { Database } from "bun:sqlite";
-import type { Urgency } from "./shared/types.ts";
+import type { DeliveryState, Urgency } from "./shared/types.ts";
 
 /**
  * Create the messages table in the M1 target schema if it does not exist. The CHECK
@@ -75,6 +75,56 @@ export function pushAfterFor(urgency: Urgency, nowMs: number, delayMs: number): 
     case "normal": return nowMs + delayMs;
     case "fyi": return null;
   }
+}
+
+export type ChannelPushDecision = { push: boolean; reason: string };
+
+/**
+ * Default per-message cap for the best-effort channel tier (#6). After this many channel
+ * pushes on one queued row the broker stops re-notifying it; the row stays queued so
+ * check_messages still delivers it. The tier wiring reads any operator override and falls
+ * back to this.
+ */
+export const DEFAULT_CHANNEL_PUSH_CAP = 3;
+
+/**
+ * Decide whether the best-effort channel tier (#6) may push a queued row now.
+ *
+ * The channel tier is the fallback for a session that loaded the `claude/channel`
+ * notification but is neither a tmux pane nor launcher-spawned, so it has no acked push
+ * path, only check_messages. It pushes `notifications/claude/channel` and never acks. This
+ * function owns the BOUNDED rule and is built to be consistent with NEVER-ACK:
+ *
+ *  Bounded (enforced here). A session that never reads must not be pushed forever, so stop
+ *  after `cap` attempts on a given row. The row remains queued for check_messages; the
+ *  broker just quits re-notifying it. A cap of 0 (or less) disables the tier.
+ *
+ *  Never-ack (enforced by confirmDelivered, not here). A channel push alone must never mark
+ *  a row delivered. This function only decides to PUSH and returns no lease, claim, or
+ *  confirm, so a caller acting on its decision has nothing to ack with; the invariant
+ *  itself lives in confirmDelivered's lease-token guard, the one path to 'delivered',
+ *  reachable only from the acked backends. A push here is fire-and-forget: a dropped
+ *  notification is never lost, because the row stays queued and check_messages is the floor.
+ *
+ * Pure and storage-agnostic: the caller passes the row's delivery_state and its current
+ * channel-push attempt count. Where that count is persisted (a messages column, an
+ * in-memory map) is the tier wiring's call, deferred so this safety core lands and is
+ * tested on its own. State is necessary but not the whole gate: only a 'queued' row reaches
+ * here (a 'delivering' row already holds a live acked attempt, a 'delivered' row is done),
+ * and the tier wiring must additionally skip poll-only rows — fyi, and floored remote
+ * forwards, whose NULL push_after is a security property (their text must never be
+ * auto-delivered). That push_after filter is the caller's, the same exclusion hasDuePush
+ * and nextDeliverable apply, kept out of this pure cap rule.
+ */
+export function decideChannelPush(
+  deliveryState: DeliveryState,
+  attempts: number,
+  cap: number,
+): ChannelPushDecision {
+  if (deliveryState !== "queued") return { push: false, reason: `state ${deliveryState}, not queued` };
+  if (cap <= 0) return { push: false, reason: "channel tier disabled (cap <= 0)" };
+  if (attempts >= cap) return { push: false, reason: `attempt cap reached (${attempts}/${cap})` };
+  return { push: true, reason: `under cap (${attempts}/${cap})` };
 }
 
 /**
