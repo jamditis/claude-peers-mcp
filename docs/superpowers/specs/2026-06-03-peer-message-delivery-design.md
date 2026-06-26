@@ -122,12 +122,20 @@ out of the part that fixes the silent-consume bug.
   #7). Adds `launcher.ts`, the broker→launcher delivery stream, the confirm-delivery
   ack, and the launcher's use of the lease token for stale-replay rejection. **Entry
   gates** (both must clear before M2 writing-plans):
-  1. **Transport proof** (issue #8). The broker is today pure request/response.
-     Before M2 we must either prove `Bun.serve` can hold a long-lived streaming
-     response per session while concurrently serving normal POSTs (with
-     GET-querystring routing and a bounded per-stream cost), or pick a concrete
-     alternative (long-poll GET that returns one event and is re-requested, or a
-     unix-domain duplex socket). This proof is a throwaway spike, not part of M1.
+  1. **Transport proof — cleared (issue #8).** The spike in
+     `spikes/m2-stream-transport/` proved `Bun.serve` (1.3.11) holds 50
+     concurrent long-lived per-session SSE streams (one per session) while
+     serving normal POSTs on the same server, with GET-querystring routing
+     (`/deliveries?session=<id>`), exclusive-per-session reconnect, ordered
+     delivery, and a bounded cost (~640 KB RSS / ~2 fd per stream, an in-process
+     upper bound counting both ends). **Decision: adopt SSE over `Bun.serve` for
+     `/deliveries`** — one `event: message` / `data: <json>` frame per delivery
+     plus a periodic `: keepalive` comment line. One caveat the M2 build must
+     honor: a client `reader.cancel()` (socket left open) does not fire the
+     server stream's `cancel` callback, so the broker must reap dead streams via
+     keepalive-write-failure + the pid-anchored `cleanStalePeers` sweep, not the
+     cancel callback alone (an `AbortController.abort()` disconnect does fire it,
+     within ~100 ms). The spike is throwaway, not part of M1.
   2. **Adoption model (decided).** A launcher session is headless/worker only —
      stream-json mode is a JSON protocol, not an interactive REPL. M2 must specify
      where `launcher.ts` lives, how `claude-peers launch` is exposed on PATH (no
@@ -670,12 +678,15 @@ must honor, so they are not re-derived.
   stdin/stdout. This is a headless/worker session, not an interactive REPL. M2 must
   specify where `launcher.ts` lives and how the command reaches PATH (no `bin`
   exists today; likely a `cli.ts` subcommand).
-- **Transport (gated):** the broker→launcher delivery channel (`/deliveries`) is a
-  long-lived per-session stream the launcher subscribes to. The exact transport is
-  the gate-1 spike's output (Bun.serve streaming proof, or long-poll, or unix
-  socket). Whatever it is, it must be loopback-only (control plane), capability-
-  token-gated, and **exclusive per session** — when a new stream attaches for a
-  session, the prior one is closed (reconnect-with-backoff guarantees overlap).
+- **Transport (decided — gate 1 cleared):** the broker→launcher delivery channel
+  (`/deliveries`) is a long-lived per-session **SSE stream over `Bun.serve`** the
+  launcher subscribes to, proven by the gate-1 spike (`spikes/m2-stream-transport/`):
+  `event: message` / `data: <json>` per delivery plus a `: keepalive` comment line.
+  It must be loopback-only (control plane), capability-token-gated, and **exclusive
+  per session** — when a new stream attaches for a session, the prior one is closed
+  (reconnect-with-backoff guarantees overlap); the spike confirmed the supersede
+  path. The broker handler must add GET-with-querystring routing (it switches on
+  POST paths only today).
 - **Server-side stream lifecycle:** a dead launcher must not leak the stream or
   wedge that session's delivery. On stream cancel / request abort, drop the broker's
   per-session stream entry and decrement `inFlightDeliveries`. Pid-anchor the
