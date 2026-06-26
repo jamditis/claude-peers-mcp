@@ -317,6 +317,9 @@ export function formatPeerMessage(msg: { id: number; from_id: string; text: stri
 
 export type TmuxSpawn = (args: string[]) => Promise<{ exitCode: number }>;
 
+/** Like TmuxSpawn, but also returns the process stdout so a probe can read it. */
+export type TmuxQuery = (args: string[]) => Promise<{ exitCode: number; stdout: string }>;
+
 /** Build the argv for one tmux process that types the text then presses Enter. */
 export function buildTmuxArgs(pane: string, socket: string | null, text: string): string[] {
   const args = ["tmux"];
@@ -325,11 +328,92 @@ export function buildTmuxArgs(pane: string, socket: string | null, text: string)
   return args;
 }
 
-/** Inject text into a pane via one tmux spawn. Success iff tmux exits 0. */
+// Pane foreground-process names that mean a bare shell prompt rather than a running
+// Claude session. A send-keys exit 0 only proves tmux queued the keystrokes; it does not
+// prove Claude was at its input box. If the pane's foreground process is a shell, the
+// injected Enter runs the pasted text as a shell command line instead of submitting a
+// Claude turn. Claude Code runs under node, so a live Claude pane reports node (or bun),
+// never one of these. The list covers the common POSIX shells, the BusyBox/embedded shells
+// a container or Alpine pane drops to (ash, hush, mksh), and the cross-platform fallbacks
+// (PowerShell on the Windows install path, nushell, xonsh, elvish), so the guard catches an
+// outlived pane on every supported host, not just a desktop Unix one. Compared lowercased
+// against pane_current_command, which tmux reports as the basename of the pane's foreground
+// command. The detector is a denylist on purpose: an unrecognized foreground fails open and
+// injects, so a live Claude pane is never starved by a name we did not anticipate; the cost
+// of a missing shell name is one stray paste into an already-dead session, not lost mail.
+const SHELL_COMMANDS = new Set([
+  "bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh", "csh",
+  "ash", "hush", "mksh",
+  "pwsh", "powershell", "nu", "nushell", "xonsh", "elvish",
+]);
+
+export interface PaneReadiness {
+  ready: boolean;
+  reason: string;
+}
+
+/**
+ * Decide, from a pane's foreground-process name, whether injecting a peer message is
+ * safe. A bare shell is not ready: an injected Enter would run the text as a command.
+ * Anything else (node or bun running Claude, or an unrecognized command) is treated as
+ * ready, so an unknown foreground never blocks a legitimate delivery. This check only
+ * suppresses the one case it can positively identify as wrong, and fails open otherwise.
+ * Detecting a modal or permission prompt inside a live Claude pane needs capture-pane
+ * signature matching and is out of scope (issue #5): the foreground process is still node
+ * in that state, so this check passes it through.
+ */
+export function classifyPaneReadiness(currentCommand: string): PaneReadiness {
+  const cmd = currentCommand.trim().toLowerCase();
+  if (cmd === "") return { ready: true, reason: "no foreground command reported; injecting" };
+  if (SHELL_COMMANDS.has(cmd)) return { ready: false, reason: `pane foreground is a shell (${cmd})` };
+  return { ready: true, reason: `pane foreground is ${cmd}` };
+}
+
+/** Build the argv that asks tmux for a pane's foreground command name. */
+export function buildPaneCommandArgs(pane: string, socket: string | null): string[] {
+  const args = ["tmux"];
+  if (socket) args.push("-S", socket);
+  args.push("display-message", "-p", "-t", pane, "#{pane_current_command}");
+  return args;
+}
+
+/**
+ * Probe a pane's readiness for injection by reading its foreground command via tmux.
+ * Fails open: any probe fault (non-zero exit or spawn rejection) yields ready, so a broken
+ * probe can never starve delivery. Only a clean probe that positively identifies a shell
+ * returns not-ready.
+ */
+export async function probePaneReadiness(
+  pane: string, socket: string | null, query: TmuxQuery,
+): Promise<PaneReadiness> {
+  try {
+    const { exitCode, stdout } = await query(buildPaneCommandArgs(pane, socket));
+    if (exitCode !== 0) return { ready: true, reason: `pane probe exited ${exitCode}; injecting` };
+    return classifyPaneReadiness(stdout);
+  } catch (e) {
+    console.error(`[claude-peers broker] pane readiness probe error for pane ${pane}:`, e);
+    return { ready: true, reason: "pane probe threw; injecting" };
+  }
+}
+
+/**
+ * Inject text into a pane via one tmux spawn. Success iff tmux exits 0. When `query` is
+ * supplied, the pane's readiness is probed first: if the pane is positively a shell prompt
+ * rather than a live Claude session, the injection is skipped and false is returned so the
+ * message stays queued for a later attempt instead of landing as a stray shell command.
+ * Omitting `query` preserves the original inject-unconditionally behavior.
+ */
 export async function deliverViaTmux(
-  pane: string, socket: string | null, text: string, spawn: TmuxSpawn,
+  pane: string, socket: string | null, text: string, spawn: TmuxSpawn, query?: TmuxQuery,
 ): Promise<boolean> {
   try {
+    if (query) {
+      const readiness = await probePaneReadiness(pane, socket, query);
+      if (!readiness.ready) {
+        console.error(`[claude-peers broker] deferring tmux delivery to pane ${pane}: ${readiness.reason}`);
+        return false;
+      }
+    }
     const { exitCode } = await spawn(buildTmuxArgs(pane, socket, text));
     return exitCode === 0;
   } catch (e) {
