@@ -23,10 +23,16 @@
 
 import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 
-// Peer ids are `${id_prefix}-${alnum}` (see generatePeerId); this matches that shape and
-// nothing else, so a hostile or malformed id can never escape the doorbell directory via a
-// path separator or `..`. Returns null for anything outside the safe set.
-const SAFE_ID = /^[A-Za-z0-9_-]+$/;
+// Peer ids are `${id_prefix}-${alnum}` (see generatePeerId), and id_prefix is copied verbatim
+// from config — which permits a dot (e.g. a machine-derived `node.a`). So dots must be allowed,
+// but a path separator or a `..` segment must not: either could let an id escape the doorbell
+// directory. This allows the filename-safe set (alnum plus dot, underscore, hyphen) and then
+// rejects any `..` substring; separators are already outside the class. Returns true for ids
+// safe to turn into a `<id>.mark` filename, false for anything else.
+const SAFE_ID_CHARS = /^[A-Za-z0-9._-]+$/;
+function isSafeId(id: string): boolean {
+  return SAFE_ID_CHARS.test(id) && !id.includes("..");
+}
 
 /**
  * The directory holding every recipient's marker, derived from the broker's db_path so the
@@ -42,7 +48,7 @@ export function doorbellDir(dbPath: string): string {
  * the caller treats as "no doorbell" rather than risking a path-traversal write/read).
  */
 export function doorbellPath(dbPath: string, id: string): string | null {
-  if (!SAFE_ID.test(id)) return null;
+  if (!isSafeId(id)) return null;
   return `${doorbellDir(dbPath)}/${id}.mark`;
 }
 

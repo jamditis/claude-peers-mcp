@@ -14,8 +14,11 @@ export type Urgency = "interrupt" | "normal" | "fyi";
 // Broker wire-protocol version. Bumped to 2 for the delivery_state schema and
 // delivery backends; to 3 for per-session capability tokens (a registered peer may
 // act only as the id it holds the token for); to 4 for urgency tiers and the
-// push_after deadline column. server.ts requires at least this from a running broker.
-export const PROTOCOL_VERSION = 4;
+// push_after deadline column; to 5 for the /peek route and the delivery_kind='none'
+// doorbell (a server holding peek_messages must force a broker that implements /peek
+// and writes doorbell markers, or both silently no-op against an older broker).
+// server.ts requires at least this from a running broker.
+export const PROTOCOL_VERSION = 5;
 
 export interface Peer {
   id: PeerId;

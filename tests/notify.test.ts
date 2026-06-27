@@ -16,13 +16,15 @@ describe("doorbell path derivation", () => {
   });
 
   it("rejects ids that are not filename-safe (path-traversal guard)", () => {
-    for (const bad of ["../escape", "a/b", "a.b", "with space", "", "a..b"]) {
+    for (const bad of ["../escape", "a/b", "with space", "", "a..b", "..", "a/../b"]) {
       expect(doorbellPath("/x/db", bad)).toBeNull();
     }
   });
 
-  it("accepts the real peer-id shape (prefix-alnum, hyphens, underscores)", () => {
-    for (const ok of ["dla-wc7mijtj", "peer-1", "a_b-9"]) {
+  it("accepts the real peer-id shape, including dotted id_prefix", () => {
+    // id_prefix is copied verbatim into the id and may contain a dot (e.g. `node.a`), so a
+    // single dot must be allowed — only `..` and separators are unsafe.
+    for (const ok of ["dla-wc7mijtj", "peer-1", "a_b-9", "node.a-wc7mijtj", "a.b"]) {
       expect(doorbellPath("/x/db", ok)).not.toBeNull();
     }
   });
