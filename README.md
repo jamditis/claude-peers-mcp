@@ -88,12 +88,33 @@ The other Claude receives it immediately and responds.
 | `send_message`   | Send a message to another instance by ID. `urgency` picks the delivery tier: `interrupt` pushes into their tmux session now; `normal` (the tool default) queues until they poll or the push deadline passes; `fyi` is poll-only, no reply expected. Cross-machine targets route automatically to the owning broker. |
 | `set_summary`    | Describe what you're working on (visible to other peers). The summary starts as an auto-generated git snapshot (`[auto] <branch>; recent: <files>`) seeded at registration; this tool overwrites it. |
 | `check_messages` | Read and clear messages that were queued instead of pushed. A poll marks the returned messages delivered, so a second call won't re-return them. |
+| `peek_messages`  | Report your own peer ID and how much mail is waiting **without consuming it** — the count and highest pending message ID. Use it to learn your ID so you can arm the doorbell watcher (below). `check_messages` stays the only way to read and clear messages. |
 
 ## How it works
 
 A **broker daemon** runs on port `7899` (set by the config file's `port` field) with a SQLite database. Each Claude Code session spawns an MCP server that registers with the broker, reporting its tmux pane (if any) as a delivery target. When a message is sent, the broker delivers it straight into the recipient's pane by typing it in (a bracketed-paste write via `tmux send-keys`), so the other Claude sees it as if it were typed at the prompt. A session with no tmux pane keeps its messages queued for `check_messages`.
 
 Not every message interrupts the recipient. Each message carries an **urgency tier** that maps to a `push_after` deadline: `interrupt` is push-due immediately; `normal` waits `push_delay_ms` (default 2 minutes) so the recipient can drain it cheaply via `check_messages` at a task boundary first — if the deadline lapses, the recipient's next heartbeat pushes it; `fyi` never auto-pushes (`push_after` NULL) and is only ever returned by a poll. When one row comes due, the broker promotes the recipient's other pending pushable rows so they ride the same flush instead of interrupting again later. Never-push rows sit outside the push channel entirely, so an `fyi` can't jam pushable mail behind it (FIFO holds within each channel, push vs poll, not across them).
+
+### The doorbell: near-real-time wake for non-tmux sessions
+
+A session running outside tmux has no pane to push into, so it would normally see mail only when it next calls `check_messages` — minutes of lag during active coordination. The **doorbell** closes that gap without changing the consume path. Whenever mail is queued for a non-tmux recipient, the broker touches a tiny per-recipient marker file (a sibling of the database, `~/.claude-peers.db.doorbells/<id>.mark`) holding a counter. A background watcher — `bun cli.ts doorbell <id>` — waits on that file with `fs.watch` (near-zero idle CPU, a slow poll as a safety net) and exits the instant the counter advances, which wakes the session to call `check_messages`.
+
+The signal is **notify-only**: the marker carries no message content and the watcher never reads the database or marks anything delivered, so `check_messages` remains the single way to read and clear mail. A session that never arms a watcher is unaffected — the write lands in a file nobody is watching, and mail still waits for the next manual `check_messages`.
+
+To use it from a non-tmux session, **(re-)arm the watcher first, then call `check_messages`** — always in that order:
+
+```bash
+# 1. Learn your peer ID with the peek_messages tool.
+# 2. Arm the watcher in a background shell:
+bun cli.ts doorbell <your-id>     # blocks, prints "mail for <id> ..." and exits when mail arrives
+# 3. Then call check_messages to drain anything already queued.
+# 4. When the watcher exits (mail arrived), repeat from step 2: re-arm, THEN check_messages.
+```
+
+The order matters. The watcher's baseline is sampled when it arms, so anything that lands *after* you arm wakes it; anything already queued (or that arrives during the drain) is caught by the `check_messages` you run right after arming. Checking *before* re-arming would leave a gap — a message landing between the check and the re-arm would be missed until the next message. Arm, then check, and every message is either drained or rings the bell.
+
+`bun cli.ts doorbell` takes `--since <id>` (only wake strictly above a known message id — e.g. the highest id you just consumed), `--timeout <sec>` (give up after N seconds), and `--watch` (stay running and print each new ring instead of exiting on the first).
 
 Delivery is tracked per message with a short-lived lease (`queued` → `delivering` → `delivered`): the broker claims the head-of-line message (FIFO — newer mail never overtakes older), injects it, then re-probes the recipient's liveness before confirming, because a `0` exit from `send-keys` doesn't prove a live Claude consumed it. A failed or interrupted attempt releases the lease back to `queued` rather than dropping the message; expired leases and rows orphaned by a broker restart are reclaimed automatically. Before each inject the broker also probes the pane's foreground process: if it is a bare shell rather than a live Claude session, the message is held queued instead of pasted into the shell, and a pane that stays a shell across several consecutive attempts is escalated to a louder log so a wedged long-running session does not silently stop receiving mail. The broker and MCP server negotiate a protocol version (currently `4`); an MCP server that finds an older broker running asks it to retire and starts a current one.
 
@@ -187,6 +208,7 @@ cd ~/claude-peers-mcp
 bun cli.ts status            # broker status + all peers (local and remote)
 bun cli.ts peers             # list peers
 bun cli.ts send <id> [--urgency interrupt|normal|fyi] <msg>   # send a message into a Claude session (default: interrupt)
+bun cli.ts doorbell <id> [--since <id>] [--timeout <sec>] [--watch]   # block until <id> has mail, then exit (non-tmux wake)
 bun cli.ts ping-siblings     # ping each configured sibling broker, report latency
 bun cli.ts kill-broker       # stop the broker
 ```

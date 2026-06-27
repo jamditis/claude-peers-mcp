@@ -14,8 +14,11 @@ export type Urgency = "interrupt" | "normal" | "fyi";
 // Broker wire-protocol version. Bumped to 2 for the delivery_state schema and
 // delivery backends; to 3 for per-session capability tokens (a registered peer may
 // act only as the id it holds the token for); to 4 for urgency tiers and the
-// push_after deadline column. server.ts requires at least this from a running broker.
-export const PROTOCOL_VERSION = 4;
+// push_after deadline column; to 5 for the /peek route and the delivery_kind='none'
+// doorbell (a server holding peek_messages must force a broker that implements /peek
+// and writes doorbell markers, or both silently no-op against an older broker).
+// server.ts requires at least this from a running broker.
+export const PROTOCOL_VERSION = 5;
 
 export interface Peer {
   id: PeerId;
@@ -111,6 +114,25 @@ export interface PollMessagesRequest {
 
 export interface PollMessagesResponse {
   messages: Message[];
+}
+
+// A non-consuming, recipient-scoped read of the caller's own backlog: the read equivalent of
+// /poll-messages minus markPolled (issue #49). Returns how many rows are pending and the
+// highest pending id, so a session can learn its own id and whether it has mail without
+// flipping any row to delivered — check_messages stays the single consume path. Token-gated to
+// the caller's id like every other mutating-principal route; it never marks anything delivered.
+export interface PeekMessagesRequest {
+  id: PeerId;
+}
+
+export interface PeekMessagesResponse {
+  // Caller's own peer id, echoed back so a session can discover the id to arm a doorbell with.
+  id: PeerId;
+  // Rows in delivery_state queued|delivering addressed to the caller.
+  count: number;
+  // Highest pending row id, or null when count is 0. Matches the doorbell marker counter, so a
+  // watcher can use it as the baseline to arm with.
+  max_id: number | null;
 }
 
 // --- Federation types ---

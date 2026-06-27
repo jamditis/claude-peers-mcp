@@ -11,6 +11,7 @@
  *   { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }   // .mcp.json
  */
 
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -25,6 +26,7 @@ import { buildAutoSummary } from "./shared/summarize.ts";
 import type {
   Peer,
   PeerId,
+  PeekMessagesResponse,
   PollMessagesResponse,
   RegisterResponse,
 } from "./shared/types.ts";
@@ -271,6 +273,15 @@ const TOOLS = [
       properties: {},
     },
   },
+  {
+    name: "peek_messages",
+    description:
+      "Report your own peer ID and how much mail is waiting, without consuming it (check_messages stays the only way to read and clear messages). Returns your id, the count of pending messages, and the highest pending message id. Use it to learn your id so you can arm the background doorbell watcher (`bun cli.ts doorbell <your-id>`), which wakes a non-tmux session within seconds of new mail instead of waiting for a manual check.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
 ];
 
 // --- Tool handlers ---
@@ -424,6 +435,45 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             {
               type: "text" as const,
               text: `Error checking messages: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    case "peek_messages": {
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      try {
+        const result = await brokerFetch<PeekMessagesResponse>("/peek", { id: myId });
+        const mail =
+          result.count === 0
+            ? "no pending messages"
+            : `${result.count} pending message(s) (highest id ${result.max_id})`;
+        // peek never consumes: report state and point at the consume + watcher paths.
+        // Absolute path to the CLI: a session's cwd is its own project, not the claude-peers
+        // install, so a bare `bun cli.ts` would not resolve. cli.ts sits next to this server.
+        const doorbellCmd = `bun ${join(import.meta.dir, "cli.ts")} doorbell ${result.id}`;
+        const hint =
+          result.count > 0
+            ? " Call check_messages to read them."
+            : ` Arm the doorbell to be woken on new mail: run \`${doorbellCmd}\` in the background, then call check_messages. When it fires, re-arm it and call check_messages again — always arm before checking so nothing is missed.`;
+        return {
+          content: [
+            { type: "text" as const, text: `You are peer ${result.id}; ${mail}.${hint}` },
+          ],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error peeking messages: ${e instanceof Error ? e.message : String(e)}`,
             },
           ],
           isError: true,
