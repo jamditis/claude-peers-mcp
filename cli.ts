@@ -13,10 +13,10 @@
  *   bun cli.ts kill-broker     — Stop the broker daemon
  */
 
-import { type FSWatcher, watch, writeFileSync } from "node:fs";
+import { type FSWatcher, mkdirSync, watch, writeFileSync } from "node:fs";
 import type { PeersConfig } from "./shared/config.ts";
 import { loadConfig } from "./shared/config.ts";
-import { doorbellPath, readDoorbell } from "./shared/notify.ts";
+import { doorbellDir, doorbellPath, readDoorbell } from "./shared/notify.ts";
 
 // Load config once; CLI may run without it for basic commands
 let config: PeersConfig | null = null;
@@ -332,11 +332,22 @@ switch (cmd) {
     let pollMs = 3000;
     let timeoutSec: number | null = null;
     let persistent = false;
+    // Parse a numeric flag value, erroring out on a missing/non-numeric arg rather than letting
+    // a silent NaN fall through to a default — a mistyped --since would otherwise behave as "no
+    // baseline", the opposite of the intent (and could reintroduce a missed wake).
+    const numArg = (flag: string, raw: string | undefined): number => {
+      const n = parseInt(raw ?? "", 10);
+      if (!Number.isFinite(n)) {
+        console.error(`${flag} requires a number (got ${raw === undefined ? "nothing" : `"${raw}"`})`);
+        process.exit(1);
+      }
+      return n;
+    };
     for (let i = 0; i < rest.length; i++) {
       const a = rest[i];
-      if (a === "--since") since = parseInt(rest[++i] ?? "", 10);
-      else if (a === "--poll-ms") pollMs = parseInt(rest[++i] ?? "", 10);
-      else if (a === "--timeout") timeoutSec = parseInt(rest[++i] ?? "", 10);
+      if (a === "--since") since = numArg("--since", rest[++i]);
+      else if (a === "--poll-ms") pollMs = numArg("--poll-ms", rest[++i]);
+      else if (a === "--timeout") timeoutSec = numArg("--timeout", rest[++i]);
       else if (a === "--watch") persistent = true;
       else if (!id && a) id = a;
     }
@@ -354,9 +365,14 @@ switch (cmd) {
       console.error(`Invalid peer id: ${id}`);
       process.exit(1);
     }
-    if (!Number.isFinite(pollMs) || pollMs < 250) pollMs = 3000;
-    // The watched file must exist before fs.watch is armed. Create it without clobbering an
-    // existing marker (wx fails if present), so we never reset a live counter.
+    if (pollMs < 250) pollMs = 250; // floor the poll so a typo can't busy-spin; default stays 3000
+    // The watched file must exist before fs.watch is armed. When a session arms the doorbell
+    // before it has ever received mail the doorbell dir does not exist yet, so create it first
+    // (as the broker's writeDoorbell does) — otherwise the marker create ENOENTs, the watch
+    // never arms, and the first message is caught only by the slow poll instead of fs.watch.
+    try { mkdirSync(doorbellDir(dbPath), { recursive: true }); } catch { /* best-effort */ }
+    // Create the marker without clobbering an existing one (wx fails if present), so we never
+    // reset a live counter.
     try { writeFileSync(markPath, "0", { flag: "wx" }); } catch { /* already exists */ }
     // Baseline: only rings strictly above this fire. Default to the marker's current value so we
     // only wake on mail that arrives after arming — the session has just drained via

@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
+import { dirname, isAbsolute, resolve } from "node:path";
 
 export interface SiblingConfig {
   machine: string;
@@ -93,8 +94,13 @@ export function loadConfig(path?: string): PeersConfig {
     }
   }
 
-  // db_path from: env var > config file > default
-  const db_path = process.env.CLAUDE_PEERS_DB ?? (obj.db_path as string | undefined) ?? DEFAULT_DB_PATH;
+  // db_path from: env var > config file > default. Resolve a relative path against the config
+  // file's directory — a stable, cwd-independent anchor — not the process cwd, so the broker,
+  // the MCP server, and `cli.ts doorbell` all derive the SAME absolute db_path (and the same
+  // doorbell marker directory) no matter which directory each was launched from. A cwd-relative
+  // resolve would let a watcher and the broker watch different files and silently miss wakes.
+  const rawDbPath = process.env.CLAUDE_PEERS_DB ?? (obj.db_path as string | undefined) ?? DEFAULT_DB_PATH;
+  const db_path = isAbsolute(rawDbPath) ? rawDbPath : resolve(dirname(configPath), rawDbPath);
   // Secure-by-default: floor remote forwards unless the operator explicitly opts
   // out with `false`. An absent or non-boolean value floors (queues for
   // check_messages) so a remote machine cannot auto-paste into a live pane until

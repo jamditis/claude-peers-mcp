@@ -102,15 +102,19 @@ A session running outside tmux has no pane to push into, so it would normally se
 
 The signal is **notify-only**: the marker carries no message content and the watcher never reads the database or marks anything delivered, so `check_messages` remains the single way to read and clear mail. A session that never arms a watcher is unaffected — the write lands in a file nobody is watching, and mail still waits for the next manual `check_messages`.
 
-To use it from a non-tmux session, arm the watcher in the background and re-arm after each wake:
+To use it from a non-tmux session, **(re-)arm the watcher first, then call `check_messages`** — always in that order:
 
 ```bash
-# 1. Learn your peer ID (peek_messages returns it). Then, in a background shell:
+# 1. Learn your peer ID with the peek_messages tool.
+# 2. Arm the watcher in a background shell:
 bun cli.ts doorbell <your-id>     # blocks, prints "mail for <id> ..." and exits when mail arrives
-# 2. On wake: call check_messages to read it, then re-run the doorbell command to re-arm.
+# 3. Then call check_messages to drain anything already queued.
+# 4. When the watcher exits (mail arrived), repeat from step 2: re-arm, THEN check_messages.
 ```
 
-`bun cli.ts doorbell` takes `--since <id>` (only wake above a known baseline), `--timeout <sec>` (give up after N seconds), and `--watch` (stay running and print each new ring instead of exiting on the first).
+The order matters. The watcher's baseline is sampled when it arms, so anything that lands *after* you arm wakes it; anything already queued (or that arrives during the drain) is caught by the `check_messages` you run right after arming. Checking *before* re-arming would leave a gap — a message landing between the check and the re-arm would be missed until the next message. Arm, then check, and every message is either drained or rings the bell.
+
+`bun cli.ts doorbell` takes `--since <id>` (only wake strictly above a known message id — e.g. the highest id you just consumed), `--timeout <sec>` (give up after N seconds), and `--watch` (stay running and print each new ring instead of exiting on the first).
 
 Delivery is tracked per message with a short-lived lease (`queued` → `delivering` → `delivered`): the broker claims the head-of-line message (FIFO — newer mail never overtakes older), injects it, then re-probes the recipient's liveness before confirming, because a `0` exit from `send-keys` doesn't prove a live Claude consumed it. A failed or interrupted attempt releases the lease back to `queued` rather than dropping the message; expired leases and rows orphaned by a broker restart are reclaimed automatically. Before each inject the broker also probes the pane's foreground process: if it is a bare shell rather than a live Claude session, the message is held queued instead of pasted into the shell, and a pane that stays a shell across several consecutive attempts is escalated to a louder log so a wedged long-running session does not silently stop receiving mail. The broker and MCP server negotiate a protocol version (currently `4`); an MCP server that finds an older broker running asks it to retire and starts a current one.
 

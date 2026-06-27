@@ -27,6 +27,29 @@ describe("loadConfig", () => {
     await Bun.write(tmpPath, JSON.stringify({ machine: "test" }));
     expect(() => loadConfig(tmpPath)).toThrow();
   });
+
+  it("resolves a relative db_path against the config file's directory, not cwd", async () => {
+    // A relative db_path must resolve to the same absolute path for every process (broker,
+    // server, doorbell watcher) regardless of their cwd, or they would derive different
+    // doorbell marker locations and the wake would silently never fire. Anchoring on the
+    // config file's directory gives that cwd-independent agreement.
+    const tmpPath = "/tmp/test-claude-peers-reldb.json";
+    await Bun.write(tmpPath, JSON.stringify({
+      machine: "m", tailscale_ip: "100.0.0.1", port: 7899, id_prefix: "tst",
+      siblings: [], allowed_ips: ["127.0.0.1"], db_path: "state/peers.db",
+    }));
+    const config = loadConfig(tmpPath);
+    expect(config.db_path).toBe("/tmp/state/peers.db");
+  });
+
+  it("leaves an absolute db_path unchanged", async () => {
+    const tmpPath = "/tmp/test-claude-peers-absdb.json";
+    await Bun.write(tmpPath, JSON.stringify({
+      machine: "m", tailscale_ip: "100.0.0.1", port: 7899, id_prefix: "tst",
+      siblings: [], allowed_ips: ["127.0.0.1"], db_path: "/var/lib/peers.db",
+    }));
+    expect(loadConfig(tmpPath).db_path).toBe("/var/lib/peers.db");
+  });
 });
 
 describe("floor_remote_forwards", () => {

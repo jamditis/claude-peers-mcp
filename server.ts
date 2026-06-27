@@ -11,6 +11,7 @@
  *   { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }   // .mcp.json
  */
 
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -455,10 +456,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             ? "no pending messages"
             : `${result.count} pending message(s) (highest id ${result.max_id})`;
         // peek never consumes: report state and point at the consume + watcher paths.
+        // Absolute path to the CLI: a session's cwd is its own project, not the claude-peers
+        // install, so a bare `bun cli.ts` would not resolve. cli.ts sits next to this server.
+        const doorbellCmd = `bun ${join(import.meta.dir, "cli.ts")} doorbell ${result.id}`;
         const hint =
           result.count > 0
             ? " Call check_messages to read them."
-            : ` Arm the doorbell to be woken on new mail: run \`bun cli.ts doorbell ${result.id}\` in the background, then check_messages when it fires.`;
+            : ` Arm the doorbell to be woken on new mail: run \`${doorbellCmd}\` in the background, then call check_messages. When it fires, re-arm it and call check_messages again — always arm before checking so nothing is missed.`;
         return {
           content: [
             { type: "text" as const, text: `You are peer ${result.id}; ${mail}.${hint}` },
