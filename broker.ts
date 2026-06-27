@@ -18,9 +18,11 @@ import {
   releasableQueuedPrefix, releaseToQueued, resetDeliveringOnStart, type TmuxQuery, type TmuxSpawn,
 } from "./delivery.ts";
 import { loadConfig, type SiblingConfig } from "./shared/config.ts";
+import { removeDoorbell, writeDoorbell } from "./shared/notify.ts";
 import type {
   ControlPlaneRequest, ForwardMessageRequest, ForwardMessageResponse,
   GossipRequest, ListPeersRequest, Message, Peer,
+  PeekMessagesRequest, PeekMessagesResponse,
   PollMessagesRequest, PollMessagesResponse,
   RegisterRequest, RegisterResponse, SendMessageRequest, SendResult,
 } from "./shared/types.ts";
@@ -227,6 +229,15 @@ if (import.meta.main) {
   const deleteUndeliveredForPeer = db.prepare(
     "DELETE FROM messages WHERE to_id = ? AND delivery_state != 'delivered'"
   );
+  // /peek (issue #49): the recipient's pending backlog as a count + max id, never touching
+  // delivery_state. The read equivalent of selectPendingForPoll without markPolled, and the
+  // source of the doorbell marker counter (max pending id).
+  const peekPending = db.prepare(
+    "SELECT COUNT(*) AS count, MAX(id) AS max_id FROM messages WHERE to_id = ? AND delivery_state IN ('queued','delivering')"
+  );
+  // The recipient's delivery backend, to gate the doorbell to delivery_kind='none' sessions:
+  // a tmux peer already gets an active push, so it needs no marker.
+  const deliveryKindForPeer = db.prepare("SELECT delivery_kind AS kind FROM peers WHERE id = ?");
 
   // In-memory delivery guards (this process only). Declared up here, before
   // cleanStalePeers, so the sweep can skip a recipient that is mid-delivery;
@@ -252,6 +263,21 @@ if (import.meta.main) {
     deleteUndeliveredForPeer.run(id);
     deletePeer.run(id);
     deferralStreaks.delete(id);
+    // The peer id is gone for good (never reused), so its doorbell marker is now stale; drop it
+    // so markers do not accumulate across sessions. Best-effort — a missing file is fine.
+    removeDoorbell(DB_PATH, id);
+  }
+
+  // Ring the doorbell for a delivery_kind='none' recipient: record that it has pending mail up
+  // to `seq` (the just-inserted row id, which is the new max pending id since ids only grow).
+  // A watcher armed via `cli.ts doorbell` wakes within seconds; a session with no watcher is
+  // unaffected (the write lands in an unwatched file) and still drains on its next
+  // check_messages. tmux recipients are skipped — they already get an active push. Best-effort
+  // and never throws into the send path: writeDoorbell swallows its own IO errors, and the
+  // kind lookup is a primary-key hit that cannot fail for a row we just inserted against.
+  function ringDoorbell(toId: string, seq: number): void {
+    const row = deliveryKindForPeer.get(toId) as { kind: string } | null;
+    if (row?.kind === "none") writeDoorbell(DB_PATH, toId, seq);
   }
 
   // Remove a peer now, or defer until its in-flight delivery's lease resolves. Deleting the
@@ -564,6 +590,9 @@ if (import.meta.main) {
         urgency, pushAfterFor(urgency, Date.now(), config.push_delay_ms),
       );
       const ownRowId = Number(inserted.lastInsertRowid);
+      // Ring the doorbell before the push attempt: a none recipient gets no inject, so this is
+      // its near-real-time wake (issue #49); a tmux recipient is skipped inside ringDoorbell.
+      ringDoorbell(body.to_id, ownRowId);
       if ((await deliverNext(body.to_id)) === "accepted") await drainAfterDelivery(body.to_id);
       // Report THIS message's own disposition, not the queue head's (the local edition of
       // issue #14): deliverNext works head-first, so the row just inserted may have ridden
@@ -623,6 +652,10 @@ if (import.meta.main) {
       : pushAfterFor(urgency, Date.now(), config.push_delay_ms);
     const inserted = insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString(), urgency, pushAfter);
     const forwardedRowId = Number(inserted.lastInsertRowid);
+    // Ring the doorbell for a none recipient regardless of floor_remote_forwards: a floored
+    // forward is poll-only (push_after NULL, never auto-injected), which is exactly the case the
+    // doorbell accelerates — the recipient still needs to know to check (issue #49, related #39).
+    ringDoorbell(body.to_id, forwardedRowId);
     // floor_remote_forwards leaves a forwarded message queued for pull-only retrieval;
     // by default a forward auto-injects into the recipient's backend like a local send.
     // Report the honest per-message disposition so the originating broker can tell the
@@ -657,6 +690,18 @@ if (import.meta.main) {
       );
     }
     return { ok: true };
+  }
+
+  // Non-consuming, recipient-scoped read of the caller's own backlog (issue #49). The read
+  // equivalent of handlePollMessages minus markPolled: it reports the pending count and the
+  // max pending id and never flips a row to delivered, so check_messages stays the single
+  // consume path and the never-ack invariant holds. Token-gated to the caller's id (not in the
+  // exempt set), so it goes through the same authenticated control plane as a send. A doorbell
+  // can use this as its schema-decoupled poll fallback, and a session can call peek_messages to
+  // learn its own id (echoed back) and the baseline to arm a watcher with.
+  function handlePeek(body: PeekMessagesRequest): PeekMessagesResponse {
+    const row = peekPending.get(body.id) as { count: number; max_id: number | null };
+    return { id: body.id, count: row.count, max_id: row.max_id };
   }
 
   function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
@@ -870,6 +915,7 @@ if (import.meta.main) {
           case "/list-peers": return Response.json(handleListPeers(body));
           case "/send-message": return Response.json(await handleSendMessage(body));
           case "/poll-messages": return Response.json(handlePollMessages(body));
+        case "/peek": return Response.json(handlePeek(body));
           case "/unregister":
             // Remove the departing peer and its now-unreachable mail. A peer id is ephemeral
             // (a fresh id per session, never reused), so a graceful exit's undelivered mail is

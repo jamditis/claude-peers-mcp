@@ -113,6 +113,25 @@ export interface PollMessagesResponse {
   messages: Message[];
 }
 
+// A non-consuming, recipient-scoped read of the caller's own backlog: the read equivalent of
+// /poll-messages minus markPolled (issue #49). Returns how many rows are pending and the
+// highest pending id, so a session can learn its own id and whether it has mail without
+// flipping any row to delivered — check_messages stays the single consume path. Token-gated to
+// the caller's id like every other mutating-principal route; it never marks anything delivered.
+export interface PeekMessagesRequest {
+  id: PeerId;
+}
+
+export interface PeekMessagesResponse {
+  // Caller's own peer id, echoed back so a session can discover the id to arm a doorbell with.
+  id: PeerId;
+  // Rows in delivery_state queued|delivering addressed to the caller.
+  count: number;
+  // Highest pending row id, or null when count is 0. Matches the doorbell marker counter, so a
+  // watcher can use it as the baseline to arm with.
+  max_id: number | null;
+}
+
 // --- Federation types ---
 
 export interface GossipRequest {
