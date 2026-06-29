@@ -50,14 +50,18 @@ Use a **keyed HMAC over the request body**, not a bare static bearer. Be honest 
 buys: the channel is already encrypted (WireGuard), so the HMAC is not protecting against a wire
 interceptor, and against the party who matters most — a process already inside an allowlisted host,
 which can read the uid-readable secret and sign a fresh forgery — HMAC and bare bearer are
-equivalent. The HMAC's marginal value over a bare bearer is narrower and worth stating plainly:
-it binds the credential to one body and timestamp, so a secret that leaks through a log line, an
-error response, or a crash dump is not a forever-reusable skeleton key, and a captured request
-cannot be replayed past the skew window or have its body substituted. That is leak-containment and
-defense in depth, not wire protection. It costs a few lines more (`node:crypto` `createHmac`,
-available under Bun): HMAC-SHA256 of the serialized body plus a unix-second timestamp, the timestamp
-echoed in a header and checked inside a bounded skew window. A bare bearer is the documented minimal
-fallback if HMAC canonicalization proves fiddly.
+equivalent. The HMAC's marginal value over a bare bearer is narrower and worth stating plainly, and
+it turns on *what* leaks. If a **signed request or its `X-Fleet-Sig` header** leaks — through a log
+line, an error response, a crash dump — the skew window bounds how long it can be replayed and the
+body cannot be substituted; that is the containment the HMAC buys over a bare bearer, whose captured
+header reauthorizes any body forever. If the **secret itself** leaks, the HMAC contains nothing: the
+holder computes valid signatures for arbitrary future bodies until the fleet rotates, so a secret
+exposure is a full compromise that must trigger rotation, not be read as bounded. So the HMAC's value
+is leak-containment for *captured traffic* and defense in depth — not wire protection, and not
+protection against secret disclosure. It costs a few lines more (`node:crypto` `createHmac`, available
+under Bun): HMAC-SHA256 of the signed string (method, path, timestamp, and serialized body — see Sign
+below) with the timestamp echoed in a header and checked inside a bounded skew window. A bare bearer
+is the documented minimal fallback if HMAC canonicalization proves fiddly.
 
 ## Mechanism
 
@@ -81,20 +85,33 @@ hand-started broker's shell. State this in the rollout step: keying a node means
 in the session/MCP launch env, from pass, so every auto-spawned broker picks it up. A node whose MCP
 env lacks the secret launches unkeyed and silently falls back to IP-only federation — which is why
 the grace flag (`ALLOW_UNSIGNED_FEDERATION`) must stay on until every node's MCP env carries the
-secret, and why the config parse should `console.error` once at startup when federation has siblings
-but no secret is set, so an un-keyed node is visible rather than silent.
+secret, and why the config parse should `console.error` once at startup when federation is remotely
+exposed (a non-loopback `allowed_ips` entry) but no secret is set, so an un-keyed node is visible
+rather than silent.
+
+One case the MCP-env route misses: a long-lived **supervised** broker — a systemd unit or Task
+Scheduler task started before, and outliving, any single MCP server — is never spawned by `server.ts`.
+`ensureBroker` returns early when a healthy broker already answers (server.ts:84-89), so it never
+inherits a later MCP server's environment. On those nodes the secret must live in the **broker
+service's own environment** (the unit's `Environment=` / `EnvironmentFile=`, or the task's env), not
+only the MCP launch env, or the supervised broker keeps running unkeyed while keyed siblings reject
+it once grace is off. The rollout step sets the secret in both places.
 
 ### Sign (sender — broker.ts:610 and :745)
-Add `signFederation(bodyString, secret)` returning `{ ts, sig }`. Attach two headers to both
-outbound `fetch` calls: `X-Fleet-Ts: <unix seconds>` and
-`X-Fleet-Sig: <hex HMAC of (ts + "." + bodyString)>`. Sign the exact serialized string passed as
-`body`, so verify recomputes over identical bytes.
+Add `signFederation(method, path, bodyString, secret)` returning `{ ts, sig }`. Attach two headers to
+both outbound `fetch` calls: `X-Fleet-Ts: <unix seconds>` and
+`X-Fleet-Sig: <hex HMAC of (method + "." + path + "." + ts + "." + bodyString)>`. **Bind method and
+path into the signed string from v1**, not a deferred future route: `/gossip` does no schema
+validation (`mergeGossipPeers(db, body.peers, ...)`, broker.ts:679), so a signed `/forward-message`
+body replayed to `/gossip` is not cleanly rejected — binding the path is what actually stops
+cross-route replay (see residual risk). Sign the exact serialized body string passed as `body`, so
+verify recomputes over identical bytes.
 
 ### Verify (broker — one block at the gate)
 Mirror the per-session token block's placement (broker.ts:863). Add a federation branch that runs
 only when `isFederationRoute(path)` and `config.federation_secret` is set:
-- Recompute `HMAC(secret, ts + "." + rawBody)`; compare to `X-Fleet-Sig` with
-  `crypto.timingSafeEqual` (constant-time, so a wrong sig leaks no timing).
+- Recompute `HMAC(secret, req.method + "." + path + "." + ts + "." + rawBody)`; compare to
+  `X-Fleet-Sig` with `crypto.timingSafeEqual` (constant-time, so a wrong sig leaks no timing).
 - Reject (401) when the signature is absent, malformed, or unequal, or when `|now - ts|` exceeds the
   skew window (300 s is ample for tunnel latency and clock drift).
 - Verification needs the raw body bytes, but the gate currently does `await req.json()`. Read
@@ -109,6 +126,35 @@ Reuse the `ALLOW_UNSIGNED` pattern the per-session tokens shipped with. Add
 `ALLOW_UNSIGNED_FEDERATION` (env): while true, a federation request that presents no signature is
 accepted and logged, so a sibling still on the old binary keeps federating during the window; a
 *wrong* signature always 401s. Flip it off once every node is keyed and re-deployed.
+
+### Fail closed when keyed-and-grace-off but no secret
+The opt-in `absent secret → IP-only` fallback is safe *only during the grace window*. Conditioning
+verification on `config.federation_secret` being set means a node that accidentally starts with no
+secret keeps accepting unsigned IP-only `/gossip` and `/forward-message` even after
+`ALLOW_UNSIGNED_FEDERATION` is off — a missed-secret deploy would sit permanently unauthenticated with
+no enforcement point. So make absent-secret fatal in that one state.
+
+Key the guard on **federation exposure, not on the outbound `siblings` list.** What makes a node
+*accept* a remote federation request is the inbound IP gate (`isAllowedIp(clientIp, config.allowed_ips)`,
+broker.ts:818), not whether this node lists any siblings to gossip *to*. A node with `siblings: []` but
+a non-loopback `allowed_ips` entry still answers `/gossip` and `/forward-message` from another host, so
+"federation is remotely exposed" means `allowed_ips` carries any non-loopback address (the
+`singleHostDefault` allowlist is loopback-only, which is the not-exposed case). The truth table the
+parse and the gate enforce together:
+
+| federation exposed (non-loopback `allowed_ips`) | grace flag | secret set | behavior |
+|---|---|---|---|
+| no | — | — | loopback-only island; secret irrelevant |
+| yes | on | no | unsigned accepted and logged (the rollout window) |
+| yes | on | yes | a *present* signature must be valid (wrong → 401); an *absent* one is accepted and logged — the `ALLOW_UNSIGNED` grace, so an old unsigned sibling keeps talking during rollout |
+| yes | off | yes | every federation request must carry a valid signature; absent or wrong → 401 |
+| **yes** | **off** | **no** | **fail closed: refuse startup, or 401 every federation route** |
+
+Two things the table encodes. First, grace gates only the *absent*-signature case: a present-but-wrong
+signature always 401s, on or off, so the grace window never weakens a node that did sign. Second, the
+last row is the missed-key catch — once the operator declares the rollout done (grace off), a remotely
+exposed node with no secret is a misconfiguration, not a legacy peer, and must not silently preserve the
+bypass.
 
 ### What it unlocks
 Once federation traffic is authenticated, `floor_remote_forwards = false` becomes safe to ship as the
@@ -131,10 +177,14 @@ Keep them as separate issues.
 - A static fleet secret is held by every node, so one compromised node's secret reauthorizes the whole
   fleet until rotation. mTLS would scope a compromise to one revocable cert. Accept for v1; revisit
   mTLS if per-node revocation becomes necessary.
-- HMAC binds body and timestamp but not method or path. For v1's two routes the body shapes are
-  disjoint, so a header replayed across routes fails JSON validation anyway; fold the path into the
-  signed string if a third federation route ever reuses the header.
-- In-window replay is not closed. Within the skew window the same signed `/forward-message` replays
+- Cross-route replay is closed by binding method and path into the signed string (Sign, above), not
+  left to JSON validation. The earlier framing — "the body shapes are disjoint, so a cross-route
+  replay fails validation" — does not hold: `/gossip` runs `mergeGossipPeers(db, body.peers, ...)`
+  (broker.ts:679) with no schema check, so a signed `/forward-message` body replayed to `/gossip`
+  reaches the handler (a 500 on the undefined `body.peers`), not a clean bounce. The HMAC over
+  method + path is the actual rejection.
+- In-window replay of the *same* route is not closed. Within the skew window the same signed
+  `/forward-message` replays
   into `handleForwardMessage` (broker.ts:631) and inserts a second message row, so the recipient's
   pane gets a duplicate peer-attributed paste. (`/gossip` replay is an idempotent re-merge, harmless.)
   Accept it for v1 — the replayer must already be inside the tunnel or on an allowlisted host, where
@@ -146,11 +196,17 @@ Keep them as separate issues.
 ## Child-issue checklist
 
 - [ ] config: add `federation_secret` (env-indirected) and opt-in parse, with a test that an unset
-  secret preserves IP-only behavior, plus a one-line startup `console.error` when siblings are
-  configured but no secret is set (so an un-keyed federated node is visible, not silent). (small)
-- [ ] sign + verify: `signFederation` plus the verify block, `req.text()` → HMAC → `JSON.parse` on
-  the request path, constant-time compare, skew window. (medium, security-touching — Codex 5.5 high
-  gate per the repo PR workflow)
+  secret preserves IP-only behavior *during grace*, plus a startup `console.error` when federation is
+  remotely exposed (non-loopback `allowed_ips`) but no secret is set. (small)
+- [ ] fail-closed guard: when federation is remotely exposed and `ALLOW_UNSIGNED_FEDERATION` is off and
+  no secret is set, refuse startup (or 401 every federation route) — the missed-key catch in the truth
+  table above, with a test per row. (small)
+- [ ] sign + verify: `signFederation(method, path, body, secret)` plus the verify block, binding
+  method + path into the HMAC, `req.text()` → HMAC → `JSON.parse` on the request path, constant-time
+  compare, skew window. (medium, security-touching — Codex 5.5 high gate per the repo PR workflow)
+- [ ] rollout env: set the secret in both the MCP server launch env and any supervised broker
+  service/task environment (the early-return reuse path means a supervised broker won't inherit the
+  MCP env). (ops)
 - [ ] migration: `ALLOW_UNSIGNED_FEDERATION` grace flag mirroring `ALLOW_UNSIGNED`. (small)
 - [ ] tests: forged-sig 401, replay-outside-skew 401, valid-sig 200, unset-secret bypass,
   grace-window unsigned accept. (medium)
