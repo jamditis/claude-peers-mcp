@@ -2,7 +2,8 @@
 
 **Goal:** Bind every cross-machine `/gossip` and `/forward-message` call to a sender that proves
 it holds the fleet's shared federation secret, so an allowlisted-but-untrusted or IP-spoofing host
-can no longer forge a gossip entry or inject a peer-attributed message. Closes issue #4.
+can no longer forge a gossip entry or inject a peer-attributed message. Designs the fix for issue #4;
+#4 stays open until the implementation child-issues below land.
 
 **Status:** proposed 2026-06-29. Not yet implemented — this is the decision and the sequenced plan,
 not the code.
@@ -84,7 +85,7 @@ Code MCP config's `env` block, or the parent shell that launches the session), n
 hand-started broker's shell. State this in the rollout step: keying a node means putting the secret
 in the session/MCP launch env, from pass, so every auto-spawned broker picks it up. A node whose MCP
 env lacks the secret launches unkeyed and silently falls back to IP-only federation — which is why
-the grace flag (`ALLOW_UNSIGNED_FEDERATION`) must stay on until every node's MCP env carries the
+the grace flag (`CLAUDE_PEERS_ALLOW_UNSIGNED_FEDERATION`) must stay on until every node's MCP env carries the
 secret, and why the config parse should `console.error` once at startup when federation is remotely
 exposed (a non-loopback `allowed_ips` entry) but no secret is set, so an un-keyed node is visible
 rather than silent.
@@ -96,6 +97,13 @@ inherits a later MCP server's environment. On those nodes the secret must live i
 service's own environment** (the unit's `Environment=` / `EnvironmentFile=`, or the task's env), not
 only the MCP launch env, or the supervised broker keeps running unkeyed while keyed siblings reject
 it once grace is off. The rollout step sets the secret in both places.
+
+A third case is an already-running **auto-spawned** broker from a prior session. `ensureBroker` returns
+early when a healthy broker already answers (server.ts:84-89), so a broker launched before the secret
+was added to the MCP env keeps the environment it started with and won't pick the secret up — adding it
+to the MCP config only keys brokers spawned *after* the change. Keying a node therefore includes
+restarting any broker already running on it (kill it and let the next session re-spawn it, or restart
+the supervised unit), not just editing the env.
 
 ### Sign (sender — broker.ts:610 and :745)
 Add `signFederation(method, path, bodyString, secret)` returning `{ ts, sig }`. Attach two headers to
@@ -122,8 +130,8 @@ The secret is config, not a peer-row column, so `stripToken` / `toGossipPeer` ar
 verify block must never echo the secret or a computed sig back in a response.
 
 ### Migration (rolling upgrade)
-Reuse the `ALLOW_UNSIGNED` pattern the per-session tokens shipped with. Add
-`ALLOW_UNSIGNED_FEDERATION` (env): while true, a federation request that presents no signature is
+Reuse the `CLAUDE_PEERS_ALLOW_UNSIGNED` pattern the per-session tokens shipped with (broker.ts:365). Add
+`CLAUDE_PEERS_ALLOW_UNSIGNED_FEDERATION` (env): while true, a federation request that presents no signature is
 accepted and logged, so a sibling still on the old binary keeps federating during the window; a
 *wrong* signature always 401s. Flip it off once every node is keyed and re-deployed.
 
@@ -131,7 +139,7 @@ accepted and logged, so a sibling still on the old binary keeps federating durin
 The opt-in `absent secret → IP-only` fallback is safe *only during the grace window*. Conditioning
 verification on `config.federation_secret` being set means a node that accidentally starts with no
 secret keeps accepting unsigned IP-only `/gossip` and `/forward-message` even after
-`ALLOW_UNSIGNED_FEDERATION` is off — a missed-secret deploy would sit permanently unauthenticated with
+`CLAUDE_PEERS_ALLOW_UNSIGNED_FEDERATION` is off — a missed-secret deploy would sit permanently unauthenticated with
 no enforcement point. So make absent-secret fatal in that one state.
 
 Key the guard on **federation exposure, not on the outbound `siblings` list.** What makes a node
@@ -159,8 +167,12 @@ bypass.
 ### What it unlocks
 Once federation traffic is authenticated, `floor_remote_forwards = false` becomes safe to ship as the
 default again, because a remote push now proves fleet-secret possession before it can auto-paste into
-a pane. The issue thread already names this as the gate for flipping that default. Treat the flip as a
-separate follow-up after the auth lands and bakes, not part of this change.
+a pane. The issue thread already names this as the gate for flipping that default. Gate the flip on
+#15 as well, not on this auth alone: `handleForwardMessage` applies `floor_remote_forwards` to every
+forward (broker.ts:650), so once the default pushes, the #15 loopback path — a local caller hitting
+token-exempt `/forward-message` — becomes the remaining unauthenticated auto-paste vector. Both #4
+(this) and #15 should land before the flip. Treat the flip as a separate follow-up after the auth
+lands and bakes, not part of this change.
 
 ## Relationship to #15
 
@@ -186,11 +198,16 @@ Keep them as separate issues.
 - In-window replay of the *same* route is not closed. Within the skew window the same signed
   `/forward-message` replays
   into `handleForwardMessage` (broker.ts:631) and inserts a second message row, so the recipient's
-  pane gets a duplicate peer-attributed paste. (`/gossip` replay is an idempotent re-merge, harmless.)
-  Accept it for v1 — the replayer must already be inside the tunnel or on an allowlisted host, where
-  it holds the secret and could forge directly anyway — or add a seen-signature nonce cache as the v2
-  hook. The skew window only bounds replay relative to a bare bearer's open-ended window; it does not
-  eliminate it.
+  pane gets a duplicate peer-attributed paste. A `/gossip` replay is not fully harmless either:
+  `handleGossip` re-runs its prune — `DELETE FROM remote_peers WHERE machine = ? AND id NOT IN
+  (payload)`, or a full delete on an empty payload (broker.ts:682-689) — so a replayed stale or empty
+  gossip inside the skew window can drop peer rows that were legitimately present, until the next real
+  gossip restores them. Accept it for v1 — but note the replayer need not hold the secret: a party who
+  captured a signed request (via a leaked log line, error response, or crash dump — the same exposure
+  the HMAC rationale names) can replay it with only network reach to an allowlisted source IP, within
+  the skew window, on the same route. A seen-signature nonce cache is the v2 hook that closes it. The
+  skew window only bounds replay relative to a bare bearer's open-ended window; it does not eliminate
+  it.
 - The same-uid local-process residual is #15's scope, not this one's.
 
 ## Child-issue checklist
@@ -198,18 +215,23 @@ Keep them as separate issues.
 - [ ] config: add `federation_secret` (env-indirected) and opt-in parse, with a test that an unset
   secret preserves IP-only behavior *during grace*, plus a startup `console.error` when federation is
   remotely exposed (non-loopback `allowed_ips`) but no secret is set. (small)
-- [ ] fail-closed guard: when federation is remotely exposed and `ALLOW_UNSIGNED_FEDERATION` is off and
+- [ ] fail-closed guard: when federation is remotely exposed and `CLAUDE_PEERS_ALLOW_UNSIGNED_FEDERATION` is off and
   no secret is set, refuse startup (or 401 every federation route) — the missed-key catch in the truth
   table above, with a test per row. (small)
 - [ ] sign + verify: `signFederation(method, path, body, secret)` plus the verify block, binding
   method + path into the HMAC, `req.text()` → HMAC → `JSON.parse` on the request path, constant-time
-  compare, skew window. (medium, security-touching — Codex 5.5 high gate per the repo PR workflow)
+  compare, skew window. Also update the gossip sender: `gossipToSiblings` marks an attempt successful
+  the moment `fetch` resolves and never checks `res.ok` (broker.ts:745-754), so once verifiers start
+  returning 401 for unsigned gossip, add a `res.ok` check there or a rejected gossip is silently
+  treated as delivered. (medium, security-touching — warrants the high-effort review gate per the repo
+  PR workflow)
 - [ ] rollout env: set the secret in both the MCP server launch env and any supervised broker
   service/task environment (the early-return reuse path means a supervised broker won't inherit the
   MCP env). (ops)
-- [ ] migration: `ALLOW_UNSIGNED_FEDERATION` grace flag mirroring `ALLOW_UNSIGNED`. (small)
+- [ ] migration: `CLAUDE_PEERS_ALLOW_UNSIGNED_FEDERATION` grace flag mirroring `ALLOW_UNSIGNED`. (small)
 - [ ] tests: forged-sig 401, replay-outside-skew 401, valid-sig 200, unset-secret bypass,
   grace-window unsigned accept. (medium)
 - [ ] rollout: put the secret in each node's MCP server launch env (from pass) so every auto-spawned
-  broker inherits it, redeploy, then flip the grace flag off. (ops)
+  broker inherits it, restart any broker already running so the re-spawn picks up the secret, redeploy,
+  then flip the grace flag off. (ops)
 - [ ] follow-up: flip `floor_remote_forwards` default to false once auth is baked. (separate issue)
