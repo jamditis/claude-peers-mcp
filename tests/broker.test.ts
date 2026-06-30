@@ -3,6 +3,8 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   generatePeerId,
   isAllowedIp,
@@ -12,7 +14,7 @@ import {
   resolveTargetBroker,
 } from "../broker.ts";
 
-const TEST_DB = "/tmp/test-claude-peers-unit.db";
+const TEST_DB = join(tmpdir(), "test-claude-peers-unit.db");
 
 function createTestDb(): Database {
   const db = new Database(TEST_DB);
