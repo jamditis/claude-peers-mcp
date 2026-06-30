@@ -1,11 +1,22 @@
 // tests/integration.test.ts
 
 import { Database } from "bun:sqlite";
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe as bunDescribe, expect, it } from "bun:test";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PROTOCOL_VERSION } from "../shared/types.ts";
+
+// #22: this suite drives a live broker through a shell-based `tmux` stub (a
+// `#!/usr/bin/env bash` script made executable with `chmodSync(..., 0o755)`, see
+// makeStubTmux below), which native Windows cannot exec, so the tmux-stub
+// delivery tests fail there. Gate the whole broker+tmux integration suite behind
+// a platform check: on win32 it skips instead of failing at exec time; on POSIX
+// `skipIf(false)` is a no-op and every test runs exactly as before. This removes
+// the bash-stub-exec failure class only. It is not on its own enough to make
+// `bun test` pass on native Windows, because the remaining unit suites still
+// hardcode `/tmp` paths (config/broker/delivery); that is tracked in #53.
+const describe = bunDescribe.skipIf(process.platform === "win32");
 
 // Create a directory holding a fake `tmux` executable that records its argv and
 // exits 0, so the broker's tmux backend is deterministic without a real tmux.
