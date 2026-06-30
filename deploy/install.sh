@@ -17,6 +17,16 @@ if ! command -v bun &>/dev/null; then
   export PATH="$HOME/.bun/bin:$PATH"
 fi
 
+# Bun must be on PATH now. The systemd unit's ExecStart is rendered from its path
+# below, so if the install above failed (no network, etc.) command -v bun is empty
+# and we would write a broken ExecStart that leaves the broker unable to start.
+# Fail loudly here instead.
+if ! command -v bun &>/dev/null; then
+  echo "bun is not on PATH and the automatic install did not provide it." >&2
+  echo "Install bun manually (https://bun.sh), then re-run deploy/install.sh." >&2
+  exit 1
+fi
+
 # 2. Install deps
 cd "$PROJECT_DIR"
 bun install
