@@ -130,10 +130,33 @@ The secret is config, not a peer-row column, so `stripToken` / `toGossipPeer` ar
 verify block must never echo the secret or a computed sig back in a response.
 
 ### Migration (rolling upgrade)
-Reuse the `CLAUDE_PEERS_ALLOW_UNSIGNED` pattern the per-session tokens shipped with (broker.ts:365). Add
-`CLAUDE_PEERS_ALLOW_UNSIGNED_FEDERATION` (env): while true, a federation request that presents no signature is
-accepted and logged, so a sibling still on the old binary keeps federating during the window; a
-*wrong* signature always 401s. Flip it off once every node is keyed and re-deployed.
+Reuse the `CLAUDE_PEERS_ALLOW_UNSIGNED` pattern the per-session tokens shipped with (broker.ts:365), with one
+deliberate change: the default. Add `CLAUDE_PEERS_ALLOW_UNSIGNED_FEDERATION` (env): while true, a federation
+request that presents no signature is accepted and logged, so a sibling still on the old binary keeps
+federating during the window; a *wrong* signature always 401s. Flip it off once every node is keyed and
+re-deployed.
+
+The flag defaults **off**, matching the per-session `ALLOW_UNSIGNED` (which parses `=== "1"`, broker.ts:365):
+the steady state is enforcement, so a keyed node rejects unsigned federation by default instead of carrying
+the #4 spoofing hole open until an operator remembers to harden it. Defaulting on would make the security fix
+opt-in (a node with a secret but no explicit flip-off would accept unsigned `/gossip` and `/forward-message`
+forever), so the rollout window is an explicit migration setting, not the default. Opening it is the *first*
+rollout step: set `CLAUDE_PEERS_ALLOW_UNSIGNED_FEDERATION=1` across the fleet before deploying the verifying
+binary to any remotely exposed node, so an exposed node that upgrades before it is keyed accepts unsigned
+IP-only traffic during the window instead of tripping the fail-closed last row. Clearing the flag is the
+*last* step, once every node is keyed. Both failure modes point safe: forget to open the window and the first
+exposed un-keyed node fails closed (a loud federation outage, never a silent bypass), and the window is only
+ever permissive because an operator deliberately set it, with the startup `console.error` for an
+exposed-but-unkeyed node keeping that state visible. The rest of the `ALLOW_UNSIGNED` pattern carries over: an
+env flag, present-but-wrong always 401s, grace forgives only a missing signature.
+
+A keyed sender reaching an un-keyed receiver mid-rollout is not an error. The verify branch is gated on
+`federation_secret` being set (Verify, above), so a node with no secret never recomputes or compares a
+signature and never inspects `X-Fleet-Sig`: a keyed sibling's signed `/gossip` or `/forward-message` lands
+there as an ordinary IP-only request and is accepted exactly like an unsigned one. The asymmetry a rolling
+upgrade might fear (keyed senders rejected until every receiver is keyed) never arises, because a present
+signature is only ever rejected by a node that holds a secret to check it against, and that node accepts a
+valid one.
 
 ### Fail closed when keyed-and-grace-off but no secret
 The opt-in `absent secret → IP-only` fallback is safe *only during the grace window*. Conditioning
@@ -153,7 +176,7 @@ parse and the gate enforce together:
 | federation exposed (non-loopback `allowed_ips`) | grace flag | secret set | behavior |
 |---|---|---|---|
 | no | — | — | loopback-only island; secret irrelevant |
-| yes | on | no | unsigned accepted and logged (the rollout window) |
+| yes | on | no | accepted IP-only and logged: with no secret the node never reaches the verify branch, so it ignores any signature a keyed sender attached (the rollout window) |
 | yes | on | yes | a *present* signature must be valid (wrong → 401); an *absent* one is accepted and logged — the `ALLOW_UNSIGNED` grace, so an old unsigned sibling keeps talking during rollout |
 | yes | off | yes | every federation request must carry a valid signature; absent or wrong → 401 |
 | **yes** | **off** | **no** | **fail closed: refuse startup, or 401 every federation route** |
@@ -163,6 +186,41 @@ signature always 401s, on or off, so the grace window never weakens a node that 
 last row is the missed-key catch — once the operator declares the rollout done (grace off), a remotely
 exposed node with no secret is a misconfiguration, not a legacy peer, and must not silently preserve the
 bypass.
+
+### Secret rotation (previous-secret acceptance window)
+The Decision and the residual-risk note both lean on rotation as the only containment once the *secret*
+leaks, so rotation has to be a procedure that does not force a fleet-wide outage. A single shared secret
+makes a naive rotation a hard cut: a node switched to the new secret signs requests that siblings still on
+the old secret reject as a wrong signature (401), and old-secret senders fail against an already-rotated
+receiver, so swapping one secret for another in place forces either a coordinated fleet stop or a federation
+outage for the length of the roll.
+
+Close that with a previous-secret acceptance window. Add `federation_secret_previous?: string` to
+`PeersConfig`, env-indirected like `federation_secret`. Senders always sign with `federation_secret` (the
+current one); the verify branch accepts a signature that validates under **either** `federation_secret` or,
+when set, `federation_secret_previous` (recompute and `timingSafeEqual` against the current secret first,
+then the previous on a miss). Acceptance becomes a two-key set while the sender side stays single-key, which
+is what lets the two sides cross over without a synchronized restart.
+
+Rotation is then three rolling passes, each node-by-node with the same broker restart that keying needs:
+1. **Seed acceptance.** Set `federation_secret_previous = S_new` on every node, leaving `federation_secret =
+   S_old`. Every node now accepts both secrets and every node still signs `S_old`; nothing has cut over yet.
+2. **Cut over signing.** Set `federation_secret = S_new` and `federation_secret_previous = S_old` on every
+   node. Each node now signs `S_new`, which every node already accepts from pass 1, and still accepts
+   `S_old`, so a sibling not yet flipped keeps validating. Order within the pass does not matter.
+3. **Drop the old.** Clear `federation_secret_previous` on every node. Acceptance narrows back to the single
+   new secret and `S_old` is retired.
+
+Each pass must finish on every node before the next begins: pass 2's safety rests on every node having
+completed pass 1 (so `S_new` is already accepted everywhere before anyone signs it), and pass 3 on every node
+having completed pass 2. Within a pass node order is free, but the passes are a strict fleet-wide sequence,
+not a per-node loop through all three: rotating a single node through 1-2-3 while its siblings sit at `S_old`
+leaves it signing and accepting only `S_new` against peers that sign and accept only `S_old`, the mutual
+401 outage this procedure exists to avoid. No pass ever presents a signature a peer cannot validate, so
+federation stays up throughout. A coordinated
+stop (set the new secret everywhere, restart the fleet together, wear a brief federation pause) is the
+documented minimal fallback when the fleet is small enough that the pause is cheaper than carrying a second
+secret field, the same minimal-fallback stance the Decision takes toward a bare bearer.
 
 ### What it unlocks
 Once federation traffic is authenticated, `floor_remote_forwards = false` becomes safe to ship as the
@@ -187,8 +245,9 @@ Keep them as separate issues.
 ## Residual risk (named, not hidden)
 
 - A static fleet secret is held by every node, so one compromised node's secret reauthorizes the whole
-  fleet until rotation. mTLS would scope a compromise to one revocable cert. Accept for v1; revisit
-  mTLS if per-node revocation becomes necessary.
+  fleet until rotation. The previous-secret window (Secret rotation, above) makes that rotation a no-outage
+  roll rather than a fleet stop, but it is still fleet-wide: every node re-keys, where mTLS would scope a
+  compromise to one revocable cert. Accept for v1; revisit mTLS if per-node revocation becomes necessary.
 - Cross-route replay is closed by binding method and path into the signed string (Sign, above), not
   left to JSON validation. The earlier framing — "the body shapes are disjoint, so a cross-route
   replay fails validation" — does not hold: `/gossip` runs `mergeGossipPeers(db, body.peers, ...)`
@@ -228,7 +287,12 @@ Keep them as separate issues.
 - [ ] rollout env: set the secret in both the MCP server launch env and any supervised broker
   service/task environment (the early-return reuse path means a supervised broker won't inherit the
   MCP env). (ops)
-- [ ] migration: `CLAUDE_PEERS_ALLOW_UNSIGNED_FEDERATION` grace flag mirroring `ALLOW_UNSIGNED`. (small)
+- [ ] migration: `CLAUDE_PEERS_ALLOW_UNSIGNED_FEDERATION` grace flag mirroring `ALLOW_UNSIGNED` (default
+  off, opened explicitly as the first rollout step and cleared as the last), with a test that a keyed node
+  rejects unsigned federation by default and accepts it only while the flag is set. (small)
+- [ ] rotation: add `federation_secret_previous` (env-indirected) and accept a signature valid under the
+  current or the previous secret, with a test that a previous-secret signature validates and that clearing
+  the previous secret stops accepting the old one. (small)
 - [ ] tests: forged-sig 401, replay-outside-skew 401, valid-sig 200, unset-secret bypass,
   grace-window unsigned accept. (medium)
 - [ ] rollout: put the secret in each node's MCP server launch env (from pass) so every auto-spawned
