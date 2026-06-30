@@ -54,6 +54,11 @@ function regSender(overrides: Record<string, unknown> = {}) {
 }
 
 beforeAll(async () => {
+  // #22: the suites below are gated off win32, but Bun runs a file-scoped beforeAll even when
+  // every suite in the file is skipped. This setup is POSIX-only (it writes a `#!/usr/bin/env bash`
+  // tmux stub, chmods it executable, and spawns a broker), so guard it too: on win32 the gated
+  // suites do not run, so nothing needs it; on POSIX this returns false and the setup runs as before.
+  if (process.platform === "win32") return;
   // Stub tmux: reports a version (so the broker sees tmux available and a %pane registers as
   // 'tmux'), records argv, exits 0 — enough for a tmux recipient to take the push path.
   const stub = join(work, "tmux");
