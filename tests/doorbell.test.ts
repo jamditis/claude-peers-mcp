@@ -5,11 +5,18 @@
 // id; a send to a tmux recipient writes no marker (it already gets an active push); /peek
 // reports the backlog without consuming it; and /peek is token-gated to the caller's id.
 
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe as bunDescribe, expect, it } from "bun:test";
 import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { doorbellPath, readDoorbell, writeDoorbell } from "../shared/notify.ts";
+
+// #22: this suite spins up a real broker with a shell-based `tmux` stub (shebang +
+// `chmodSync` executable bit), which native Windows cannot exec. Gate it behind a
+// platform check: on win32 it skips instead of failing at exec time; on POSIX
+// `skipIf(false)` is a no-op. This removes the bash-stub-exec failure class only;
+// the remaining unit suites still hardcode `/tmp` paths, tracked in #53.
+const describe = bunDescribe.skipIf(process.platform === "win32");
 
 const PORT = 17940;
 const work = mkdtempSync(join(tmpdir(), "doorbell-it-"));
@@ -47,6 +54,11 @@ function regSender(overrides: Record<string, unknown> = {}) {
 }
 
 beforeAll(async () => {
+  // #22: the suites below are gated off win32, but Bun runs a file-scoped beforeAll even when
+  // every suite in the file is skipped. This setup is POSIX-only (it writes a `#!/usr/bin/env bash`
+  // tmux stub, chmods it executable, and spawns a broker), so guard it too: on win32 the gated
+  // suites do not run, so nothing needs it; on POSIX this returns false and the setup runs as before.
+  if (process.platform === "win32") return;
   // Stub tmux: reports a version (so the broker sees tmux available and a %pane registers as
   // 'tmux'), records argv, exits 0 — enough for a tmux recipient to take the push path.
   const stub = join(work, "tmux");
