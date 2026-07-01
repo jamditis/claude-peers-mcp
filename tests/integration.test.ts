@@ -496,6 +496,106 @@ describe("empty-broker self-exit", () => {
     }
   }, 25_000);
 
+  it("stays up while a heartbeat-stale live peer is inside prune grace", async () => {
+    const PORT = 17933;
+    const CONFIG = "/tmp/config-exit-stale-grace.json";
+    const DB = "/tmp/broker-exit-stale-grace.db";
+    const PEER_ID = "exg-stale00";
+    await Bun.write(CONFIG, JSON.stringify({
+      machine: "exg-a", tailscale_ip: "127.0.0.1", port: PORT, id_prefix: "exg",
+      siblings: [], allowed_ips: ["127.0.0.1"],
+    }));
+    try { unlinkSync(DB); } catch {}
+
+    const db = new Database(DB);
+    db.run(`CREATE TABLE peers (
+      id TEXT PRIMARY KEY, pid INTEGER NOT NULL, machine TEXT NOT NULL,
+      tailscale_ip TEXT NOT NULL, cwd TEXT NOT NULL, git_root TEXT, tty TEXT,
+      summary TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL, last_seen TEXT NOT NULL,
+      tmux_pane TEXT, tmux_socket TEXT, delivery_kind TEXT NOT NULL DEFAULT 'none', token TEXT
+    )`);
+    const stale = new Date(Date.now() - 120_000).toISOString();
+    db.prepare(
+      "INSERT INTO peers (id, pid, machine, tailscale_ip, cwd, git_root, tty, summary, registered_at, last_seen, tmux_pane, tmux_socket, delivery_kind, token) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(PEER_ID, process.pid, "exg-a", "127.0.0.1", "/tmp/exit-stale-grace", null, null, "stale", stale, stale, null, null, "none", "stale-token");
+    db.close();
+
+    const proc = Bun.spawn(["bun", "broker.ts"], {
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG,
+             CLAUDE_PEERS_DB: DB, CLAUDE_PEERS_IDLE_EXIT_MS: "2500",
+             CLAUDE_PEERS_STALE_PRUNE_GRACE_MS: "10000" },
+      stdout: "ignore", stderr: "ignore",
+    });
+    try {
+      let up = false;
+      for (let i = 0; i < 30; i++) {
+        try { if ((await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(300) })).ok) { up = true; break; } } catch {}
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      expect(up).toBe(true);
+
+      await new Promise((r) => setTimeout(r, 3_500));
+      const res = await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(500) });
+      expect(res.ok).toBe(true);
+    } finally {
+      proc.kill();
+      try { unlinkSync(DB); } catch {}
+      try { unlinkSync(CONFIG); } catch {}
+    }
+  }, 15_000);
+
+  it("self-exits when only prune-ready heartbeat-stale peers remain", async () => {
+    const PORT = 17932;
+    const CONFIG = "/tmp/config-exit-stale.json";
+    const DB = "/tmp/broker-exit-stale.db";
+    const PEER_ID = "exs-stale00";
+    await Bun.write(CONFIG, JSON.stringify({
+      machine: "exs-a", tailscale_ip: "127.0.0.1", port: PORT, id_prefix: "exs",
+      siblings: [], allowed_ips: ["127.0.0.1"],
+    }));
+    try { unlinkSync(DB); } catch {}
+
+    const db = new Database(DB);
+    db.run(`CREATE TABLE peers (
+      id TEXT PRIMARY KEY, pid INTEGER NOT NULL, machine TEXT NOT NULL,
+      tailscale_ip TEXT NOT NULL, cwd TEXT NOT NULL, git_root TEXT, tty TEXT,
+      summary TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL, last_seen TEXT NOT NULL,
+      tmux_pane TEXT, tmux_socket TEXT, delivery_kind TEXT NOT NULL DEFAULT 'none', token TEXT
+    )`);
+    const stale = new Date(Date.now() - 120_000).toISOString();
+    db.prepare(
+      "INSERT INTO peers (id, pid, machine, tailscale_ip, cwd, git_root, tty, summary, registered_at, last_seen, tmux_pane, tmux_socket, delivery_kind, token) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(PEER_ID, process.pid, "exs-a", "127.0.0.1", "/tmp/exit-stale", null, null, "stale", stale, stale, null, null, "none", "stale-token");
+    db.close();
+
+    const proc = Bun.spawn(["bun", "broker.ts"], {
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG,
+             CLAUDE_PEERS_DB: DB, CLAUDE_PEERS_IDLE_EXIT_MS: "2500",
+             CLAUDE_PEERS_STALE_PRUNE_GRACE_MS: "1000" },
+      stdout: "ignore", stderr: "ignore",
+    });
+    try {
+      let up = false;
+      for (let i = 0; i < 30; i++) {
+        try { if ((await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(300) })).ok) { up = true; break; } } catch {}
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      expect(up).toBe(true);
+
+      let down = false;
+      for (let i = 0; i < 40; i++) {
+        try { await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(300) }); }
+        catch { down = true; break; }
+        await new Promise((r) => setTimeout(r, 300));
+      }
+      expect(down).toBe(true);
+    } finally {
+      proc.kill();
+      try { unlinkSync(DB); } catch {}
+      try { unlinkSync(CONFIG); } catch {}
+    }
+  }, 25_000);
+
   it("stays up with CLAUDE_PEERS_IDLE_EXIT_MS=0 even when idle (systemd-safe default)", async () => {
     const PORT = 17909;
     await Bun.write("/tmp/config-noexit.json", JSON.stringify({
@@ -958,7 +1058,7 @@ describe("send/forward to a dead-but-unswept local peer is honest", () => {
 });
 
 describe("broker restart preserves live peers until they can heartbeat", () => {
-  const PORT = 17920;
+  const PORT = 17930;
   const CONFIG = "/tmp/config-restartlive.json";
   const DB = "/tmp/broker-restartlive.db";
   const PEER_ID = "rst-live000";

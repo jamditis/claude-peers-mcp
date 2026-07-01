@@ -31,7 +31,7 @@ import { PROTOCOL_VERSION } from "./shared/types.ts";
 const GOSSIP_INTERVAL_MS = 5_000;
 const CLEANUP_INTERVAL_MS = 15_000;
 export const LOCAL_PEER_TTL_MS = 45_000;
-const BROKER_STARTUP_HEARTBEAT_GRACE_MS = LOCAL_PEER_TTL_MS;
+export const LOCAL_PEER_STALE_PRUNE_GRACE_MS = LOCAL_PEER_TTL_MS;
 const REMOTE_TTL_MS = 30_000;
 const DELIVERED_TTL_MS = 60_000;
 const QUEUED_MAX_AGE_MS = 24 * 60 * 60_000; // lossy backstop
@@ -77,6 +77,35 @@ export function pruneRemotePeers(db: Database, ttlMs: number): number {
 export function isLocalPeerStale(lastSeen: string, ttlMs = LOCAL_PEER_TTL_MS, nowMs = Date.now()): boolean {
   const seenMs = Date.parse(lastSeen);
   return Number.isFinite(seenMs) && seenMs < nowMs - ttlMs;
+}
+
+export function isLocalPeerStalePrunable(
+  lastSeen: string,
+  brokerStartedAtMs: number,
+  nowMs = Date.now(),
+  ttlMs = LOCAL_PEER_TTL_MS,
+  pruneGraceMs = LOCAL_PEER_STALE_PRUNE_GRACE_MS,
+): boolean {
+  const seenMs = Date.parse(lastSeen);
+  if (!Number.isFinite(seenMs)) return false;
+  const staleAtMs = seenMs + ttlMs;
+  if (nowMs <= staleAtMs) return false;
+  const earliestPruneMs = Math.max(staleAtMs, brokerStartedAtMs) + pruneGraceMs;
+  return nowMs >= earliestPruneMs;
+}
+
+export function shouldPruneLocalPeer(
+  { deadPid, staleHeartbeat, stalePruneReady }: {
+    deadPid: boolean;
+    staleHeartbeat: boolean;
+    stalePruneReady: boolean;
+  },
+): boolean {
+  if (deadPid) return true;
+  // A stale heartbeat first quarantines a live peer from list/send/gossip. Delete it only after
+  // an extra grace window, so transient sleep/stall gaps can heartbeat and keep their mail/token.
+  if (staleHeartbeat && stalePruneReady) return true;
+  return false;
 }
 
 export function resolveTargetBroker(
@@ -178,6 +207,10 @@ if (import.meta.main) {
   const config = loadConfig();
   const PORT = config.port;
   const DB_PATH = config.db_path;
+  const LOCAL_STALE_PRUNE_GRACE_MS = (() => {
+    const v = parseInt(process.env.CLAUDE_PEERS_STALE_PRUNE_GRACE_MS ?? "", 10);
+    return Number.isFinite(v) && v >= 0 ? v : LOCAL_PEER_STALE_PRUNE_GRACE_MS;
+  })();
 
   // --- Database setup ---
   const brokerStartedAtMs = Date.now();
@@ -304,14 +337,15 @@ if (import.meta.main) {
     const peers = db.query("SELECT id, pid, last_seen FROM peers").all() as { id: string; pid: number; last_seen: string }[];
     const nowMs = Date.now();
     for (const peer of peers) {
-      // A peer is gone if its process is dead OR if its MCP server stopped heartbeating.
-      // PID-existence alone is insufficient: an orphaned server.ts process can outlive its
-      // Claude/Codex host and keep a real PID while no session can ever poll the peer id.
-      // The staleness window is a small multiple of the 15s heartbeat interval, matching the
-      // delivery design's heartbeat-staleness bound.
+      // A dead PID prunes immediately. A stale heartbeat quarantines the peer first; after one
+      // extra grace window, treat it as wedged and delete its now-unreachable mail instead of
+      // leaving it for the 24h lossy queue backstop.
       const deadPid = isPidDead(pidProbe(peer.pid));
-      const staleHeartbeat = localHeartbeatPrunable(peer.last_seen, nowMs);
-      if (!deadPid && !staleHeartbeat) continue;
+      const staleHeartbeat = isLocalPeerStale(peer.last_seen, LOCAL_PEER_TTL_MS, nowMs);
+      const stalePruneReady = isLocalPeerStalePrunable(
+        peer.last_seen, brokerStartedAtMs, nowMs, LOCAL_PEER_TTL_MS, LOCAL_STALE_PRUNE_GRACE_MS,
+      );
+      if (!shouldPruneLocalPeer({ deadPid, staleHeartbeat, stalePruneReady })) continue;
       // Never delete a recipient's rows while one of its messages is mid-delivery:
       // deliverNext awaits the tmux spawn, and deleting the 'delivering' row out from
       // under it would corrupt the lease and could drop a message the pane already
@@ -440,12 +474,15 @@ if (import.meta.main) {
     return p !== null && !isPidDead(pidProbe(p.pid)) && !isLocalPeerStale(p.last_seen, LOCAL_PEER_TTL_MS);
   }
 
-  function localHeartbeatPrunable(lastSeen: string, nowMs = Date.now()): boolean {
-    if (!isLocalPeerStale(lastSeen, LOCAL_PEER_TTL_MS, nowMs)) return false;
-    // A broker restart can leave still-running MCP servers with an old last_seen because
-    // the broker was down when their heartbeats fired. Keep the row long enough for the
-    // server's own heartbeat to refresh it, but keep list/send/gossip using strict staleness.
-    return nowMs - brokerStartedAtMs >= BROKER_STARTUP_HEARTBEAT_GRACE_MS;
+  function hasRecoverableLocalPeer(): boolean {
+    const nowMs = Date.now();
+    return (selectAllPeers.all() as Peer[]).some(p => {
+      if (pendingPeerDeletes.has(p.id) || isPidDead(pidProbe(p.pid))) return false;
+      if (!isLocalPeerStale(p.last_seen, LOCAL_PEER_TTL_MS, nowMs)) return true;
+      return !isLocalPeerStalePrunable(
+        p.last_seen, brokerStartedAtMs, nowMs, LOCAL_PEER_TTL_MS, LOCAL_STALE_PRUNE_GRACE_MS,
+      );
+    });
   }
 
   // Attempt to deliver the recipient's head-of-line row. Serial per recipient.
@@ -795,15 +832,16 @@ if (import.meta.main) {
   const cleanupTimer = setInterval(cleanStalePeers, CLEANUP_INTERVAL_MS);
 
   // --- Idle self-exit (opt-in; see IDLE_EXIT_MS) ---
-  // Exits only when there are zero live peers, zero in-flight deliveries, and the idle
-  // window has elapsed since the last POST. Disabled (idleTimer null) when IDLE_EXIT_MS<=0.
+  // Exits only when there are zero recoverable local peers, zero in-flight deliveries, and the
+  // idle window has elapsed since the last POST. Disabled (idleTimer null) when IDLE_EXIT_MS<=0.
   // Runs on its own timer rather than piggybacking the 15s peer sweep so a short window is
   // observable and reaping is timely; the cadence is clamped so production (a multi-minute
   // window) checks coarsely while a sub-second test window checks promptly.
   function maybeIdleExit(): void {
     if (IDLE_EXIT_MS <= 0 || retiring) return;
     if (hasWorkInFlight()) return;
-    if ((selectAllPeers.all() as unknown[]).length > 0) return;
+    cleanStalePeers();
+    if (hasRecoverableLocalPeer()) return;
     if (Date.now() - lastActivityAt <= IDLE_EXIT_MS) return;
     console.error("[claude-peers broker] idle with no peers; exiting");
     // Route through retire() rather than duplicating teardown here: retire() announces an empty

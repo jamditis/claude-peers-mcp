@@ -8,11 +8,13 @@ import { join } from "node:path";
 import {
   generatePeerId,
   isLocalPeerStale,
+  isLocalPeerStalePrunable,
   isAllowedIp,
   mergeGossipPeers,
   pruneRemotePeers,
   recordGossipResult,
   resolveTargetBroker,
+  shouldPruneLocalPeer,
 } from "../broker.ts";
 
 const TEST_DB = join(tmpdir(), "test-claude-peers-unit.db");
@@ -154,6 +156,66 @@ describe("isLocalPeerStale", () => {
 
   it("does not delete rows with unparseable last_seen values", () => {
     expect(isLocalPeerStale("not-a-date", 45_000, now)).toBe(false);
+  });
+});
+
+describe("isLocalPeerStalePrunable", () => {
+  const now = Date.parse("2026-07-01T12:00:00.000Z");
+  const ttlMs = 45_000;
+  const pruneGraceMs = 45_000;
+
+  it("does not prune before the local peer TTL has elapsed", () => {
+    const lastSeen = "2026-07-01T11:59:30.000Z";
+    const brokerStartedAtMs = Date.parse("2026-07-01T11:55:00.000Z");
+
+    expect(isLocalPeerStalePrunable(lastSeen, brokerStartedAtMs, now, ttlMs, pruneGraceMs)).toBe(false);
+  });
+
+  it("keeps a stale live peer through the extra prune grace window", () => {
+    const lastSeen = "2026-07-01T11:59:00.000Z";
+    const brokerStartedAtMs = Date.parse("2026-07-01T11:55:00.000Z");
+
+    expect(isLocalPeerStalePrunable(lastSeen, brokerStartedAtMs, now, ttlMs, pruneGraceMs)).toBe(false);
+  });
+
+  it("prunes a stale live peer after TTL plus prune grace", () => {
+    const lastSeen = "2026-07-01T11:58:00.000Z";
+    const brokerStartedAtMs = Date.parse("2026-07-01T11:55:00.000Z");
+
+    expect(isLocalPeerStalePrunable(lastSeen, brokerStartedAtMs, now, ttlMs, pruneGraceMs)).toBe(true);
+  });
+
+  it("gives already-stale rows a broker-start grace window", () => {
+    const lastSeen = "2026-07-01T11:58:00.000Z";
+    const brokerStartedAtMs = Date.parse("2026-07-01T11:59:30.000Z");
+
+    expect(isLocalPeerStalePrunable(lastSeen, brokerStartedAtMs, now, ttlMs, pruneGraceMs)).toBe(false);
+  });
+});
+
+describe("shouldPruneLocalPeer", () => {
+  it("prunes a dead pid even when its heartbeat is fresh", () => {
+    expect(shouldPruneLocalPeer({
+      deadPid: true,
+      staleHeartbeat: false,
+      stalePruneReady: false,
+    })).toBe(true);
+  });
+
+  it("does not delete a live pid only because its heartbeat is newly stale", () => {
+    expect(shouldPruneLocalPeer({
+      deadPid: false,
+      staleHeartbeat: true,
+      stalePruneReady: false,
+    })).toBe(false);
+  });
+
+  it("prunes a stale live pid after the recovery grace window expires", () => {
+    expect(shouldPruneLocalPeer({
+      deadPid: false,
+      staleHeartbeat: true,
+      stalePruneReady: true,
+    })).toBe(true);
   });
 });
 
