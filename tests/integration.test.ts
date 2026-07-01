@@ -447,6 +447,12 @@ describe("dead push path removed", () => {
     expect(src).not.toContain("/peek-messages");
     expect(src).not.toContain("/ack-messages");
   });
+  it("server.ts cleans up when the stdio host disconnects", () => {
+    const src = readFileSync("server.ts", "utf-8");
+    expect(src).toContain('process.stdin.once("end"');
+    expect(src).toContain('process.stdin.once("close"');
+    expect(src).toContain("cleanupStarted");
+  });
 });
 
 // Empty-broker self-exit (Task 14). Opt-in via a positive CLAUDE_PEERS_IDLE_EXIT_MS;

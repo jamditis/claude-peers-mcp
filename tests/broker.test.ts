@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   generatePeerId,
+  isLocalPeerStale,
   isAllowedIp,
   mergeGossipPeers,
   pruneRemotePeers,
@@ -137,6 +138,22 @@ describe("pruneRemotePeers", () => {
     const remaining = db.query("SELECT * FROM remote_peers").all() as any[];
     expect(remaining).toHaveLength(1);
     expect(remaining[0].id).toBe("gam-fresh222");
+  });
+});
+
+describe("isLocalPeerStale", () => {
+  const now = Date.parse("2026-07-01T12:00:00.000Z");
+
+  it("marks a peer stale when last_seen is older than the local TTL", () => {
+    expect(isLocalPeerStale("2026-07-01T11:59:00.000Z", 45_000, now)).toBe(true);
+  });
+
+  it("keeps a peer fresh inside the local TTL", () => {
+    expect(isLocalPeerStale("2026-07-01T11:59:30.000Z", 45_000, now)).toBe(false);
+  });
+
+  it("does not delete rows with unparseable last_seen values", () => {
+    expect(isLocalPeerStale("not-a-date", 45_000, now)).toBe(false);
   });
 });
 

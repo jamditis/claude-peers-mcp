@@ -520,24 +520,13 @@ async function main() {
   myAuthToken = reg.token; // capability for every subsequent control-plane call this session
   log(`Registered as peer ${myId}`);
 
-  // 5. Connect MCP over stdio
-  await mcp.connect(new StdioServerTransport());
-  log("MCP connected");
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  let cleanupStarted = false;
 
-  // 6. Start heartbeat
-  const heartbeatTimer = setInterval(async () => {
-    if (myId) {
-      try {
-        await brokerFetch("/heartbeat", { id: myId });
-      } catch {
-        // Non-critical
-      }
-    }
-  }, HEARTBEAT_INTERVAL_MS);
-
-  // 8. Clean up on exit
   const cleanup = async () => {
-    clearInterval(heartbeatTimer);
+    if (cleanupStarted) return;
+    cleanupStarted = true;
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (myId) {
       try {
         await brokerFetch("/unregister", { id: myId });
@@ -549,8 +538,30 @@ async function main() {
     process.exit(0);
   };
 
+  // If the MCP host closes stdio without sending a signal, this server has no useful
+  // work left to do. Unregister and exit so it cannot keep heartbeating as a ghost peer.
+  process.stdin.once("end", () => { void cleanup(); });
+  process.stdin.once("close", () => { void cleanup(); });
+
+  // 5. Connect MCP over stdio
+  await mcp.connect(new StdioServerTransport());
+  log("MCP connected");
+
+  // 6. Start heartbeat
+  heartbeatTimer = setInterval(async () => {
+    if (myId) {
+      try {
+        await brokerFetch("/heartbeat", { id: myId });
+      } catch {
+        // Non-critical
+      }
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+
+  // 8. Clean up on exit
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
+  process.on("SIGHUP", cleanup);
 }
 
 main().catch((e) => {

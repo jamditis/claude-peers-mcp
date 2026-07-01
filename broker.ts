@@ -30,6 +30,7 @@ import { PROTOCOL_VERSION } from "./shared/types.ts";
 
 const GOSSIP_INTERVAL_MS = 5_000;
 const CLEANUP_INTERVAL_MS = 15_000;
+export const LOCAL_PEER_TTL_MS = 45_000;
 const REMOTE_TTL_MS = 30_000;
 const DELIVERED_TTL_MS = 60_000;
 const QUEUED_MAX_AGE_MS = 24 * 60 * 60_000; // lossy backstop
@@ -70,6 +71,11 @@ export function pruneRemotePeers(db: Database, ttlMs: number): number {
   const cutoff = new Date(Date.now() - ttlMs).toISOString();
   const result = db.run("DELETE FROM remote_peers WHERE last_seen < ?", [cutoff]);
   return result.changes;
+}
+
+export function isLocalPeerStale(lastSeen: string, ttlMs = LOCAL_PEER_TTL_MS, nowMs = Date.now()): boolean {
+  const seenMs = Date.parse(lastSeen);
+  return Number.isFinite(seenMs) && seenMs < nowMs - ttlMs;
 }
 
 export function resolveTargetBroker(
@@ -293,15 +299,17 @@ if (import.meta.main) {
 
   // --- Clean dead peers ---
   function cleanStalePeers() {
-    const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
+    const peers = db.query("SELECT id, pid, last_seen FROM peers").all() as { id: string; pid: number; last_seen: string }[];
+    const nowMs = Date.now();
     for (const peer of peers) {
-      // The pid probe is the only authoritative deadness signal (ESRCH alone — a foreign live
-      // pid gives EPERM and is NOT dead). A heartbeat gap never deletes a peer: a live but
-      // briefly stalled session (machine sleep, load spike, a wedged event loop) would
-      // otherwise lose its queued mail permanently and vanish from listings with no way to
-      // re-register. Mail for a genuinely abandoned-but-alive peer ages out via the
-      // queued-max-age backstop below, not on a transient gap.
-      if (!isPidDead(pidProbe(peer.pid))) continue;
+      // A peer is gone if its process is dead OR if its MCP server stopped heartbeating.
+      // PID-existence alone is insufficient: an orphaned server.ts process can outlive its
+      // Claude/Codex host and keep a real PID while no session can ever poll the peer id.
+      // The staleness window is a small multiple of the 15s heartbeat interval, matching the
+      // delivery design's heartbeat-staleness bound.
+      const deadPid = isPidDead(pidProbe(peer.pid));
+      const staleHeartbeat = isLocalPeerStale(peer.last_seen, LOCAL_PEER_TTL_MS, nowMs);
+      if (!deadPid && !staleHeartbeat) continue;
       // Never delete a recipient's rows while one of its messages is mid-delivery:
       // deliverNext awaits the tmux spawn, and deleting the 'delivering' row out from
       // under it would corrupt the lease and could drop a message the pane already
@@ -426,8 +434,8 @@ if (import.meta.main) {
   // re-verify liveness after the tmux send (the lease was claimed before the await), since a
   // 0 exit from send-keys does not prove a live peer consumed the text.
   function peerStillLive(toId: string): boolean {
-    const p = db.query("SELECT pid FROM peers WHERE id = ?").get(toId) as { pid: number } | null;
-    return p !== null && !isPidDead(pidProbe(p.pid));
+    const p = db.query("SELECT pid, last_seen FROM peers WHERE id = ?").get(toId) as { pid: number; last_seen: string } | null;
+    return p !== null && !isPidDead(pidProbe(p.pid)) && !isLocalPeerStale(p.last_seen, LOCAL_PEER_TTL_MS);
   }
 
   // Attempt to deliver the recipient's head-of-line row. Serial per recipient.
@@ -557,6 +565,7 @@ if (import.meta.main) {
     }
     localPeers = localPeers
       .filter(p => !isPidDead(pidProbe(p.pid)))
+      .filter(p => !isLocalPeerStale(p.last_seen, LOCAL_PEER_TTL_MS))
       // A peer pending deferred deletion is logically gone: its row lingers only so an in-flight
       // lease can settle. Don't advertise it, or a peer would address a superseded/departing id.
       .filter(p => !pendingPeerDeletes.has(p.id))
@@ -733,7 +742,7 @@ if (import.meta.main) {
   async function gossipToSiblings(peerList?: Peer[]) {
     const sourcePeers = peerList ?? (selectAllPeers.all() as Peer[]).filter(p => {
       try { process.kill(p.pid, 0); return true; } catch { return false; }
-    });
+    }).filter(p => !isLocalPeerStale(p.last_seen, LOCAL_PEER_TTL_MS));
     // Project every peer through the federated allow-list before it crosses a machine boundary,
     // regardless of whether the caller passed an explicit list or we read the table. This keeps the
     // local-only delivery coordinates (tmux_pane/tmux_socket/delivery_kind) on this host.
