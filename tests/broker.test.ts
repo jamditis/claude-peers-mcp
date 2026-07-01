@@ -6,12 +6,16 @@ import { unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  advanceStaleGraceFloor,
   generatePeerId,
+  isLocalPeerStale,
+  isLocalPeerStalePrunable,
   isAllowedIp,
   mergeGossipPeers,
   pruneRemotePeers,
   recordGossipResult,
   resolveTargetBroker,
+  shouldPruneLocalPeer,
 } from "../broker.ts";
 
 const TEST_DB = join(tmpdir(), "test-claude-peers-unit.db");
@@ -137,6 +141,126 @@ describe("pruneRemotePeers", () => {
     const remaining = db.query("SELECT * FROM remote_peers").all() as any[];
     expect(remaining).toHaveLength(1);
     expect(remaining[0].id).toBe("gam-fresh222");
+  });
+});
+
+describe("isLocalPeerStale", () => {
+  const now = Date.parse("2026-07-01T12:00:00.000Z");
+
+  it("marks a peer stale when last_seen is older than the local TTL", () => {
+    expect(isLocalPeerStale("2026-07-01T11:59:00.000Z", 45_000, now)).toBe(true);
+  });
+
+  it("keeps a peer fresh inside the local TTL", () => {
+    expect(isLocalPeerStale("2026-07-01T11:59:30.000Z", 45_000, now)).toBe(false);
+  });
+
+  it("does not delete rows with unparseable last_seen values", () => {
+    expect(isLocalPeerStale("not-a-date", 45_000, now)).toBe(false);
+  });
+});
+
+describe("isLocalPeerStalePrunable", () => {
+  const now = Date.parse("2026-07-01T12:00:00.000Z");
+  const ttlMs = 45_000;
+  const pruneGraceMs = 45_000;
+
+  it("does not prune before the local peer TTL has elapsed", () => {
+    const lastSeen = "2026-07-01T11:59:30.000Z";
+    const brokerStartedAtMs = Date.parse("2026-07-01T11:55:00.000Z");
+
+    expect(isLocalPeerStalePrunable(lastSeen, brokerStartedAtMs, now, ttlMs, pruneGraceMs)).toBe(false);
+  });
+
+  it("keeps a stale live peer through the extra prune grace window", () => {
+    const lastSeen = "2026-07-01T11:59:00.000Z";
+    const brokerStartedAtMs = Date.parse("2026-07-01T11:55:00.000Z");
+
+    expect(isLocalPeerStalePrunable(lastSeen, brokerStartedAtMs, now, ttlMs, pruneGraceMs)).toBe(false);
+  });
+
+  it("prunes a stale live peer after TTL plus prune grace", () => {
+    const lastSeen = "2026-07-01T11:58:00.000Z";
+    const brokerStartedAtMs = Date.parse("2026-07-01T11:55:00.000Z");
+
+    expect(isLocalPeerStalePrunable(lastSeen, brokerStartedAtMs, now, ttlMs, pruneGraceMs)).toBe(true);
+  });
+
+  it("gives already-stale rows a broker-start grace window", () => {
+    const lastSeen = "2026-07-01T11:58:00.000Z";
+    const brokerStartedAtMs = Date.parse("2026-07-01T11:59:30.000Z");
+
+    expect(isLocalPeerStalePrunable(lastSeen, brokerStartedAtMs, now, ttlMs, pruneGraceMs)).toBe(false);
+  });
+});
+
+describe("advanceStaleGraceFloor", () => {
+  const suspendGapMs = 45_000;
+  const ttlMs = 45_000;
+  const pruneGraceMs = 45_000;
+  const floor = Date.parse("2026-07-01T11:55:00.000Z");
+  const lastTick = Date.parse("2026-07-01T12:00:00.000Z");
+
+  it("keeps the floor when cleanup ticks arrive on their normal cadence", () => {
+    // 15s cadence, well under the 45s suspend threshold: not a freeze, so the floor is unchanged.
+    const now = lastTick + 15_000;
+    expect(advanceStaleGraceFloor(floor, lastTick, now, suspendGapMs)).toBe(floor);
+  });
+
+  it("advances the floor to now after a freeze longer than the suspend gap", () => {
+    // The loop was frozen for 10 minutes: the resumed tick is a time jump, not idle time.
+    const now = Date.parse("2026-07-01T12:10:00.000Z");
+    expect(advanceStaleGraceFloor(floor, lastTick, now, suspendGapMs)).toBe(now);
+  });
+
+  it("does not advance on a gap exactly at the threshold", () => {
+    // Strict-greater guard: a gap of exactly the threshold is still treated as a normal tick.
+    const now = lastTick + suspendGapMs;
+    expect(advanceStaleGraceFloor(floor, lastTick, now, suspendGapMs)).toBe(floor);
+  });
+
+  it("after a freeze, the refreshed floor keeps a heartbeat-stale live peer recoverable", () => {
+    // A peer last seen just before the freeze: with the wall-clock floor stuck at broker start its
+    // staleAtMs is far in the past on resume and it prunes immediately; advancing the floor to the
+    // resumed tick gives it a fresh grace window so it survives until its heartbeat catches up (#29).
+    const lastSeen = "2026-07-01T12:00:30.000Z";
+    const preFreezeFloor = Date.parse("2026-07-01T11:55:00.000Z");
+    const tickBeforeFreeze = Date.parse("2026-07-01T12:00:40.000Z");
+    const resumedNow = Date.parse("2026-07-01T12:10:40.000Z"); // 10 min later
+
+    // Without the amnesty: the first resumed sweep prunes the live peer and its mail.
+    expect(isLocalPeerStalePrunable(lastSeen, preFreezeFloor, resumedNow, ttlMs, pruneGraceMs)).toBe(true);
+
+    // With the amnesty: the floor advances to the resumed tick, sparing the peer this window.
+    const refreshed = advanceStaleGraceFloor(preFreezeFloor, tickBeforeFreeze, resumedNow, suspendGapMs);
+    expect(refreshed).toBe(resumedNow);
+    expect(isLocalPeerStalePrunable(lastSeen, refreshed, resumedNow, ttlMs, pruneGraceMs)).toBe(false);
+  });
+});
+
+describe("shouldPruneLocalPeer", () => {
+  it("prunes a dead pid even when its heartbeat is fresh", () => {
+    expect(shouldPruneLocalPeer({
+      deadPid: true,
+      staleHeartbeat: false,
+      stalePruneReady: false,
+    })).toBe(true);
+  });
+
+  it("does not delete a live pid only because its heartbeat is newly stale", () => {
+    expect(shouldPruneLocalPeer({
+      deadPid: false,
+      staleHeartbeat: true,
+      stalePruneReady: false,
+    })).toBe(false);
+  });
+
+  it("prunes a stale live pid after the recovery grace window expires", () => {
+    expect(shouldPruneLocalPeer({
+      deadPid: false,
+      staleHeartbeat: true,
+      stalePruneReady: true,
+    })).toBe(true);
   });
 });
 

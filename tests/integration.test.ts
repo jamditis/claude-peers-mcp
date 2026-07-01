@@ -447,6 +447,12 @@ describe("dead push path removed", () => {
     expect(src).not.toContain("/peek-messages");
     expect(src).not.toContain("/ack-messages");
   });
+  it("server.ts cleans up when the stdio host disconnects", () => {
+    const src = readFileSync("server.ts", "utf-8");
+    expect(src).toContain('process.stdin.once("end"');
+    expect(src).toContain('process.stdin.once("close"');
+    expect(src).toContain("cleanupStarted");
+  });
 });
 
 // Empty-broker self-exit (Task 14). Opt-in via a positive CLAUDE_PEERS_IDLE_EXIT_MS;
@@ -487,6 +493,106 @@ describe("empty-broker self-exit", () => {
       proc.kill();
       try { unlinkSync("/tmp/broker-exit.db"); } catch {}
       try { unlinkSync("/tmp/config-exit.json"); } catch {}
+    }
+  }, 25_000);
+
+  it("stays up while a heartbeat-stale live peer is inside prune grace", async () => {
+    const PORT = 17933;
+    const CONFIG = "/tmp/config-exit-stale-grace.json";
+    const DB = "/tmp/broker-exit-stale-grace.db";
+    const PEER_ID = "exg-stale00";
+    await Bun.write(CONFIG, JSON.stringify({
+      machine: "exg-a", tailscale_ip: "127.0.0.1", port: PORT, id_prefix: "exg",
+      siblings: [], allowed_ips: ["127.0.0.1"],
+    }));
+    try { unlinkSync(DB); } catch {}
+
+    const db = new Database(DB);
+    db.run(`CREATE TABLE peers (
+      id TEXT PRIMARY KEY, pid INTEGER NOT NULL, machine TEXT NOT NULL,
+      tailscale_ip TEXT NOT NULL, cwd TEXT NOT NULL, git_root TEXT, tty TEXT,
+      summary TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL, last_seen TEXT NOT NULL,
+      tmux_pane TEXT, tmux_socket TEXT, delivery_kind TEXT NOT NULL DEFAULT 'none', token TEXT
+    )`);
+    const stale = new Date(Date.now() - 120_000).toISOString();
+    db.prepare(
+      "INSERT INTO peers (id, pid, machine, tailscale_ip, cwd, git_root, tty, summary, registered_at, last_seen, tmux_pane, tmux_socket, delivery_kind, token) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(PEER_ID, process.pid, "exg-a", "127.0.0.1", "/tmp/exit-stale-grace", null, null, "stale", stale, stale, null, null, "none", "stale-token");
+    db.close();
+
+    const proc = Bun.spawn(["bun", "broker.ts"], {
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG,
+             CLAUDE_PEERS_DB: DB, CLAUDE_PEERS_IDLE_EXIT_MS: "2500",
+             CLAUDE_PEERS_STALE_PRUNE_GRACE_MS: "10000" },
+      stdout: "ignore", stderr: "ignore",
+    });
+    try {
+      let up = false;
+      for (let i = 0; i < 30; i++) {
+        try { if ((await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(300) })).ok) { up = true; break; } } catch {}
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      expect(up).toBe(true);
+
+      await new Promise((r) => setTimeout(r, 3_500));
+      const res = await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(500) });
+      expect(res.ok).toBe(true);
+    } finally {
+      proc.kill();
+      try { unlinkSync(DB); } catch {}
+      try { unlinkSync(CONFIG); } catch {}
+    }
+  }, 15_000);
+
+  it("self-exits when only prune-ready heartbeat-stale peers remain", async () => {
+    const PORT = 17932;
+    const CONFIG = "/tmp/config-exit-stale.json";
+    const DB = "/tmp/broker-exit-stale.db";
+    const PEER_ID = "exs-stale00";
+    await Bun.write(CONFIG, JSON.stringify({
+      machine: "exs-a", tailscale_ip: "127.0.0.1", port: PORT, id_prefix: "exs",
+      siblings: [], allowed_ips: ["127.0.0.1"],
+    }));
+    try { unlinkSync(DB); } catch {}
+
+    const db = new Database(DB);
+    db.run(`CREATE TABLE peers (
+      id TEXT PRIMARY KEY, pid INTEGER NOT NULL, machine TEXT NOT NULL,
+      tailscale_ip TEXT NOT NULL, cwd TEXT NOT NULL, git_root TEXT, tty TEXT,
+      summary TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL, last_seen TEXT NOT NULL,
+      tmux_pane TEXT, tmux_socket TEXT, delivery_kind TEXT NOT NULL DEFAULT 'none', token TEXT
+    )`);
+    const stale = new Date(Date.now() - 120_000).toISOString();
+    db.prepare(
+      "INSERT INTO peers (id, pid, machine, tailscale_ip, cwd, git_root, tty, summary, registered_at, last_seen, tmux_pane, tmux_socket, delivery_kind, token) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(PEER_ID, process.pid, "exs-a", "127.0.0.1", "/tmp/exit-stale", null, null, "stale", stale, stale, null, null, "none", "stale-token");
+    db.close();
+
+    const proc = Bun.spawn(["bun", "broker.ts"], {
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG,
+             CLAUDE_PEERS_DB: DB, CLAUDE_PEERS_IDLE_EXIT_MS: "2500",
+             CLAUDE_PEERS_STALE_PRUNE_GRACE_MS: "1000" },
+      stdout: "ignore", stderr: "ignore",
+    });
+    try {
+      let up = false;
+      for (let i = 0; i < 30; i++) {
+        try { if ((await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(300) })).ok) { up = true; break; } } catch {}
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      expect(up).toBe(true);
+
+      let down = false;
+      for (let i = 0; i < 40; i++) {
+        try { await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(300) }); }
+        catch { down = true; break; }
+        await new Promise((r) => setTimeout(r, 300));
+      }
+      expect(down).toBe(true);
+    } finally {
+      proc.kill();
+      try { unlinkSync(DB); } catch {}
+      try { unlinkSync(CONFIG); } catch {}
     }
   }, 25_000);
 
@@ -627,6 +733,100 @@ describe("unregister during in-flight delivery defers peer deletion", () => {
 
     // The in-flight lease still resolved against the kept row — proof the deferral protected
     // the active delivery (had the row been deleted on unregister, it would have requeued).
+    expect(inflight?.delivery).toBe("accepted");
+  }, 15_000);
+});
+
+// Finding #58/P2: the post-send confirmation must not requeue an already-pasted message just
+// because the recipient's heartbeat aged past the TTL during the ~2s send. peerStillLive() folded
+// heartbeat staleness into the confirm check, so a live peer whose last_seen crossed the TTL while
+// send-keys was in flight had its delivered message released back to 'queued' — and redelivered
+// once it heartbeated again (a duplicate). peerConfirmable() checks only row-presence + a live pid,
+// so the send confirms. The fifo stub holds the delivery in flight while the test ages last_seen
+// past the TTL in the broker DB, making the race deterministic without a real 45s wait.
+describe("post-send confirm ignores heartbeat aging (no duplicate delivery)", () => {
+  const PORT = 17934;
+  let proc: any;
+  let dir: string;
+  let fifo: string;
+  let marker: string;
+
+  beforeAll(async () => {
+    dir = mkdtempSync(join(tmpdir(), "block-tmux-confirm-"));
+    fifo = join(dir, "gate.fifo");
+    marker = join(dir, "started");
+    Bun.spawnSync(["mkfifo", fifo]);
+    const stub = join(dir, "tmux");
+    writeFileSync(stub,
+      `#!/usr/bin/env bash\n` +
+      `if [ "$1" = "-V" ]; then echo "tmux 3.4"; exit 0; fi\n` +
+      `if [ "$1" = "display-message" ]; then echo node; exit 0; fi\n` +
+      `echo started > "${marker}"\n` +
+      `cat "${fifo}" > /dev/null\n` +
+      `exit 0\n`);
+    chmodSync(stub, 0o755);
+    await Bun.write(join(dir, "config.json"), JSON.stringify({
+      machine: "confirm-a", tailscale_ip: "127.0.0.1", port: PORT,
+      id_prefix: "cfa", siblings: [], allowed_ips: ["127.0.0.1"],
+    }));
+    proc = Bun.spawn(["bun", "broker.ts"], {
+      env: {
+        ...process.env,
+        CLAUDE_PEERS_CONFIG: join(dir, "config.json"),
+        CLAUDE_PEERS_DB: join(dir, "broker.db"),
+        PATH: `${dir}:${process.env.PATH}`, // stub tmux wins
+      },
+      stdout: "ignore", stderr: "inherit",
+    });
+    for (let i = 0; i < 20; i++) {
+      try { if ((await fetch(`http://127.0.0.1:${PORT}/health`)).ok) break; } catch {}
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  });
+
+  afterAll(() => {
+    proc?.kill();
+  });
+
+  it("confirms a delivery whose recipient heartbeat crossed the TTL mid-send", async () => {
+    // pid = this live process so peerConfirmable() sees a live pid and list-peers does not filter it.
+    const reg = await brokerFetch(PORT, "/register", {
+      pid: process.pid, cwd: "/tmp/cf1", git_root: null, tty: null, summary: "",
+      machine: "confirm-a", tailscale_ip: "127.0.0.1", tmux_pane: "%5", tmux_socket: null,
+    }) as any;
+    // A registered sender (distinct pid so it does not supersede reg) authenticates the send.
+    const sender = await registerAndGetToken(PORT, { cwd: "/tmp/cf1-s" });
+
+    // Fire the send WITHOUT awaiting: last_seen is fresh, so the ingress liveness gate passes, the
+    // broker claims the lease, spawns the stub, and parks on the fifo — the delivery is in flight.
+    const sendPromise = brokerFetch(PORT, "/send-message", {
+      from_id: sender.id, to_id: reg.id, text: "in flight",
+    }, sender.token);
+
+    let inflight: any;
+    try {
+      for (let i = 0; i < 60 && !existsSync(marker); i++) await new Promise((r) => setTimeout(r, 50));
+      expect(existsSync(marker)).toBe(true);
+
+      // While the send is parked mid-flight, age the recipient's heartbeat past the 45s TTL: the
+      // deterministic stand-in for "last_seen crossed the TTL during the send". The text is already
+      // being pasted; only the post-send confirm has yet to run. recipientsInFlight protects the
+      // row from the cleanup sweep, and the pid stays alive, so this is purely a heartbeat-age flip.
+      const db = new Database(join(dir, "broker.db"));
+      db.exec("PRAGMA busy_timeout=3000");
+      const staleIso = new Date(Date.now() - 60_000).toISOString();
+      db.query("UPDATE peers SET last_seen = ? WHERE id = ?").run(staleIso, reg.id);
+      db.close();
+    } finally {
+      if (existsSync(marker)) {
+        writeFileSync(fifo, "go");
+        inflight = await sendPromise.catch((e) => ({ error: String(e) }));
+      }
+    }
+
+    // Live pid + present row: the aged heartbeat must not requeue the already-pasted message. Under
+    // the old peerStillLive() confirm this returned "queued" and the message would be delivered a
+    // second time once the peer heartbeated again.
     expect(inflight?.delivery).toBe("accepted");
   }, 15_000);
 });
@@ -948,6 +1148,72 @@ describe("send/forward to a dead-but-unswept local peer is honest", () => {
       text: "forwarded to a ghost", from_machine: "other-machine",
     }) as any;
     expect(result.ok).toBe(false);
+  }, 15_000);
+});
+
+describe("broker restart preserves live peers until they can heartbeat", () => {
+  const PORT = 17930;
+  const CONFIG = "/tmp/config-restartlive.json";
+  const DB = "/tmp/broker-restartlive.db";
+  const PEER_ID = "rst-live000";
+  const TOKEN = "survivor-token";
+  let proc: any;
+
+  beforeAll(async () => {
+    await Bun.write(CONFIG, JSON.stringify({
+      machine: "rst-a", tailscale_ip: "127.0.0.1", port: PORT, id_prefix: "rst",
+      siblings: [], allowed_ips: ["127.0.0.1"],
+    }));
+    try { unlinkSync(DB); } catch {}
+
+    const db = new Database(DB);
+    db.run(`CREATE TABLE peers (
+      id TEXT PRIMARY KEY, pid INTEGER NOT NULL, machine TEXT NOT NULL,
+      tailscale_ip TEXT NOT NULL, cwd TEXT NOT NULL, git_root TEXT, tty TEXT,
+      summary TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL, last_seen TEXT NOT NULL,
+      tmux_pane TEXT, tmux_socket TEXT, delivery_kind TEXT NOT NULL DEFAULT 'none', token TEXT
+    )`);
+    const stale = new Date(Date.now() - 120_000).toISOString();
+    db.prepare(
+      "INSERT INTO peers (id, pid, machine, tailscale_ip, cwd, git_root, tty, summary, registered_at, last_seen, tmux_pane, tmux_socket, delivery_kind, token) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(PEER_ID, process.pid, "rst-a", "127.0.0.1", "/tmp/restart-live", null, null, "survivor", stale, stale, null, null, "none", TOKEN);
+    db.close();
+
+    proc = Bun.spawn(["bun", "broker.ts"], {
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG, CLAUDE_PEERS_DB: DB },
+      stdout: "ignore", stderr: "inherit",
+    });
+    for (let i = 0; i < 20; i++) {
+      try { if ((await fetch(`http://127.0.0.1:${PORT}/health`)).ok) break; } catch {}
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  });
+
+  afterAll(() => {
+    proc?.kill();
+    try { unlinkSync(DB); } catch {}
+    try { unlinkSync(CONFIG); } catch {}
+  });
+
+  it("keeps the stale row hidden and unroutable but heartbeatable until the survivor refreshes it", async () => {
+    const beforeHeartbeat = await brokerFetch(PORT, "/list-peers", {
+      scope: "machine", cwd: "/tmp/restart-live", git_root: null,
+    }) as any[];
+    expect(beforeHeartbeat.some((p) => p.id === PEER_ID)).toBe(false);
+
+    const sender = await registerAndGetToken(PORT, { cwd: "/tmp/restart-sender" });
+    const sendBeforeHeartbeat = await brokerFetch(PORT, "/send-message", {
+      from_id: sender.id, to_id: PEER_ID, text: "not yet",
+    }, sender.token) as any;
+    expect(sendBeforeHeartbeat.ok).toBe(false);
+
+    const heartbeat = await rawPost(PORT, "/heartbeat", { id: PEER_ID }, TOKEN);
+    expect(heartbeat.status).toBe(200);
+
+    const afterHeartbeat = await brokerFetch(PORT, "/list-peers", {
+      scope: "machine", cwd: "/tmp/restart-live", git_root: null,
+    }) as any[];
+    expect(afterHeartbeat.some((p) => p.id === PEER_ID)).toBe(true);
   }, 15_000);
 });
 
