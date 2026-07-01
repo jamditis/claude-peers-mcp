@@ -737,6 +737,100 @@ describe("unregister during in-flight delivery defers peer deletion", () => {
   }, 15_000);
 });
 
+// Finding #58/P2: the post-send confirmation must not requeue an already-pasted message just
+// because the recipient's heartbeat aged past the TTL during the ~2s send. peerStillLive() folded
+// heartbeat staleness into the confirm check, so a live peer whose last_seen crossed the TTL while
+// send-keys was in flight had its delivered message released back to 'queued' — and redelivered
+// once it heartbeated again (a duplicate). peerConfirmable() checks only row-presence + a live pid,
+// so the send confirms. The fifo stub holds the delivery in flight while the test ages last_seen
+// past the TTL in the broker DB, making the race deterministic without a real 45s wait.
+describe("post-send confirm ignores heartbeat aging (no duplicate delivery)", () => {
+  const PORT = 17934;
+  let proc: any;
+  let dir: string;
+  let fifo: string;
+  let marker: string;
+
+  beforeAll(async () => {
+    dir = mkdtempSync(join(tmpdir(), "block-tmux-confirm-"));
+    fifo = join(dir, "gate.fifo");
+    marker = join(dir, "started");
+    Bun.spawnSync(["mkfifo", fifo]);
+    const stub = join(dir, "tmux");
+    writeFileSync(stub,
+      `#!/usr/bin/env bash\n` +
+      `if [ "$1" = "-V" ]; then echo "tmux 3.4"; exit 0; fi\n` +
+      `if [ "$1" = "display-message" ]; then echo node; exit 0; fi\n` +
+      `echo started > "${marker}"\n` +
+      `cat "${fifo}" > /dev/null\n` +
+      `exit 0\n`);
+    chmodSync(stub, 0o755);
+    await Bun.write(join(dir, "config.json"), JSON.stringify({
+      machine: "confirm-a", tailscale_ip: "127.0.0.1", port: PORT,
+      id_prefix: "cfa", siblings: [], allowed_ips: ["127.0.0.1"],
+    }));
+    proc = Bun.spawn(["bun", "broker.ts"], {
+      env: {
+        ...process.env,
+        CLAUDE_PEERS_CONFIG: join(dir, "config.json"),
+        CLAUDE_PEERS_DB: join(dir, "broker.db"),
+        PATH: `${dir}:${process.env.PATH}`, // stub tmux wins
+      },
+      stdout: "ignore", stderr: "inherit",
+    });
+    for (let i = 0; i < 20; i++) {
+      try { if ((await fetch(`http://127.0.0.1:${PORT}/health`)).ok) break; } catch {}
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  });
+
+  afterAll(() => {
+    proc?.kill();
+  });
+
+  it("confirms a delivery whose recipient heartbeat crossed the TTL mid-send", async () => {
+    // pid = this live process so peerConfirmable() sees a live pid and list-peers does not filter it.
+    const reg = await brokerFetch(PORT, "/register", {
+      pid: process.pid, cwd: "/tmp/cf1", git_root: null, tty: null, summary: "",
+      machine: "confirm-a", tailscale_ip: "127.0.0.1", tmux_pane: "%5", tmux_socket: null,
+    }) as any;
+    // A registered sender (distinct pid so it does not supersede reg) authenticates the send.
+    const sender = await registerAndGetToken(PORT, { cwd: "/tmp/cf1-s" });
+
+    // Fire the send WITHOUT awaiting: last_seen is fresh, so the ingress liveness gate passes, the
+    // broker claims the lease, spawns the stub, and parks on the fifo — the delivery is in flight.
+    const sendPromise = brokerFetch(PORT, "/send-message", {
+      from_id: sender.id, to_id: reg.id, text: "in flight",
+    }, sender.token);
+
+    let inflight: any;
+    try {
+      for (let i = 0; i < 60 && !existsSync(marker); i++) await new Promise((r) => setTimeout(r, 50));
+      expect(existsSync(marker)).toBe(true);
+
+      // While the send is parked mid-flight, age the recipient's heartbeat past the 45s TTL: the
+      // deterministic stand-in for "last_seen crossed the TTL during the send". The text is already
+      // being pasted; only the post-send confirm has yet to run. recipientsInFlight protects the
+      // row from the cleanup sweep, and the pid stays alive, so this is purely a heartbeat-age flip.
+      const db = new Database(join(dir, "broker.db"));
+      db.exec("PRAGMA busy_timeout=3000");
+      const staleIso = new Date(Date.now() - 60_000).toISOString();
+      db.query("UPDATE peers SET last_seen = ? WHERE id = ?").run(staleIso, reg.id);
+      db.close();
+    } finally {
+      if (existsSync(marker)) {
+        writeFileSync(fifo, "go");
+        inflight = await sendPromise.catch((e) => ({ error: String(e) }));
+      }
+    }
+
+    // Live pid + present row: the aged heartbeat must not requeue the already-pasted message. Under
+    // the old peerStillLive() confirm this returned "queued" and the message would be delivered a
+    // second time once the peer heartbeated again.
+    expect(inflight?.delivery).toBe("accepted");
+  }, 15_000);
+});
+
 // Same orphan race as unregister, but via the other teardown path: a same-pid re-register
 // supersedes the old peer row. If it deletes that row while a delivery to the old id is in
 // flight, the lease resolves against a missing peer and the message orphans under a dead id.

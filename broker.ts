@@ -32,6 +32,11 @@ const GOSSIP_INTERVAL_MS = 5_000;
 const CLEANUP_INTERVAL_MS = 15_000;
 export const LOCAL_PEER_TTL_MS = 45_000;
 export const LOCAL_PEER_STALE_PRUNE_GRACE_MS = LOCAL_PEER_TTL_MS;
+// A gap between cleanup ticks longer than this means the process was frozen (host suspend or a
+// long event-loop stall), not merely idle: wall clock jumped forward while surviving MCP servers
+// had no chance to heartbeat. Kept comfortably above CLEANUP_INTERVAL_MS (15s) so a normal tick
+// never trips it. See advanceStaleGraceFloor.
+const SUSPEND_TICK_GAP_MS = LOCAL_PEER_TTL_MS;
 const REMOTE_TTL_MS = 30_000;
 const DELIVERED_TTL_MS = 60_000;
 const QUEUED_MAX_AGE_MS = 24 * 60 * 60_000; // lossy backstop
@@ -92,6 +97,21 @@ export function isLocalPeerStalePrunable(
   if (nowMs <= staleAtMs) return false;
   const earliestPruneMs = Math.max(staleAtMs, brokerStartedAtMs) + pruneGraceMs;
   return nowMs >= earliestPruneMs;
+}
+
+// Stale-prune grace is anchored on a floor (broker start, so a peer that was already stale when
+// this broker booted still gets a full grace window). A process freeze longer than the TTL breaks
+// that anchor: on the first resumed tick a live peer's staleAtMs is already in the past, so it
+// would be pruned before its due heartbeat runs, deleting the peer and its queued mail. Detect the
+// freeze as an oversized gap between cleanup ticks and, when seen, advance the floor to now so
+// every peer gets a fresh grace window — the same protection broker restart already gives.
+export function advanceStaleGraceFloor(
+  prevFloorMs: number,
+  lastTickMs: number,
+  nowMs: number,
+  suspendGapMs: number,
+): number {
+  return nowMs - lastTickMs > suspendGapMs ? nowMs : prevFloorMs;
 }
 
 export function shouldPruneLocalPeer(
@@ -214,6 +234,10 @@ if (import.meta.main) {
 
   // --- Database setup ---
   const brokerStartedAtMs = Date.now();
+  // Floor the stale-prune grace at broker start, then advance it past a detected process freeze
+  // (see advanceStaleGraceFloor). lastCleanupTickMs tracks the previous sweep so the gap is visible.
+  let staleGraceFloorMs = brokerStartedAtMs;
+  let lastCleanupTickMs = brokerStartedAtMs;
   const db = new Database(DB_PATH);
   db.run("PRAGMA journal_mode = WAL");
   db.run("PRAGMA busy_timeout = 3000");
@@ -336,6 +360,10 @@ if (import.meta.main) {
   function cleanStalePeers() {
     const peers = db.query("SELECT id, pid, last_seen FROM peers").all() as { id: string; pid: number; last_seen: string }[];
     const nowMs = Date.now();
+    // If the loop was frozen longer than a TTL, treat the resumed tick as a time jump and refresh
+    // the grace floor so a survivor is not reaped before its heartbeat catches up (issue #29).
+    staleGraceFloorMs = advanceStaleGraceFloor(staleGraceFloorMs, lastCleanupTickMs, nowMs, SUSPEND_TICK_GAP_MS);
+    lastCleanupTickMs = nowMs;
     for (const peer of peers) {
       // A dead PID prunes immediately. A stale heartbeat quarantines the peer first; after one
       // extra grace window, treat it as wedged and delete its now-unreachable mail instead of
@@ -343,7 +371,7 @@ if (import.meta.main) {
       const deadPid = isPidDead(pidProbe(peer.pid));
       const staleHeartbeat = isLocalPeerStale(peer.last_seen, LOCAL_PEER_TTL_MS, nowMs);
       const stalePruneReady = isLocalPeerStalePrunable(
-        peer.last_seen, brokerStartedAtMs, nowMs, LOCAL_PEER_TTL_MS, LOCAL_STALE_PRUNE_GRACE_MS,
+        peer.last_seen, staleGraceFloorMs, nowMs, LOCAL_PEER_TTL_MS, LOCAL_STALE_PRUNE_GRACE_MS,
       );
       if (!shouldPruneLocalPeer({ deadPid, staleHeartbeat, stalePruneReady })) continue;
       // Never delete a recipient's rows while one of its messages is mid-delivery:
@@ -474,13 +502,28 @@ if (import.meta.main) {
     return p !== null && !isPidDead(pidProbe(p.pid)) && !isLocalPeerStale(p.last_seen, LOCAL_PEER_TTL_MS);
   }
 
+  // Post-send confirmation predicate. The text is already pasted into the pane, so the only
+  // reasons to withhold confirmation are genuine peer loss: the row was gracefully unregistered
+  // (deleted) or the pid died mid-send. Heartbeat-TTL staleness must NOT gate this, unlike the
+  // pre-send peerStillLive() gate: within the ~2s send window a fresh peer's last_seen cannot
+  // cross the 45s TTL by dying, so here the staleness clause can only misfire on a peer whose
+  // last_seen was already near the TTL at send start — requeuing an already-delivered message and
+  // duplicating it once the peer heartbeats again.
+  function peerConfirmable(toId: string): boolean {
+    const p = db.query("SELECT pid FROM peers WHERE id = ?").get(toId) as { pid: number } | null;
+    return p !== null && !isPidDead(pidProbe(p.pid));
+  }
+
   function hasRecoverableLocalPeer(): boolean {
     const nowMs = Date.now();
     return (selectAllPeers.all() as Peer[]).some(p => {
       if (pendingPeerDeletes.has(p.id) || isPidDead(pidProbe(p.pid))) return false;
       if (!isLocalPeerStale(p.last_seen, LOCAL_PEER_TTL_MS, nowMs)) return true;
+      // Same floor + grace override the sweep uses, so idle-retire and cleanup agree on which
+      // stale-but-live peers are still recoverable (maybeIdleExit runs cleanStalePeers first,
+      // refreshing staleGraceFloorMs after a freeze before this check reads it).
       return !isLocalPeerStalePrunable(
-        p.last_seen, brokerStartedAtMs, nowMs, LOCAL_PEER_TTL_MS, LOCAL_STALE_PRUNE_GRACE_MS,
+        p.last_seen, staleGraceFloorMs, nowMs, LOCAL_PEER_TTL_MS, LOCAL_STALE_PRUNE_GRACE_MS,
       );
     });
   }
@@ -536,10 +579,13 @@ if (import.meta.main) {
       // A 0 exit from send-keys is not proof a live peer consumed the text: the recipient can
       // die after the lease is claimed (before or during the await), leaving a pane that
       // outlived the Claude process — now a bare shell — that still accepts keystrokes and exits
-      // 0. Re-probe liveness before confirming so a death (or a graceful unregister) mid-send is
-      // not masked as a delivery. If the peer is gone, leave the row queued; cleanStalePeers
-      // drops it honestly when it reaps the dead pid, and retention prune bounds an orphan.
-      if (ok && peerStillLive(toId) && confirmDelivered(db, row.id, token)) {
+      // 0. Re-probe with peerConfirmable() before confirming so a death (or a graceful unregister)
+      // mid-send is not masked as a delivery. It deliberately ignores heartbeat-TTL staleness: the
+      // text already landed, so only a dead pid or a deleted row should withhold confirmation —
+      // requeuing on mere heartbeat age would redeliver the same message. If the peer is gone,
+      // leave the row queued; cleanStalePeers drops it honestly when it reaps the dead pid, and
+      // retention prune bounds an orphan.
+      if (ok && peerConfirmable(toId) && confirmDelivered(db, row.id, token)) {
         deferralStreaks.delete(toId);   // delivered: the pane is healthy, clear any streak
         return "accepted";
       }
