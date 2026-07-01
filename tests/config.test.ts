@@ -1,9 +1,11 @@
 import { describe, expect, it } from "bun:test";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { loadConfig, singleHostDefault } from "../shared/config.ts";
 
 describe("loadConfig", () => {
   it("loads config from a file path", async () => {
-    const tmpPath = "/tmp/test-claude-peers.json";
+    const tmpPath = join(tmpdir(), "test-claude-peers.json");
     await Bun.write(tmpPath, JSON.stringify({
       machine: "testmachine",
       tailscale_ip: "100.0.0.1",
@@ -23,7 +25,7 @@ describe("loadConfig", () => {
   });
 
   it("throws if required fields are missing", async () => {
-    const tmpPath = "/tmp/test-claude-peers-bad.json";
+    const tmpPath = join(tmpdir(), "test-claude-peers-bad.json");
     await Bun.write(tmpPath, JSON.stringify({ machine: "test" }));
     expect(() => loadConfig(tmpPath)).toThrow();
   });
@@ -33,17 +35,19 @@ describe("loadConfig", () => {
     // server, doorbell watcher) regardless of their cwd, or they would derive different
     // doorbell marker locations and the wake would silently never fire. Anchoring on the
     // config file's directory gives that cwd-independent agreement.
-    const tmpPath = "/tmp/test-claude-peers-reldb.json";
+    const tmpPath = join(tmpdir(), "test-claude-peers-reldb.json");
     await Bun.write(tmpPath, JSON.stringify({
       machine: "m", tailscale_ip: "100.0.0.1", port: 7899, id_prefix: "tst",
       siblings: [], allowed_ips: ["127.0.0.1"], db_path: "state/peers.db",
     }));
     const config = loadConfig(tmpPath);
-    expect(config.db_path).toBe("/tmp/state/peers.db");
+    // mirror loadConfig's own resolve(dirname(configPath), rawDbPath) so the assertion holds on any
+    // platform instead of pinning a literal POSIX /tmp string
+    expect(config.db_path).toBe(resolve(tmpdir(), "state/peers.db"));
   });
 
   it("leaves an absolute db_path unchanged", async () => {
-    const tmpPath = "/tmp/test-claude-peers-absdb.json";
+    const tmpPath = join(tmpdir(), "test-claude-peers-absdb.json");
     await Bun.write(tmpPath, JSON.stringify({
       machine: "m", tailscale_ip: "100.0.0.1", port: 7899, id_prefix: "tst",
       siblings: [], allowed_ips: ["127.0.0.1"], db_path: "/var/lib/peers.db",
@@ -59,7 +63,7 @@ describe("floor_remote_forwards", () => {
   // setting the flag false explicitly. Until federation traffic is authenticated
   // (per-message secret/signature), this is the safe resting posture.
   it("defaults to true when absent", async () => {
-    const path = "/tmp/cfg-floor-absent.json";
+    const path = join(tmpdir(), "cfg-floor-absent.json");
     await Bun.write(path, JSON.stringify({
       machine: "m", tailscale_ip: "127.0.0.1", port: 19001,
       id_prefix: "m", siblings: [], allowed_ips: ["127.0.0.1"],
@@ -68,7 +72,7 @@ describe("floor_remote_forwards", () => {
   });
 
   it("reads false when explicitly set to false (opt in to cross-node push)", async () => {
-    const path = "/tmp/cfg-floor-false.json";
+    const path = join(tmpdir(), "cfg-floor-false.json");
     await Bun.write(path, JSON.stringify({
       machine: "m", tailscale_ip: "127.0.0.1", port: 19003,
       id_prefix: "m", siblings: [], allowed_ips: ["127.0.0.1"],
@@ -78,7 +82,7 @@ describe("floor_remote_forwards", () => {
   });
 
   it("reads true when set", async () => {
-    const path = "/tmp/cfg-floor-true.json";
+    const path = join(tmpdir(), "cfg-floor-true.json");
     await Bun.write(path, JSON.stringify({
       machine: "m", tailscale_ip: "127.0.0.1", port: 19002,
       id_prefix: "m", siblings: [], allowed_ips: ["127.0.0.1"],
@@ -93,7 +97,7 @@ describe("push_delay_ms", () => {
   // anyway. Long enough for the recipient to hit a task boundary and poll (the cheap
   // path — no inference turn), short enough that unpolled mail still arrives promptly.
   it("defaults to 120000 when absent", async () => {
-    const path = "/tmp/cfg-delay-absent.json";
+    const path = join(tmpdir(), "cfg-delay-absent.json");
     await Bun.write(path, JSON.stringify({
       machine: "m", tailscale_ip: "127.0.0.1", port: 19004,
       id_prefix: "m", siblings: [], allowed_ips: ["127.0.0.1"],
@@ -102,7 +106,7 @@ describe("push_delay_ms", () => {
   });
 
   it("reads an explicit number", async () => {
-    const path = "/tmp/cfg-delay-set.json";
+    const path = join(tmpdir(), "cfg-delay-set.json");
     await Bun.write(path, JSON.stringify({
       machine: "m", tailscale_ip: "127.0.0.1", port: 19005,
       id_prefix: "m", siblings: [], allowed_ips: ["127.0.0.1"],
@@ -112,7 +116,7 @@ describe("push_delay_ms", () => {
   });
 
   it("falls back to the default on a negative or non-numeric value", async () => {
-    const path = "/tmp/cfg-delay-bad.json";
+    const path = join(tmpdir(), "cfg-delay-bad.json");
     await Bun.write(path, JSON.stringify({
       machine: "m", tailscale_ip: "127.0.0.1", port: 19006,
       id_prefix: "m", siblings: [], allowed_ips: ["127.0.0.1"],
@@ -134,7 +138,7 @@ describe("auto_summary", () => {
   // git_root fields that already federate, so the seed defaults on — but an operator
   // federating across a sensitive boundary can switch it off without losing set_summary.
   it("defaults to true when absent", async () => {
-    const path = "/tmp/cfg-autosum-absent.json";
+    const path = join(tmpdir(), "cfg-autosum-absent.json");
     await Bun.write(path, JSON.stringify({
       machine: "m", tailscale_ip: "127.0.0.1", port: 19007,
       id_prefix: "m", siblings: [], allowed_ips: ["127.0.0.1"],
@@ -143,7 +147,7 @@ describe("auto_summary", () => {
   });
 
   it("reads false when explicitly set (opt out of the git-seeded summary)", async () => {
-    const path = "/tmp/cfg-autosum-false.json";
+    const path = join(tmpdir(), "cfg-autosum-false.json");
     await Bun.write(path, JSON.stringify({
       machine: "m", tailscale_ip: "127.0.0.1", port: 19008,
       id_prefix: "m", siblings: [], allowed_ips: ["127.0.0.1"],
@@ -153,7 +157,7 @@ describe("auto_summary", () => {
   });
 
   it("treats a non-boolean value as the default (tuning knob, not a startup gate)", async () => {
-    const path = "/tmp/cfg-autosum-bad.json";
+    const path = join(tmpdir(), "cfg-autosum-bad.json");
     await Bun.write(path, JSON.stringify({
       machine: "m", tailscale_ip: "127.0.0.1", port: 19009,
       id_prefix: "m", siblings: [], allowed_ips: ["127.0.0.1"],
@@ -183,12 +187,12 @@ describe("single-host default (zero-config fresh install)", () => {
   it("throws on an explicit missing path (only the default path defaults)", () => {
     // A caller that passes a path MEANT to load it — a missing explicit config is a real
     // misconfiguration, not a fresh install, so it must fail loudly rather than default.
-    expect(() => loadConfig("/tmp/definitely-absent-peers.json")).toThrow();
+    expect(() => loadConfig(join(tmpdir(), "definitely-absent-peers.json"))).toThrow();
   });
 
   it("throws when CLAUDE_PEERS_CONFIG points at a missing file (deploy misconfig fails loudly)", () => {
     const prev = process.env.CLAUDE_PEERS_CONFIG;
-    process.env.CLAUDE_PEERS_CONFIG = "/tmp/definitely-absent-env-peers.json";
+    process.env.CLAUDE_PEERS_CONFIG = join(tmpdir(), "definitely-absent-env-peers.json");
     try {
       expect(() => loadConfig()).toThrow();
     } finally {
@@ -198,13 +202,13 @@ describe("single-host default (zero-config fresh install)", () => {
   });
 
   it("still throws on a present-but-incomplete file (does not loosen validation)", async () => {
-    await Bun.write("/tmp/cfg-present-incomplete.json", JSON.stringify({ machine: "only-machine" }));
-    expect(() => loadConfig("/tmp/cfg-present-incomplete.json")).toThrow();
+    await Bun.write(join(tmpdir(), "cfg-present-incomplete.json"), JSON.stringify({ machine: "only-machine" }));
+    expect(() => loadConfig(join(tmpdir(), "cfg-present-incomplete.json"))).toThrow();
   });
 
-  it("still throws when the config path is unreadable (a directory -> EISDIR, not absence)", () => {
+  it("still throws when the config path is a directory, not a file (not absence)", () => {
     // A path that exists but cannot be read as a file is an explicit misconfiguration and
-    // must fail loudly, not silently default.
-    expect(() => loadConfig("/tmp")).toThrow();
+    // must fail loudly, not silently default. tmpdir() is a real directory on every platform.
+    expect(() => loadConfig(tmpdir())).toThrow();
   });
 });

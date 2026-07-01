@@ -1,6 +1,8 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   buildPaneCommandArgs, buildTmuxArgs, claimForDelivery, classifyPaneReadiness,
   confirmDelivered, DEFAULT_CHANNEL_PUSH_CAP,
@@ -13,7 +15,7 @@ import {
   resetDeliveringOnStart, resolveTmuxTarget, type TmuxQuery, type TmuxSpawn,
 } from "../delivery.ts";
 
-const DB = "/tmp/test-delivery-migration.db";
+const DB = join(tmpdir(), "test-delivery-migration.db");
 
 function cols(db: Database): string[] {
   return (db.query("PRAGMA table_info(messages)").all() as { name: string }[]).map((c) => c.name);
@@ -121,7 +123,7 @@ describe("migrateMessagesSchema", () => {
   });
 });
 
-const LDB = "/tmp/test-delivery-lease.db";
+const LDB = join(tmpdir(), "test-delivery-lease.db");
 
 function seededDb(): Database {
   try { unlinkSync(LDB); } catch {}
@@ -391,7 +393,7 @@ describe("pushAfterFor", () => {
   });
 });
 
-const UDB = "/tmp/test-delivery-urgency.db";
+const UDB = join(tmpdir(), "test-delivery-urgency.db");
 function urgencyDb(): Database {
   try { unlinkSync(UDB); } catch {}
   const db = new Database(UDB); ensureMessagesTable(db); return db;
@@ -589,7 +591,7 @@ describe("probePaneReadiness", () => {
   });
 });
 
-const NDB = "/tmp/test-delivery-order.db";
+const NDB = join(tmpdir(), "test-delivery-order.db");
 function orderDb(): Database {
   try { unlinkSync(NDB); } catch {}
   const db = new Database(NDB); ensureMessagesTable(db); return db;
@@ -721,7 +723,7 @@ describe("isPidDead", () => {
   });
 });
 
-const PDB = "/tmp/test-delivery-prune.db";
+const PDB = join(tmpdir(), "test-delivery-prune.db");
 describe("pruneMessages", () => {
   let db: Database;
   beforeEach(() => { try { unlinkSync(PDB); } catch {} db = new Database(PDB); ensureMessagesTable(db); });
