@@ -31,6 +31,7 @@ import { PROTOCOL_VERSION } from "./shared/types.ts";
 const GOSSIP_INTERVAL_MS = 5_000;
 const CLEANUP_INTERVAL_MS = 15_000;
 export const LOCAL_PEER_TTL_MS = 45_000;
+const BROKER_STARTUP_HEARTBEAT_GRACE_MS = LOCAL_PEER_TTL_MS;
 const REMOTE_TTL_MS = 30_000;
 const DELIVERED_TTL_MS = 60_000;
 const QUEUED_MAX_AGE_MS = 24 * 60 * 60_000; // lossy backstop
@@ -179,6 +180,7 @@ if (import.meta.main) {
   const DB_PATH = config.db_path;
 
   // --- Database setup ---
+  const brokerStartedAtMs = Date.now();
   const db = new Database(DB_PATH);
   db.run("PRAGMA journal_mode = WAL");
   db.run("PRAGMA busy_timeout = 3000");
@@ -308,7 +310,7 @@ if (import.meta.main) {
       // The staleness window is a small multiple of the 15s heartbeat interval, matching the
       // delivery design's heartbeat-staleness bound.
       const deadPid = isPidDead(pidProbe(peer.pid));
-      const staleHeartbeat = isLocalPeerStale(peer.last_seen, LOCAL_PEER_TTL_MS, nowMs);
+      const staleHeartbeat = localHeartbeatPrunable(peer.last_seen, nowMs);
       if (!deadPid && !staleHeartbeat) continue;
       // Never delete a recipient's rows while one of its messages is mid-delivery:
       // deliverNext awaits the tmux spawn, and deleting the 'delivering' row out from
@@ -436,6 +438,14 @@ if (import.meta.main) {
   function peerStillLive(toId: string): boolean {
     const p = db.query("SELECT pid, last_seen FROM peers WHERE id = ?").get(toId) as { pid: number; last_seen: string } | null;
     return p !== null && !isPidDead(pidProbe(p.pid)) && !isLocalPeerStale(p.last_seen, LOCAL_PEER_TTL_MS);
+  }
+
+  function localHeartbeatPrunable(lastSeen: string, nowMs = Date.now()): boolean {
+    if (!isLocalPeerStale(lastSeen, LOCAL_PEER_TTL_MS, nowMs)) return false;
+    // A broker restart can leave still-running MCP servers with an old last_seen because
+    // the broker was down when their heartbeats fired. Keep the row long enough for the
+    // server's own heartbeat to refresh it, but keep list/send/gossip using strict staleness.
+    return nowMs - brokerStartedAtMs >= BROKER_STARTUP_HEARTBEAT_GRACE_MS;
   }
 
   // Attempt to deliver the recipient's head-of-line row. Serial per recipient.

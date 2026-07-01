@@ -957,6 +957,72 @@ describe("send/forward to a dead-but-unswept local peer is honest", () => {
   }, 15_000);
 });
 
+describe("broker restart preserves live peers until they can heartbeat", () => {
+  const PORT = 17920;
+  const CONFIG = "/tmp/config-restartlive.json";
+  const DB = "/tmp/broker-restartlive.db";
+  const PEER_ID = "rst-live000";
+  const TOKEN = "survivor-token";
+  let proc: any;
+
+  beforeAll(async () => {
+    await Bun.write(CONFIG, JSON.stringify({
+      machine: "rst-a", tailscale_ip: "127.0.0.1", port: PORT, id_prefix: "rst",
+      siblings: [], allowed_ips: ["127.0.0.1"],
+    }));
+    try { unlinkSync(DB); } catch {}
+
+    const db = new Database(DB);
+    db.run(`CREATE TABLE peers (
+      id TEXT PRIMARY KEY, pid INTEGER NOT NULL, machine TEXT NOT NULL,
+      tailscale_ip TEXT NOT NULL, cwd TEXT NOT NULL, git_root TEXT, tty TEXT,
+      summary TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL, last_seen TEXT NOT NULL,
+      tmux_pane TEXT, tmux_socket TEXT, delivery_kind TEXT NOT NULL DEFAULT 'none', token TEXT
+    )`);
+    const stale = new Date(Date.now() - 120_000).toISOString();
+    db.prepare(
+      "INSERT INTO peers (id, pid, machine, tailscale_ip, cwd, git_root, tty, summary, registered_at, last_seen, tmux_pane, tmux_socket, delivery_kind, token) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(PEER_ID, process.pid, "rst-a", "127.0.0.1", "/tmp/restart-live", null, null, "survivor", stale, stale, null, null, "none", TOKEN);
+    db.close();
+
+    proc = Bun.spawn(["bun", "broker.ts"], {
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG, CLAUDE_PEERS_DB: DB },
+      stdout: "ignore", stderr: "inherit",
+    });
+    for (let i = 0; i < 20; i++) {
+      try { if ((await fetch(`http://127.0.0.1:${PORT}/health`)).ok) break; } catch {}
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  });
+
+  afterAll(() => {
+    proc?.kill();
+    try { unlinkSync(DB); } catch {}
+    try { unlinkSync(CONFIG); } catch {}
+  });
+
+  it("keeps the stale row hidden and unroutable but heartbeatable until the survivor refreshes it", async () => {
+    const beforeHeartbeat = await brokerFetch(PORT, "/list-peers", {
+      scope: "machine", cwd: "/tmp/restart-live", git_root: null,
+    }) as any[];
+    expect(beforeHeartbeat.some((p) => p.id === PEER_ID)).toBe(false);
+
+    const sender = await registerAndGetToken(PORT, { cwd: "/tmp/restart-sender" });
+    const sendBeforeHeartbeat = await brokerFetch(PORT, "/send-message", {
+      from_id: sender.id, to_id: PEER_ID, text: "not yet",
+    }, sender.token) as any;
+    expect(sendBeforeHeartbeat.ok).toBe(false);
+
+    const heartbeat = await rawPost(PORT, "/heartbeat", { id: PEER_ID }, TOKEN);
+    expect(heartbeat.status).toBe(200);
+
+    const afterHeartbeat = await brokerFetch(PORT, "/list-peers", {
+      scope: "machine", cwd: "/tmp/restart-live", git_root: null,
+    }) as any[];
+    expect(afterHeartbeat.some((p) => p.id === PEER_ID)).toBe(true);
+  }, 15_000);
+});
+
 // A peer's tmux delivery coordinates (tmux_pane/tmux_socket/delivery_kind) are how THIS host
 // injects into THIS host's panes. They are meaningless on another machine and must never ride
 // along in a gossip payload (shared/types.ts marks them local-only). gossipToSiblings projects

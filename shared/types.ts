@@ -16,9 +16,11 @@ export type Urgency = "interrupt" | "normal" | "fyi";
 // act only as the id it holds the token for); to 4 for urgency tiers and the
 // push_after deadline column; to 5 for the /peek route and the delivery_kind='none'
 // doorbell (a server holding peek_messages must force a broker that implements /peek
-// and writes doorbell markers, or both silently no-op against an older broker).
+// and writes doorbell markers, or both silently no-op against an older broker);
+// to 6 for local-peer heartbeat TTL eviction and the broker-restart grace that lets
+// surviving servers refresh stale rows before pruning.
 // server.ts requires at least this from a running broker.
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
 
 export interface Peer {
   id: PeerId;
