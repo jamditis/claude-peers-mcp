@@ -22,6 +22,11 @@ export type Urgency = "interrupt" | "normal" | "fyi";
 // server.ts requires at least this from a running broker.
 export const PROTOCOL_VERSION = 6;
 
+// Urgency tiers arrived in protocol 4 (see the history above). A broker older than
+// this ignores the urgency field and keeps the old push-on-send behavior, so a
+// non-interrupt send to such a broker silently degrades to an interrupt (#30).
+export const URGENCY_MIN_PROTOCOL = 4;
+
 export interface Peer {
   id: PeerId;
   pid: number;
