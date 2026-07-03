@@ -17,6 +17,7 @@ import { type FSWatcher, mkdirSync, watch, writeFileSync } from "node:fs";
 import type { PeersConfig } from "./shared/config.ts";
 import { loadConfig } from "./shared/config.ts";
 import { doorbellDir, doorbellPath, readDoorbell } from "./shared/notify.ts";
+import { urgencyDegradesWarning } from "./shared/urgency.ts";
 
 // Load config once; CLI may run without it for basic commands
 let config: PeersConfig | null = null;
@@ -160,6 +161,27 @@ switch (cmd) {
     if (!toId || !msg) {
       console.error("Usage: bun cli.ts send <peer-id> [--urgency interrupt|normal|fyi] <message>");
       process.exit(1);
+    }
+    // A broker older than the urgency tiers ignores the field and keeps its old
+    // push-on-send behavior, so a non-interrupt send there silently lands as an
+    // interrupt. Probe once and warn
+    // (do not fail closed) so the operator sees the degradation during a rolling
+    // upgrade. Only for non-interrupt urgency, so the default push-on-send path keeps
+    // its single round trip. (#30)
+    if (urgency !== "interrupt") {
+      let brokerProtocol: number | null = null;
+      try {
+        const h = await brokerFetch<{ protocol_version?: number }>("/health");
+        // A reachable broker that reports no protocol_version predates the version
+        // field entirely (protocol 1), so resolve it to 1 rather than unknown; that
+        // is the oldest broker and it will ignore urgency. Only a thrown probe (the
+        // broker is unreachable) leaves this null and stays silent, since the send
+        // below surfaces that failure on its own. This matches server.ts, which
+        // treats a versionless /health as a stale broker to retire.
+        brokerProtocol = typeof h.protocol_version === "number" ? h.protocol_version : 1;
+      } catch { /* unreachable; stay silent, the send below surfaces the error */ }
+      const warning = urgencyDegradesWarning(urgency, brokerProtocol);
+      if (warning) console.error(warning);
     }
     // The control plane authenticates the sender, so the CLI registers an ephemeral
     // queued-only peer (no tmux pane -> never a delivery target), sends as that id with its
