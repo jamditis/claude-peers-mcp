@@ -18,6 +18,7 @@ import {
   releasableQueuedPrefix, releaseToQueued, resetDeliveringOnStart, type TmuxQuery, type TmuxSpawn,
 } from "./delivery.ts";
 import { loadConfig, type SiblingConfig } from "./shared/config.ts";
+import { displaySessionName } from "./shared/format-peers.ts";
 import { removeDoorbell, writeDoorbell } from "./shared/notify.ts";
 import type {
   ControlPlaneRequest, ForwardMessageRequest, ForwardMessageResponse,
@@ -142,6 +143,50 @@ export function resolveTargetBroker(
   const target = remote.machine.toLowerCase();
   const sibling = siblings.find(s => s.machine.toLowerCase() === target);
   return sibling?.url ?? null;
+}
+
+export type PeerRefResolution =
+  | { kind: "match"; id: string }
+  | { kind: "ambiguous"; ids: string[] }
+  | { kind: "none" };
+
+// Resolve a send target reference (issue #38, address-by-name) to a single peer id.
+// An exact peer-id match always wins: id addressing is unambiguous and must never be
+// shadowed by a session name that happens to equal some peer's id. Otherwise resolve by
+// session name, keyed on the form of the ref:
+//   - A ref that already equals its own displayed handle (the copy-from-list case) is judged
+//     at the handle level: every peer that renders as that handle is a candidate, so a handle
+//     two peers share is ambiguous even when it also equals one peer's literal full name —
+//     the shown handle can't distinguish them, so refuse rather than silently pick one.
+//   - A longer or re-spaced ref (a full name the user typed) prefers an exact full-name match,
+//     so a unique full name stays addressable even when it collapses to a handle shared with
+//     another long name; it falls back to the handle set only when no name matches exactly.
+// One match resolves, several is ambiguous (the caller must fall back to a peer id), and no
+// match is none. A null/empty or whitespace-only ref never matches, so an unnamed session stays
+// unaddressable by name but still reachable by id. Candidates may list the same id twice (a
+// local session and its gossiped remote copy), so matches are de-duplicated by id before the
+// single-vs-ambiguous decision.
+export function resolvePeerRef(
+  candidates: { id: string; name: string | null }[],
+  ref: string,
+): PeerRefResolution {
+  if (candidates.some((c) => c.id === ref)) return { kind: "match", id: ref };
+  const target = displaySessionName(ref);
+  if (target.length === 0) return { kind: "none" };
+  const idsWhere = (pred: (name: string) => boolean) => [
+    ...new Set(candidates.filter((c) => !!c.name && pred(c.name)).map((c) => c.id)),
+  ];
+  const byHandle = idsWhere((name) => displaySessionName(name) === target);
+  let ids: string[];
+  if (ref === target) {
+    ids = byHandle;
+  } else {
+    const exact = idsWhere((name) => name === ref);
+    ids = exact.length > 0 ? exact : byHandle;
+  }
+  if (ids.length > 1) return { kind: "ambiguous", ids };
+  const [only] = ids;
+  return only === undefined ? { kind: "none" } : { kind: "match", id: only };
 }
 
 // Project a peer down to the fields that may cross a machine boundary. The local-only delivery
@@ -679,7 +724,39 @@ if (import.meta.main) {
   }
 
   async function handleSendMessage(body: SendMessageRequest): Promise<SendResult> {
-    const localTarget = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id);
+    // Resolve an addressed session name to a peer id before routing (issue #38). Id
+    // addressing is unchanged: a ref that already names a known local or remote peer id
+    // skips name matching, so every existing id send routes exactly as before. Only a ref
+    // matching no known id falls through to name resolution, making this purely additive
+    // on the path that previously returned "not found".
+    let toId = body.to_id;
+    const knownId =
+      db.query("SELECT 1 FROM peers WHERE id = ?").get(toId) ??
+      db.query("SELECT 1 FROM remote_peers WHERE id = ?").get(toId);
+    if (!knownId) {
+      // Resolve names only over peers a user can actually see and reach — the same visibility
+      // handleListPeers applies (live pid, heartbeat-fresh, not pending deferred deletion). A
+      // hidden stale local row must not shadow a live peer's name into "ambiguous", nor resolve
+      // a name to a dead id right after a suspend/restart. Remote peers mirror list_peers as-is.
+      const named = [
+        ...(selectAllPeers.all() as Peer[])
+          .filter((p) => !isPidDead(pidProbe(p.pid)))
+          .filter((p) => !isLocalPeerStale(p.last_seen, LOCAL_PEER_TTL_MS))
+          .filter((p) => !pendingPeerDeletes.has(p.id))
+          .map((p) => ({ id: p.id, name: p.name ?? null })),
+        ...(selectAllRemotePeers.all() as Peer[]).map((p) => ({ id: p.id, name: p.name ?? null })),
+      ];
+      const resolved = resolvePeerRef(named, toId);
+      if (resolved.kind === "match") toId = resolved.id;
+      else if (resolved.kind === "ambiguous") {
+        return {
+          ok: false,
+          error: `"${body.to_id}" matches ${resolved.ids.length} peers by name (${resolved.ids.join(", ")}); address by peer id instead.`,
+        };
+      }
+      // "none": keep the original ref so the not-found path below reports it verbatim.
+    }
+    const localTarget = db.query("SELECT id FROM peers WHERE id = ?").get(toId);
     // Accept the local route only for a row whose process is still alive AND not pending deferred
     // deletion. A peer's row outlives its process between cleanup sweeps (deletion is decoupled
     // from listing), and a peer pending deferred deletion (pendingPeerDeletes — superseded by a
@@ -688,23 +765,23 @@ if (import.meta.main) {
     // sweep wipes it. Treat both as absent so the caller gets an honest result (a sibling, or "not
     // found") instead of an ok that silently drops the message.
     const urgency = body.urgency ?? "interrupt"; // absent = pre-urgency client, keep its old push-on-send
-    if (localTarget && peerStillLive(body.to_id) && !pendingPeerDeletes.has(body.to_id)) {
+    if (localTarget && peerStillLive(toId) && !pendingPeerDeletes.has(toId)) {
       const inserted = insertMessage.run(
-        body.from_id, body.to_id, body.text, new Date().toISOString(),
+        body.from_id, toId, body.text, new Date().toISOString(),
         urgency, pushAfterFor(urgency, Date.now(), config.push_delay_ms),
       );
       const ownRowId = Number(inserted.lastInsertRowid);
       // Ring the doorbell before the push attempt: a none recipient gets no inject, so this is
       // its near-real-time wake (issue #49); a tmux recipient is skipped inside ringDoorbell.
-      ringDoorbell(body.to_id, ownRowId);
-      if ((await deliverNext(body.to_id)) === "accepted") await drainAfterDelivery(body.to_id);
+      ringDoorbell(toId, ownRowId);
+      if ((await deliverNext(toId)) === "accepted") await drainAfterDelivery(toId);
       // Report THIS message's own disposition, not the queue head's (the local edition of
       // issue #14): deliverNext works head-first, so the row just inserted may have ridden
       // out behind older backlog, still be queued (normal/fyi), or had its own push fail
       // after the head's succeeded.
       return { ok: true, routed: "local", delivery: isMessageDelivered(db, ownRowId) ? "accepted" : "queued" };
     }
-    const siblingUrl = resolveTargetBroker(db, body.to_id, config.siblings);
+    const siblingUrl = resolveTargetBroker(db, toId, config.siblings);
     if (!siblingUrl) return { ok: false, error: `Peer ${body.to_id} not found` };
     // Mark the forward in flight so a concurrent retire / idle self-exit drains it before
     // exiting (see hasWorkInFlight); the finally clears it whether the fetch resolves, rejects,
@@ -716,7 +793,7 @@ if (import.meta.main) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           protocol_version: PROTOCOL_VERSION, from_id: body.from_id,
-          to_id: body.to_id, text: body.text, from_machine: config.machine,
+          to_id: toId, text: body.text, from_machine: config.machine,
           urgency,
         } satisfies ForwardMessageRequest),
         signal: AbortSignal.timeout(FORWARD_TIMEOUT_MS),

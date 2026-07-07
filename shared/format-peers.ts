@@ -33,16 +33,26 @@ export function formatAge(iso: string, nowMs: number): string | null {
   return `${Math.floor(h / 24)}d`;
 }
 
+/** The addressable handle for a session name: internal whitespace collapsed, the string trimmed,
+ * then truncated with an ellipsis past NAME_DISPLAY_MAX_CHARS. This is the exact form list_peers
+ * renders in parentheses, so send_message can resolve a name against the same string a user reads
+ * there — the displayed name is always the sendable name. Returns "" for an empty or
+ * whitespace-only name, which callers treat as unnamed. */
+export function displaySessionName(name: string): string {
+  const collapsed = name.replace(/\s+/g, " ").trim();
+  return collapsed.length > NAME_DISPLAY_MAX_CHARS
+    ? `${collapsed.slice(0, NAME_DISPLAY_MAX_CHARS - 1)}…`
+    : collapsed;
+}
+
 export function formatPeerList(peers: Peer[], scope: string, nowMs: number): string {
   const header = `${peers.length} peer${peers.length === 1 ? "" : "s"} (scope: ${scope}):`;
   const blocks = peers.map((p) => {
     // The friendly name rides right on the id as a parenthetical handle ("<id> (newsroom)"),
     // so a human or agent can match the name they were given to the id routing needs. Omitted
     // when unknown so an unnamed peer reads exactly as it did before names existed.
-    const name = p.name?.replace(/\s+/g, " ").trim() ?? "";
-    const namePart = name
-      ? ` (${name.length > NAME_DISPLAY_MAX_CHARS ? `${name.slice(0, NAME_DISPLAY_MAX_CHARS - 1)}…` : name})`
-      : "";
+    const name = p.name ? displaySessionName(p.name) : "";
+    const namePart = name ? ` (${name})` : "";
     const head = [`${p.id}${namePart}  ${p.machine}${p.is_remote ? " [remote]" : ""}`, p.cwd];
     if (p.git_root && p.git_root !== p.cwd) head.push(`(repo ${p.git_root})`);
     const age = formatAge(p.last_seen, nowMs);

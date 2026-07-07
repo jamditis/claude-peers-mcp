@@ -21,9 +21,12 @@ export type Urgency = "interrupt" | "normal" | "fyi";
 // surviving servers refresh stale rows before pruning; to 7 for the peers/remote_peers
 // session-name column and the gossiped `name` field (a server that reports a session name
 // forces a pre-7 broker to retire, so the name is never silently dropped on register or
-// gossip against a broker whose schema predates it).
+// gossip against a broker whose schema predates it); to 8 for send_message address-by-name
+// resolution (a server advertising name sends forces a pre-8 broker to retire, so a name send
+// never silently falls back to the old id-only path and fails as "not found" against a broker
+// that stores names but cannot resolve them).
 // server.ts requires at least this from a running broker.
-export const PROTOCOL_VERSION = 7;
+export const PROTOCOL_VERSION = 8;
 
 export interface Peer {
   id: PeerId;
