@@ -413,6 +413,75 @@ export function buildPaneCommandArgs(pane: string, socket: string | null): strin
   return args;
 }
 
+/** Build the argv that asks tmux for a pane's session name (#S), the human-facing handle. */
+export function buildSessionNameArgs(pane: string, socket: string | null): string[] {
+  const args = ["tmux"];
+  if (socket) args.push("-S", socket);
+  args.push("display-message", "-p", "-t", pane, "#S");
+  return args;
+}
+
+/** Environment-variable name a session can set to override its resolved name. */
+export const SESSION_NAME_ENV = "CLAUDE_PEERS_SESSION_NAME";
+
+/**
+ * Resolve the friendly name of the caller's own session -- the handle a human uses
+ * (e.g. "newsroom", "billing"), so a peer told "ask newsroom" can find it. Precedence:
+ * an explicit CLAUDE_PEERS_SESSION_NAME override (lets a non-tmux session, or a future
+ * harness that exposes the name, set it) wins; otherwise the tmux session name of the
+ * pane this process runs in, read via `tmux display-message '#S'`. Returns null when
+ * neither is available -- a non-tmux session with no override, or a tmux read that
+ * faults. The name is optional everywhere downstream, so a missing one degrades to an
+ * unnamed peer rather than an error, exactly as before this field existed.
+ */
+export async function resolveSessionName(
+  env: {
+    [SESSION_NAME_ENV]?: string | null;
+    TMUX?: string | null;
+    TMUX_PANE?: string | null;
+    [key: string]: string | null | undefined;
+  },
+  query: TmuxQuery,
+): Promise<string | null> {
+  const override = env[SESSION_NAME_ENV]?.trim();
+  if (override) return override;
+  const target = resolveTmuxTarget(env);
+  if (!target) return null;
+  try {
+    const { exitCode, stdout } = await query(buildSessionNameArgs(target.pane, target.socket));
+    if (exitCode !== 0) return null;
+    const name = stdout.trim();
+    return name.length > 0 ? name : null;
+  } catch (e) {
+    console.error("[claude-peers] session-name probe error:", e);
+    return null;
+  }
+}
+
+/** Default kill-timeout for a session-name probe, so a wedged tmux cannot stall registration. */
+export const SESSION_NAME_TIMEOUT_MS = 2_000;
+
+/**
+ * Build a real TmuxQuery: spawn tmux, capture stdout, report the exit code, and kill the process
+ * if it outlives timeoutMs so a hung tmux cannot stall the caller. A spawn fault rejects to the
+ * caller's try/catch rather than being swallowed here. Both callers that need a stdout-capturing
+ * tmux query -- the broker's pre-send readiness probe and the server's session-name lookup --
+ * share this one implementation, differing only in the timeout they pass.
+ */
+export function makeSpawnTmuxQuery(timeoutMs: number): TmuxQuery {
+  return async (args) => {
+    const proc = Bun.spawn(args, { stdout: "pipe", stderr: "ignore" });
+    const timer = setTimeout(() => { try { proc.kill(); } catch {} }, timeoutMs);
+    try {
+      const stdout = await new Response(proc.stdout).text();
+      const exitCode = await proc.exited;
+      return { exitCode, stdout };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+}
+
 /**
  * Probe a pane's readiness for injection by reading its foreground command via tmux.
  * Fails open: any probe fault (non-zero exit or spawn rejection) yields ready, so a broken

@@ -27,14 +27,14 @@ function createTestDb(): Database {
   db.run(`CREATE TABLE IF NOT EXISTS peers (
     id TEXT PRIMARY KEY, pid INTEGER NOT NULL, machine TEXT NOT NULL,
     tailscale_ip TEXT NOT NULL, cwd TEXT NOT NULL, git_root TEXT,
-    tty TEXT, summary TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL,
+    tty TEXT, summary TEXT NOT NULL DEFAULT '', name TEXT, registered_at TEXT NOT NULL,
     last_seen TEXT NOT NULL
   )`);
 
   db.run(`CREATE TABLE IF NOT EXISTS remote_peers (
     id TEXT PRIMARY KEY, machine TEXT NOT NULL, tailscale_ip TEXT NOT NULL,
     pid INTEGER NOT NULL, cwd TEXT NOT NULL, git_root TEXT, tty TEXT,
-    summary TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '', name TEXT, registered_at TEXT NOT NULL,
     last_seen TEXT NOT NULL
   )`);
 
@@ -83,38 +83,53 @@ describe("mergeGossipPeers", () => {
   beforeEach(() => { try { unlinkSync(TEST_DB); } catch {} db = createTestDb(); });
   afterEach(() => { db.close(); try { unlinkSync(TEST_DB); } catch {} });
 
-  it("inserts new remote peers", () => {
+  it("inserts new remote peers, carrying the federated session name", () => {
     const now = new Date().toISOString();
     mergeGossipPeers(db, [
       { id: "bet-aaaa1111", pid: 1000, machine: "node-b", tailscale_ip: "100.64.0.2",
         cwd: "/home/peer", git_root: null, tty: null, summary: "working on bot",
-        registered_at: now, last_seen: now, is_remote: false },
+        name: "newsroom", registered_at: now, last_seen: now, is_remote: false },
     ], "node-b", "100.64.0.2");
 
     const result = db.query("SELECT * FROM remote_peers").all() as any[];
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("bet-aaaa1111");
     expect(result[0].summary).toBe("working on bot");
+    expect(result[0].name).toBe("newsroom");
   });
 
-  it("updates existing remote peers on re-gossip", () => {
+  it("stores a null name when a gossiped peer has none", () => {
+    const now = new Date().toISOString();
+    mergeGossipPeers(db, [
+      { id: "bet-bbbb2222", pid: 1001, machine: "node-b", tailscale_ip: "100.64.0.2",
+        cwd: "/home/peer", git_root: null, tty: null, summary: "unnamed",
+        registered_at: now, last_seen: now, is_remote: false },
+    ], "node-b", "100.64.0.2");
+
+    const result = db.query("SELECT * FROM remote_peers").all() as any[];
+    expect(result).toHaveLength(1);
+    expect(result[0].name).toBeNull();
+  });
+
+  it("updates existing remote peers on re-gossip, including a renamed session", () => {
     const now = new Date().toISOString();
     mergeGossipPeers(db, [
       { id: "bet-aaaa1111", pid: 1000, machine: "node-b", tailscale_ip: "100.64.0.2",
         cwd: "/tmp/old", git_root: null, tty: null, summary: "old summary",
-        registered_at: now, last_seen: now, is_remote: false },
+        name: "old-name", registered_at: now, last_seen: now, is_remote: false },
     ], "node-b", "100.64.0.2");
 
     mergeGossipPeers(db, [
       { id: "bet-aaaa1111", pid: 1000, machine: "node-b", tailscale_ip: "100.64.0.2",
         cwd: "/tmp/new", git_root: null, tty: null, summary: "new summary",
-        registered_at: now, last_seen: now, is_remote: false },
+        name: "new-name", registered_at: now, last_seen: now, is_remote: false },
     ], "node-b", "100.64.0.2");
 
     const result = db.query("SELECT * FROM remote_peers").all() as any[];
     expect(result).toHaveLength(1);
     expect(result[0].cwd).toBe("/tmp/new");
     expect(result[0].summary).toBe("new summary");
+    expect(result[0].name).toBe("new-name");
   });
 });
 

@@ -198,6 +198,7 @@ describe("two-broker federation", () => {
       summary: "test peer on B",
       machine: "broker-b",
       tailscale_ip: "127.0.0.1",
+      name: "billing-b",
     });
     expect(result.id).toMatch(/^brb-/);
     fedBToken = result.token;
@@ -218,6 +219,8 @@ describe("two-broker federation", () => {
       const remotePeer = peersOnA.find((p: any) => p.machine === "broker-b");
       if (remotePeer) {
         expect(remotePeer.is_remote).toBeTruthy();
+        // The friendly name registered on B federated across the gossip boundary to A.
+        expect(remotePeer.name).toBe("billing-b");
         return;
       }
 

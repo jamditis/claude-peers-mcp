@@ -14,6 +14,10 @@ import type { Peer } from "./types.ts";
  * Truncation keeps the head of the summary, where identifying markers live. */
 export const SUMMARY_DISPLAY_MAX_CHARS = 200;
 
+/** Display cap for a peer's session name. Names are short handles, but a caller could set a
+ * long CLAUDE_PEERS_SESSION_NAME override, so cap it rather than let one peer widen the head line. */
+export const NAME_DISPLAY_MAX_CHARS = 60;
+
 /** Relative age ("8s", "3m", "3h", "2d") of an ISO timestamp. Future timestamps
  * (clock skew across machines) clamp to "0s"; an unparseable one returns null so
  * the caller omits the field instead of rendering NaN. */
@@ -32,7 +36,14 @@ export function formatAge(iso: string, nowMs: number): string | null {
 export function formatPeerList(peers: Peer[], scope: string, nowMs: number): string {
   const header = `${peers.length} peer${peers.length === 1 ? "" : "s"} (scope: ${scope}):`;
   const blocks = peers.map((p) => {
-    const head = [`${p.id}  ${p.machine}${p.is_remote ? " [remote]" : ""}`, p.cwd];
+    // The friendly name rides right on the id as a parenthetical handle ("<id> (newsroom)"),
+    // so a human or agent can match the name they were given to the id routing needs. Omitted
+    // when unknown so an unnamed peer reads exactly as it did before names existed.
+    const name = p.name?.replace(/\s+/g, " ").trim() ?? "";
+    const namePart = name
+      ? ` (${name.length > NAME_DISPLAY_MAX_CHARS ? `${name.slice(0, NAME_DISPLAY_MAX_CHARS - 1)}…` : name})`
+      : "";
+    const head = [`${p.id}${namePart}  ${p.machine}${p.is_remote ? " [remote]" : ""}`, p.cwd];
     if (p.git_root && p.git_root !== p.cwd) head.push(`(repo ${p.git_root})`);
     const age = formatAge(p.last_seen, nowMs);
     if (age !== null) head.push(`(seen ${age})`);

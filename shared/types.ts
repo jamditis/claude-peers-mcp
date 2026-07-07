@@ -18,9 +18,12 @@ export type Urgency = "interrupt" | "normal" | "fyi";
 // doorbell (a server holding peek_messages must force a broker that implements /peek
 // and writes doorbell markers, or both silently no-op against an older broker);
 // to 6 for local-peer heartbeat TTL eviction and the broker-restart grace that lets
-// surviving servers refresh stale rows before pruning.
+// surviving servers refresh stale rows before pruning; to 7 for the peers/remote_peers
+// session-name column and the gossiped `name` field (a server that reports a session name
+// forces a pre-7 broker to retire, so the name is never silently dropped on register or
+// gossip against a broker whose schema predates it).
 // server.ts requires at least this from a running broker.
-export const PROTOCOL_VERSION = 6;
+export const PROTOCOL_VERSION = 7;
 
 export interface Peer {
   id: PeerId;
@@ -34,6 +37,11 @@ export interface Peer {
   registered_at: string;
   last_seen: string;
   is_remote?: boolean;
+  // Friendly session name a human uses to refer to this session (e.g. "newsroom", "billing").
+  // Unlike the delivery coordinates below, this is public: it rides gossip and appears in
+  // list_peers so a remote session can be found by name, not just by opaque id. Null when
+  // the session has no resolvable name (a non-tmux session with no override).
+  name?: string | null;
   // Local-only delivery coordinates. Never serialized into gossip/forward payloads.
   tmux_pane?: string | null;
   tmux_socket?: string | null;
@@ -65,6 +73,9 @@ export interface RegisterRequest {
   summary: string;
   machine: string;
   tailscale_ip: string;
+  // Friendly session name, resolved by the server at startup (see resolveSessionName).
+  // Optional: absent when the session has no resolvable name.
+  name?: string | null;
   tmux_pane?: string | null;
   tmux_socket?: string | null;
 }

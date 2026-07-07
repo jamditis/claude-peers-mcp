@@ -4,7 +4,7 @@ import { unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  buildPaneCommandArgs, buildTmuxArgs, claimForDelivery, classifyPaneReadiness,
+  buildPaneCommandArgs, buildSessionNameArgs, buildTmuxArgs, claimForDelivery, classifyPaneReadiness,
   confirmDelivered, DEFAULT_CHANNEL_PUSH_CAP,
   DEFAULT_DEFERRAL_ESCALATION_CAP, decideChannelPush, decideDeferralEscalation, deliverViaTmux,
   ensureMessagesTable, findLeaklessDelivering, formatPeerMessage, hasDuePush,
@@ -12,7 +12,8 @@ import {
   migrateMessagesSchema, nextDeliverable, PASTE_END, PASTE_START,
   probePaneReadiness, promoteQueuedForFlush, pruneMessages, pushAfterFor, reclaimIfExpired,
   reclaimLeaklessDelivering, releasableQueuedPrefix, releaseToQueued,
-  resetDeliveringOnStart, resolveTmuxTarget, type TmuxQuery, type TmuxSpawn,
+  makeSpawnTmuxQuery, resetDeliveringOnStart, resolveSessionName, resolveTmuxTarget,
+  SESSION_NAME_ENV, type TmuxQuery, type TmuxSpawn,
 } from "../delivery.ts";
 
 const DB = join(tmpdir(), "test-delivery-migration.db");
@@ -331,6 +332,77 @@ describe("resolveTmuxTarget", () => {
   it("drops a non-absolute socket but keeps the pane", () => {
     expect(resolveTmuxTarget({ TMUX_PANE: "%0", TMUX: "relative,1,0" }))
       .toEqual({ pane: "%0", socket: null });
+  });
+});
+
+describe("buildSessionNameArgs", () => {
+  it("asks tmux for the pane's session name, including the socket when set", () => {
+    expect(buildSessionNameArgs("%3", "/tmp/sock"))
+      .toEqual(["tmux", "-S", "/tmp/sock", "display-message", "-p", "-t", "%3", "#S"]);
+  });
+  it("omits the socket flag when there is no socket", () => {
+    expect(buildSessionNameArgs("%1", null))
+      .toEqual(["tmux", "display-message", "-p", "-t", "%1", "#S"]);
+  });
+});
+
+describe("makeSpawnTmuxQuery", () => {
+  it("kills a probe that outlives the timeout instead of hanging on it", async () => {
+    // A real spawn of a 5s sleep with a 200ms budget: the kill-timer must fire so the caller
+    // gets a fast non-zero result rather than blocking for the full 5s. This exercises the
+    // safety valve itself -- the resolveSessionName tests below use fakes and never spawn.
+    const query = makeSpawnTmuxQuery(200);
+    const start = Date.now();
+    const { exitCode } = await query(["sleep", "5"]);
+    expect(Date.now() - start).toBeLessThan(2000);
+    expect(exitCode).not.toBe(0);
+  });
+});
+
+describe("resolveSessionName", () => {
+  // A query that fails the test if tmux is ever consulted -- used to prove the override
+  // short-circuits before any spawn.
+  const noQuery: TmuxQuery = async () => {
+    throw new Error("tmux should not have been queried");
+  };
+  const tmuxEnv = { TMUX_PANE: "%2", TMUX: "/tmp/tmux-1000/default,1,0" };
+
+  it("prefers an explicit override and never touches tmux", async () => {
+    expect(await resolveSessionName({ [SESSION_NAME_ENV]: "  billing  ", ...tmuxEnv }, noQuery))
+      .toBe("billing");
+  });
+
+  it("falls through to tmux when the override is blank", async () => {
+    const query: TmuxQuery = async () => ({ exitCode: 0, stdout: "newsroom\n" });
+    expect(await resolveSessionName({ [SESSION_NAME_ENV]: "   ", ...tmuxEnv }, query))
+      .toBe("newsroom");
+  });
+
+  it("reads the tmux session name for the pane it runs in", async () => {
+    let seen: string[] = [];
+    const query: TmuxQuery = async (args) => { seen = args; return { exitCode: 0, stdout: "newsroom\n" }; };
+    expect(await resolveSessionName(tmuxEnv, query)).toBe("newsroom");
+    // It asked the right pane and socket, not a fixed guess.
+    expect(seen).toEqual(buildSessionNameArgs("%2", "/tmp/tmux-1000/default"));
+  });
+
+  it("returns null for a non-tmux session with no override, without querying", async () => {
+    expect(await resolveSessionName({}, noQuery)).toBeNull();
+  });
+
+  it("returns null when tmux exits non-zero", async () => {
+    const query: TmuxQuery = async () => ({ exitCode: 1, stdout: "" });
+    expect(await resolveSessionName(tmuxEnv, query)).toBeNull();
+  });
+
+  it("returns null when tmux reports an empty name", async () => {
+    const query: TmuxQuery = async () => ({ exitCode: 0, stdout: "   \n" });
+    expect(await resolveSessionName(tmuxEnv, query)).toBeNull();
+  });
+
+  it("fails soft to null when the query throws", async () => {
+    const query: TmuxQuery = async () => { throw new Error("no tmux"); };
+    expect(await resolveSessionName(tmuxEnv, query)).toBeNull();
   });
 });
 
