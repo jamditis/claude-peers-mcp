@@ -11,9 +11,11 @@ import {
   mergeGossipPeers,
   pruneRemotePeers,
   recordGossipResult,
+  resolvePeerRef,
   resolveTargetBroker,
   shouldPruneLocalPeer,
 } from "../broker.ts";
+import { NAME_DISPLAY_MAX_CHARS } from "../shared/format-peers.ts";
 
 function createTestDb(): Database {
   // Use a private in-memory database per test. A shared temp file leaked rows
@@ -126,6 +128,111 @@ describe("mergeGossipPeers", () => {
     expect(result[0].cwd).toBe("/tmp/new");
     expect(result[0].summary).toBe("new summary");
     expect(result[0].name).toBe("new-name");
+  });
+});
+
+describe("resolvePeerRef", () => {
+  const peers = [
+    { id: "alp-11112222", name: "newsroom" },
+    { id: "bet-33334444", name: "research" },
+    { id: "gam-55556666", name: null },
+  ];
+
+  it("resolves an exact peer id straight through", () => {
+    expect(resolvePeerRef(peers, "bet-33334444")).toEqual({ kind: "match", id: "bet-33334444" });
+  });
+
+  it("resolves a unique session name to its id", () => {
+    expect(resolvePeerRef(peers, "newsroom")).toEqual({ kind: "match", id: "alp-11112222" });
+  });
+
+  it("prefers an exact id over a name that collides with it", () => {
+    // A session literally named after another peer's id must not shadow id addressing.
+    const collide = [
+      { id: "alp-11112222", name: "ops" },
+      { id: "zed-99998888", name: "alp-11112222" },
+    ];
+    expect(resolvePeerRef(collide, "alp-11112222")).toEqual({ kind: "match", id: "alp-11112222" });
+  });
+
+  it("reports ambiguity when two distinct peers share a name", () => {
+    const dup = [
+      { id: "alp-11112222", name: "newsroom" },
+      { id: "bet-33334444", name: "newsroom" },
+    ];
+    expect(resolvePeerRef(dup, "newsroom")).toEqual({
+      kind: "ambiguous",
+      ids: ["alp-11112222", "bet-33334444"],
+    });
+  });
+
+  it("de-dupes a local peer and its gossiped remote twin into one match", () => {
+    // The same session shows up in both peers and remote_peers under one id — not ambiguous.
+    const twin = [
+      { id: "alp-11112222", name: "newsroom" },
+      { id: "alp-11112222", name: "newsroom" },
+    ];
+    expect(resolvePeerRef(twin, "newsroom")).toEqual({ kind: "match", id: "alp-11112222" });
+  });
+
+  it("never matches an unnamed peer by an empty ref", () => {
+    expect(resolvePeerRef(peers, "")).toEqual({ kind: "none" });
+  });
+
+  it("returns none for a ref that is neither a known id nor a name", () => {
+    expect(resolvePeerRef(peers, "sports")).toEqual({ kind: "none" });
+  });
+
+  it("matches a name whose stored whitespace differs from the displayed handle", () => {
+    // Stored with a tab and doubled spaces; list_peers shows it collapsed to single spaces, so
+    // a ref copied from that display must still resolve.
+    const spaced = [{ id: "alp-11112222", name: "morning\tdesk  team" }];
+    expect(resolvePeerRef(spaced, "morning desk team")).toEqual({ kind: "match", id: "alp-11112222" });
+  });
+
+  it("matches a long name by the truncated handle list_peers displays", () => {
+    const longName = "a".repeat(80);
+    const handle = `${"a".repeat(59)}…`; // what formatPeerList renders (cap is 60)
+    const longPeer = [{ id: "alp-11112222", name: longName }];
+    // Both the shown (truncated) handle and the full name resolve, since both reduce to it.
+    expect(resolvePeerRef(longPeer, handle)).toEqual({ kind: "match", id: "alp-11112222" });
+    expect(resolvePeerRef(longPeer, longName)).toEqual({ kind: "match", id: "alp-11112222" });
+  });
+
+  it("treats a whitespace-only ref as unnamed, not a match", () => {
+    expect(resolvePeerRef(peers, "   ")).toEqual({ kind: "none" });
+  });
+
+  it("keeps two long names with a shared prefix addressable by their full names", () => {
+    // Both collapse to the same truncated display handle, but an exact full name is unique and
+    // must still resolve — the handle match is only the fallback when no name matches exactly.
+    const shared = "x".repeat(NAME_DISPLAY_MAX_CHARS - 1);
+    const longs = [
+      { id: "alp-11112222", name: `${shared}ALPHA` },
+      { id: "bet-33334444", name: `${shared}BETA` },
+    ];
+    expect(resolvePeerRef(longs, `${shared}ALPHA`)).toEqual({ kind: "match", id: "alp-11112222" });
+    expect(resolvePeerRef(longs, `${shared}BETA`)).toEqual({ kind: "match", id: "bet-33334444" });
+    // The shared truncated handle genuinely can't distinguish them, so it stays ambiguous.
+    expect(resolvePeerRef(longs, `${shared}…`)).toEqual({
+      kind: "ambiguous",
+      ids: ["alp-11112222", "bet-33334444"],
+    });
+  });
+
+  it("is ambiguous when a displayed handle equals another peer's literal full name", () => {
+    const shared = "x".repeat(NAME_DISPLAY_MAX_CHARS - 1);
+    const handle = `${shared}…`; // the long peer's displayed handle, and the other peer's real name
+    const collide = [
+      { id: "alp-11112222", name: `${shared}LONGTAIL` }, // long: renders as `handle`
+      { id: "bet-33334444", name: handle }, // literally named the handle: also renders as `handle`
+    ];
+    // Copying the handle from list_peers can't tell them apart, so refuse rather than misroute to
+    // the literal-name peer.
+    expect(resolvePeerRef(collide, handle)).toEqual({
+      kind: "ambiguous",
+      ids: ["alp-11112222", "bet-33334444"],
+    });
   });
 });
 

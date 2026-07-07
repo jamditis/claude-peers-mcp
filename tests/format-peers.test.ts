@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+  displaySessionName,
   formatAge,
   formatPeerList,
   NAME_DISPLAY_MAX_CHARS,
@@ -112,5 +113,34 @@ describe("formatPeerList", () => {
     const text = formatPeerList([peer({ last_seen: "garbage" })], "machine", NOW);
     expect(text).not.toContain("NaN");
     expect(text).not.toContain("(seen");
+  });
+});
+
+describe("displaySessionName", () => {
+  it("collapses internal whitespace and trims", () => {
+    expect(displaySessionName("  morning\tdesk  team  ")).toBe("morning desk team");
+  });
+
+  it("returns a short name unchanged", () => {
+    expect(displaySessionName("newsroom")).toBe("newsroom");
+  });
+
+  it("truncates past the cap with a single-character ellipsis", () => {
+    const long = "a".repeat(80);
+    const shown = displaySessionName(long);
+    expect(shown).toBe(`${"a".repeat(NAME_DISPLAY_MAX_CHARS - 1)}…`);
+    expect(shown.length).toBe(NAME_DISPLAY_MAX_CHARS);
+  });
+
+  it("is the exact handle formatPeerList renders", () => {
+    // The parenthetical in the peer list must equal displaySessionName for that name, so a
+    // name copied from the list resolves back to the peer in send_message.
+    const long = "desk-".repeat(20); // > cap
+    const text = formatPeerList([peer({ name: long })], "machine", NOW);
+    expect(text).toContain(`(${displaySessionName(long)})`);
+  });
+
+  it("returns empty for a whitespace-only name", () => {
+    expect(displaySessionName("   ")).toBe("");
   });
 });
