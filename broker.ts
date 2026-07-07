@@ -12,7 +12,7 @@ import {
   claimForDelivery, confirmDelivered, DEFAULT_DEFERRAL_ESCALATION_CAP,
   decideDeferralEscalation, deliverViaTmux, ensureMessagesTable,
   formatPeerMessage, generateAuthToken, generateLeaseToken, hasDuePush,
-  isFederationRoute, isLoopback, isMessageDelivered, isPidDead,
+  isFederationRoute, isLoopback, isMessageDelivered, isPidDead, makeSpawnTmuxQuery,
   migrateMessagesSchema, nextDeliverable, pidProbe, promoteQueuedForFlush,
   pruneMessages, pushAfterFor, reclaimIfExpired, reclaimLeaklessDelivering,
   releasableQueuedPrefix, releaseToQueued, resetDeliveringOnStart, type TmuxQuery, type TmuxSpawn,
@@ -63,13 +63,13 @@ export function mergeGossipPeers(
 ): void {
   const upsert = db.prepare(`
     INSERT OR REPLACE INTO remote_peers
-      (id, machine, tailscale_ip, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (id, machine, tailscale_ip, pid, cwd, git_root, tty, summary, name, registered_at, last_seen)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const now = new Date().toISOString();
   for (const p of peers) {
     upsert.run(p.id, machine, tailscaleIp, p.pid, p.cwd,
-      p.git_root, p.tty, p.summary, p.registered_at, now);
+      p.git_root, p.tty, p.summary, p.name ?? null, p.registered_at, now);
   }
 }
 
@@ -152,6 +152,8 @@ export function toGossipPeer(p: Peer): Peer {
   return {
     id: p.id, pid: p.pid, machine: p.machine, tailscale_ip: p.tailscale_ip,
     cwd: p.cwd, git_root: p.git_root, tty: p.tty, summary: p.summary,
+    // name is a public handle, not a delivery coordinate, so it federates like summary.
+    name: p.name ?? null,
     registered_at: p.registered_at, last_seen: p.last_seen,
   };
 }
@@ -245,13 +247,15 @@ if (import.meta.main) {
   db.run(`CREATE TABLE IF NOT EXISTS peers (
     id TEXT PRIMARY KEY, pid INTEGER NOT NULL, machine TEXT NOT NULL,
     tailscale_ip TEXT NOT NULL, cwd TEXT NOT NULL, git_root TEXT, tty TEXT,
-    summary TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL, last_seen TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '', name TEXT, registered_at TEXT NOT NULL, last_seen TEXT NOT NULL,
     tmux_pane TEXT, tmux_socket TEXT, delivery_kind TEXT NOT NULL DEFAULT 'none', token TEXT
   )`);
   // Upgrade a legacy peers table that predates the delivery columns (and the auth token).
   // A NULL token is a pre-v3 row: it can never match a presented token, so it authenticates
   // only under CLAUDE_PEERS_ALLOW_UNSIGNED until the session re-registers and is minted one.
-  for (const [col, type] of [["tmux_pane","TEXT"],["tmux_socket","TEXT"],["delivery_kind","TEXT NOT NULL DEFAULT 'none'"],["token","TEXT"]] as const) {
+  // A NULL name is a row from before the session-name column: it lists as an unnamed peer
+  // until the session re-registers and reports its name.
+  for (const [col, type] of [["name","TEXT"],["tmux_pane","TEXT"],["tmux_socket","TEXT"],["delivery_kind","TEXT NOT NULL DEFAULT 'none'"],["token","TEXT"]] as const) {
     const present = (db.query("PRAGMA table_info(peers)").all() as { name: string }[]).some((c) => c.name === col);
     if (!present) db.run(`ALTER TABLE peers ADD COLUMN ${col} ${type}`);
   }
@@ -259,8 +263,14 @@ if (import.meta.main) {
   db.run(`CREATE TABLE IF NOT EXISTS remote_peers (
     id TEXT PRIMARY KEY, machine TEXT NOT NULL, tailscale_ip TEXT NOT NULL,
     pid INTEGER NOT NULL, cwd TEXT NOT NULL, git_root TEXT, tty TEXT,
-    summary TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL, last_seen TEXT NOT NULL
+    summary TEXT NOT NULL DEFAULT '', name TEXT, registered_at TEXT NOT NULL, last_seen TEXT NOT NULL
   )`);
+  // Add the gossiped session name to a remote_peers table created before it existed, so a
+  // sibling broker's names persist across a local broker upgrade.
+  for (const [col, type] of [["name","TEXT"]] as const) {
+    const present = (db.query("PRAGMA table_info(remote_peers)").all() as { name: string }[]).some((c) => c.name === col);
+    if (!present) db.run(`ALTER TABLE remote_peers ADD COLUMN ${col} ${type}`);
+  }
 
   ensureMessagesTable(db);
   migrateMessagesSchema(db);
@@ -269,8 +279,8 @@ if (import.meta.main) {
 
   // --- Prepared statements ---
   const insertPeer = db.prepare(`
-    INSERT INTO peers (id, pid, machine, tailscale_ip, cwd, git_root, tty, summary, registered_at, last_seen, tmux_pane, tmux_socket, delivery_kind, token)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO peers (id, pid, machine, tailscale_ip, cwd, git_root, tty, summary, name, registered_at, last_seen, tmux_pane, tmux_socket, delivery_kind, token)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const tokenForPeer = db.prepare("SELECT token FROM peers WHERE id = ?");
   const updateLastSeen = db.prepare("UPDATE peers SET last_seen = ? WHERE id = ?");
@@ -479,15 +489,7 @@ if (import.meta.main) {
   // Same shape as realTmuxSpawn but pipes stdout so a readiness probe can read the pane's
   // foreground command. Used only for the pre-send pane check (display-message), never for
   // the inject itself. Subject to the same kill-timer so a hung probe cannot block delivery.
-  const realTmuxQuery: TmuxQuery = async (args) => {
-    const proc = Bun.spawn(args, { stdout: "pipe", stderr: "ignore" });
-    const timer = setTimeout(() => { try { proc.kill(); } catch {} }, TMUX_TIMEOUT_MS);
-    try {
-      const stdout = await new Response(proc.stdout).text();
-      const exitCode = await proc.exited;
-      return { exitCode, stdout };
-    } finally { clearTimeout(timer); }
-  };
+  const realTmuxQuery: TmuxQuery = makeSpawnTmuxQuery(TMUX_TIMEOUT_MS);
 
   function peerDelivery(toId: string): { kind: string; pane: string | null; socket: string | null } | null {
     return db.query("SELECT delivery_kind AS kind, tmux_pane AS pane, tmux_socket AS socket FROM peers WHERE id = ?")
@@ -638,7 +640,7 @@ if (import.meta.main) {
     // control-plane call; the gate binds the call's principal (from_id/id) to it.
     const token = generateAuthToken();
     insertPeer.run(id, body.pid, config.machine, config.tailscale_ip,
-      body.cwd, body.git_root, body.tty, body.summary, now, now, pane, socket, kind, token);
+      body.cwd, body.git_root, body.tty, body.summary, body.name ?? null, now, now, pane, socket, kind, token);
     return { id, token };
   }
 

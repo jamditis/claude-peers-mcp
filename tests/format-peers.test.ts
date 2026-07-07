@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
   formatAge,
   formatPeerList,
+  NAME_DISPLAY_MAX_CHARS,
   SUMMARY_DISPLAY_MAX_CHARS,
 } from "../shared/format-peers.ts";
 import type { Peer } from "../shared/types.ts";
@@ -42,6 +43,24 @@ describe("formatPeerList", () => {
   it("renders one head line per peer: id, machine, cwd, age", () => {
     const text = formatPeerList([peer({})], "machine", NOW);
     expect(text).toBe("1 peer (scope: machine):\nalp-abc  node-alpha  /workspace/projects/foo  (seen 8s)");
+  });
+
+  it("shows a known session name as a parenthetical handle on the id", () => {
+    const text = formatPeerList([peer({ name: "newsroom" })], "machine", NOW);
+    expect(text).toContain("alp-abc (newsroom)  node-alpha  /workspace/projects/foo");
+  });
+
+  it("omits the handle entirely for an unnamed peer, reading as it did before names", () => {
+    const text = formatPeerList([peer({ name: null })], "machine", NOW);
+    expect(text).toBe("1 peer (scope: machine):\nalp-abc  node-alpha  /workspace/projects/foo  (seen 8s)");
+  });
+
+  it("collapses whitespace and truncates an over-long name", () => {
+    const long = "x".repeat(NAME_DISPLAY_MAX_CHARS + 20);
+    const text = formatPeerList([peer({ name: `  spaced\n  ${long}` })], "machine", NOW);
+    // Whitespace normalized to single spaces, and the whole handle capped with an ellipsis.
+    expect(text).toContain(`alp-abc (spaced ${"x".repeat(NAME_DISPLAY_MAX_CHARS - 1 - "spaced ".length)}…)`);
+    expect(text).not.toContain("\n  x"); // the name never leaks onto its own line
   });
 
   it("indents a non-empty summary on its own line under the head line", () => {

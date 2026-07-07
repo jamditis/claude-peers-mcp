@@ -84,7 +84,7 @@ The other Claude receives it immediately and responds.
 
 | Tool             | What it does                                                                                |
 | ---------------- | ------------------------------------------------------------------------------------------- |
-| `list_peers`     | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo`. With `machine` scope, remote peers from federated nodes are included and tagged `[remote]`. |
+| `list_peers`     | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo`. With `machine` scope, remote peers from federated nodes are included and tagged `[remote]`. A peer's friendly session name, when known, shows as a parenthetical handle on its ID (`bra-abc123 (newsroom)`) so a name a human uses maps to the ID routing needs. |
 | `send_message`   | Send a message to another instance by ID. `urgency` picks the delivery tier: `interrupt` pushes into their tmux session now; `normal` (the tool default) queues until they poll or the push deadline passes; `fyi` is poll-only, no reply expected. Cross-machine targets route automatically to the owning broker. |
 | `set_summary`    | Describe what you're working on (visible to other peers). The summary starts as an auto-generated git snapshot (`[auto] <branch>; recent: <files>`) seeded at registration; this tool overwrites it. |
 | `check_messages` | Read and clear messages that were queued instead of pushed. A poll marks the returned messages delivered, so a second call won't re-return them. |
@@ -241,6 +241,7 @@ These live in `~/.claude-peers.json` (or the path in `CLAUDE_PEERS_CONFIG`). The
 | Environment variable          | Default              | Description                                                                            |
 | ----------------------------- | -------------------- | -------------------------------------------------------------------------------------- |
 | `CLAUDE_PEERS_CONFIG`         | `~/.claude-peers.json` | Overrides the config-file location.                                                  |
+| `CLAUDE_PEERS_SESSION_NAME`   | unset                | Friendly name for this session, shown in `list_peers`. When unset, the server uses the tmux session name of the pane it runs in; a non-tmux session with no override lists unnamed. |
 | `CLAUDE_PEERS_DB`             | `~/.claude-peers.db` | SQLite database path. Overrides the config file's `db_path`.                            |
 | `CLAUDE_PEERS_IDLE_EXIT_MS`   | `0` (disabled)       | If `> 0`, an idle broker with no peers self-exits after this many ms. The auto-launched broker sets 10 min so it reaps itself; a supervised (systemd) broker leaves it `0` so it never restart-loops. |
 | `CLAUDE_PEERS_ALLOW_UNSIGNED` | unset (`0`)          | Upgrade-window grace for rolling a live broker to v3. When `1`, the broker accepts a missing token only for a pre-v3 NULL-token peer row; a wrong token still `401`s. See [Upgrading a live broker to v3](#upgrading-a-live-broker-to-v3). Leave unset on steady-state brokers. |

@@ -19,7 +19,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { resolveTmuxTarget } from "./delivery.ts";
+import { makeSpawnTmuxQuery, resolveSessionName, resolveTmuxTarget, SESSION_NAME_TIMEOUT_MS } from "./delivery.ts";
 import { loadConfig } from "./shared/config.ts";
 import { formatPeerList } from "./shared/format-peers.ts";
 import { buildAutoSummary } from "./shared/summarize.ts";
@@ -505,6 +505,10 @@ async function main() {
   // branch + recent files immediately — no inference turn spent on set_summary just
   // to become discoverable. set_summary overwrites it once the actual task is known.
   const tmuxTarget = resolveTmuxTarget(process.env);
+  // Friendly session name (tmux #S, or a CLAUDE_PEERS_SESSION_NAME override) so peers can
+  // find this session by the handle a human uses. Null for an unnamed (non-tmux) session.
+  const sessionName = await resolveSessionName(process.env, makeSpawnTmuxQuery(SESSION_NAME_TIMEOUT_MS));
+  log(`Session name: ${sessionName ?? "(none)"}`);
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: process.pid,
     cwd: myCwd,
@@ -513,6 +517,7 @@ async function main() {
     summary: config.auto_summary ? await buildAutoSummary(myCwd) : "",
     machine: config.machine,
     tailscale_ip: config.tailscale_ip,
+    name: sessionName,
     tmux_pane: tmuxTarget?.pane ?? null,
     tmux_socket: tmuxTarget?.socket ?? null,
   });
