@@ -349,6 +349,34 @@ describe("tmux delivery and floor", () => {
     expect(poll.messages).toHaveLength(1);
     expect(poll.messages[0].text).toBe("floor me");
   });
+
+  it("resolves a shared session name to the one visible peer, excluding the sender (#38)", async () => {
+    // Bug guard: the name-resolution candidate set must drop the caller (body.from_id), exactly
+    // as list_peers hides the caller via exclude_id. A sender that shares a session name with one
+    // visible target sees a single match in list_peers, so send_message must resolve that name to
+    // the target — not count the caller's own hidden row and report a false "ambiguous".
+    const target = await brokerFetch(PORT, "/register", {
+      pid: process.pid, cwd: "/tmp/twin-t", git_root: null, tty: null, summary: "",
+      machine: "del-a", tailscale_ip: "127.0.0.1", tmux_pane: null, tmux_socket: null,
+      name: "twin",
+    }) as any;
+    // The sender must itself be a live, visible peer for the false ambiguity to be possible, so
+    // give it a real, distinct pid (a throwaway child) rather than the default dead synthetic one.
+    const child = Bun.spawn(["sleep", "30"], { stdout: "ignore", stderr: "ignore" });
+    try {
+      const sender = await registerAndGetToken(PORT, { pid: child.pid, cwd: "/tmp/twin-s", name: "twin" });
+      const send = await brokerFetch(PORT, "/send-message", {
+        from_id: sender.id, to_id: "twin", text: "resolve me",
+      }, sender.token) as any;
+      expect(send.ok).toBe(true); // not the "matches N peers by name" ambiguity error
+      expect(send.routed).toBe("local");
+      const poll = await brokerFetch(PORT, "/poll-messages", { id: target.id }, target.token) as any;
+      expect(poll.messages).toHaveLength(1);
+      expect(poll.messages[0].text).toBe("resolve me");
+    } finally {
+      child.kill();
+    }
+  });
 });
 
 // The invariant the whole feature exists to protect: a push that tmux rejects must

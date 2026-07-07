@@ -738,6 +738,10 @@ if (import.meta.main) {
       // handleListPeers applies (live pid, heartbeat-fresh, not pending deferred deletion). A
       // hidden stale local row must not shadow a live peer's name into "ambiguous", nor resolve
       // a name to a dead id right after a suspend/restart. Remote peers mirror list_peers as-is.
+      // Also drop the caller's own row (body.from_id), exactly as list_peers hides it via
+      // exclude_id: the caller can't see its own name in the list, so it must not count toward a
+      // name match — otherwise a sender sharing a session name with one visible peer would read a
+      // single match in list_peers yet get a false "ambiguous" here from its own hidden row.
       const named = [
         ...(selectAllPeers.all() as Peer[])
           .filter((p) => !isPidDead(pidProbe(p.pid)))
@@ -745,7 +749,7 @@ if (import.meta.main) {
           .filter((p) => !pendingPeerDeletes.has(p.id))
           .map((p) => ({ id: p.id, name: p.name ?? null })),
         ...(selectAllRemotePeers.all() as Peer[]).map((p) => ({ id: p.id, name: p.name ?? null })),
-      ];
+      ].filter((p) => p.id !== body.from_id);
       const resolved = resolvePeerRef(named, toId);
       if (resolved.kind === "match") toId = resolved.id;
       else if (resolved.kind === "ambiguous") {
