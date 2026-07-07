@@ -2,9 +2,6 @@
 
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { unlinkSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import {
   advanceStaleGraceFloor,
   generatePeerId,
@@ -18,11 +15,10 @@ import {
   shouldPruneLocalPeer,
 } from "../broker.ts";
 
-const TEST_DB = join(tmpdir(), "test-claude-peers-unit.db");
-
 function createTestDb(): Database {
-  const db = new Database(TEST_DB);
-  db.run("PRAGMA journal_mode = WAL");
+  // Use a private in-memory database per test. A shared temp file leaked rows
+  // between fast Windows tests when cleanup raced SQLite file handles.
+  const db = new Database(":memory:");
 
   db.run(`CREATE TABLE IF NOT EXISTS peers (
     id TEXT PRIMARY KEY, pid INTEGER NOT NULL, machine TEXT NOT NULL,
@@ -80,8 +76,8 @@ describe("isAllowedIp", () => {
 
 describe("mergeGossipPeers", () => {
   let db: Database;
-  beforeEach(() => { try { unlinkSync(TEST_DB); } catch {} db = createTestDb(); });
-  afterEach(() => { db.close(); try { unlinkSync(TEST_DB); } catch {} });
+  beforeEach(() => { db = createTestDb(); });
+  afterEach(() => { db.close(); });
 
   it("inserts new remote peers, carrying the federated session name", () => {
     const now = new Date().toISOString();
@@ -135,8 +131,8 @@ describe("mergeGossipPeers", () => {
 
 describe("pruneRemotePeers", () => {
   let db: Database;
-  beforeEach(() => { try { unlinkSync(TEST_DB); } catch {} db = createTestDb(); });
-  afterEach(() => { db.close(); try { unlinkSync(TEST_DB); } catch {} });
+  beforeEach(() => { db = createTestDb(); });
+  afterEach(() => { db.close(); });
 
   // Skipped on win32: bun:sqlite on Windows reports DELETE changes=1 but a follow-up SELECT on the
   // same connection still returns the deleted row, so this fails despite correct code. Tracked in #57;
@@ -378,8 +374,8 @@ describe("recordGossipResult", () => {
 
 describe("resolveTargetBroker", () => {
   let db: Database;
-  beforeEach(() => { try { unlinkSync(TEST_DB); } catch {} db = createTestDb(); });
-  afterEach(() => { db.close(); try { unlinkSync(TEST_DB); } catch {} });
+  beforeEach(() => { db = createTestDb(); });
+  afterEach(() => { db.close(); });
 
   const siblings = [
     { machine: "node-b", url: "http://100.64.0.2:7899" },
