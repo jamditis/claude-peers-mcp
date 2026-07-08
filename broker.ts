@@ -868,12 +868,15 @@ if (import.meta.main) {
     }
     // Report whether this host will ever auto-push the row, so the originating broker can
     // give its sender an accurate queued-vs-poll-only signal (#39). It is poll-only when
-    // floored (push_after NULL above, never auto-pushed) OR when the recipient is not
-    // push-eligible here at all (a delivery_kind='none' session, a paneless row, or no
-    // tmux backend): deliverNext would return "queued" for those regardless of floor, so
-    // reporting push-eligible would be wrong. Derived from the same predicate deliverNext
-    // gates on, so the two cannot drift.
-    const pollOnly = config.floor_remote_forwards || !isPushableTarget(peerDelivery(body.to_id));
+    // the stored push_after is NULL, i.e. the row never enters the push channel: floored,
+    // or an fyi whose pushAfterFor is NULL (hasDuePush/nextDeliverable both filter
+    // push_after IS NOT NULL, so a NULL row is only ever read via check_messages). It is
+    // also poll-only when the recipient is not push-eligible here at all (a
+    // delivery_kind='none' session, a paneless row, or no tmux backend), which deliverNext
+    // would leave "queued" regardless of push_after. Derived from the same push_after the
+    // row carries and the same predicate deliverNext gates on, so the signal cannot drift
+    // from the actual push behavior.
+    const pollOnly = pushAfter === null || !isPushableTarget(peerDelivery(body.to_id));
     return { ok: true, delivery, poll_only: pollOnly };
   }
 
