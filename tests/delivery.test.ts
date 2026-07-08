@@ -4,7 +4,7 @@ import { unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  buildPaneCommandArgs, buildSessionNameArgs, buildTmuxArgs, claimForDelivery, classifyPaneReadiness,
+  buildPaneCommandArgs, buildPaneReadyFormat, buildSessionNameArgs, buildTmuxArgs, claimForDelivery, classifyPaneReadiness, SHELL_COMMANDS,
   confirmDelivered, DEFAULT_CHANNEL_PUSH_CAP,
   DEFAULT_DEFERRAL_ESCALATION_CAP, decideChannelPush, decideDeferralEscalation, deliverViaTmux,
   ensureMessagesTable, findLeaklessDelivering, formatPeerMessage, hasDuePush,
@@ -643,6 +643,79 @@ describe("classifyPaneReadiness", () => {
   it("fails open on an empty or unrecognized command", () => {
     expect(classifyPaneReadiness("").ready).toBe(true);
     expect(classifyPaneReadiness("python3").ready).toBe(true);
+  });
+});
+
+// A minimal evaluator for the tmux `-F` format subset buildPaneReadyFormat emits:
+// #{pane_current_command}, #{==:a,b}, #{||:a,b}, #{?c,t,f}, and literals. tmux truthiness is
+// "non-empty and not 0". Deliberately case-sensitive with no trimming, mirroring tmux and NOT
+// classifyPaneReadiness, so the test both proves parity on canonical input and pins the
+// documented case divergence. Commas inside nested #{...} are respected via balanced splitting.
+function splitTopLevel(s: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === "{") depth++;
+    else if (c === "}") depth--;
+    else if (c === "," && depth === 0) {
+      parts.push(s.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(s.slice(start));
+  return parts;
+}
+function evalTmuxFormat(fmt: string, paneCmd: string): string {
+  if (!fmt.startsWith("#{")) return fmt; // literal
+  const inner = fmt.slice(2, -1);
+  if (inner === "pane_current_command") return paneCmd;
+  const truthy = (v: string): boolean => v !== "" && v !== "0";
+  if (inner.startsWith("?")) {
+    const [cond = "", t = "", f = ""] = splitTopLevel(inner.slice(1));
+    return truthy(evalTmuxFormat(cond, paneCmd)) ? evalTmuxFormat(t, paneCmd) : evalTmuxFormat(f, paneCmd);
+  }
+  if (inner.startsWith("==:")) {
+    const [a = "", b = ""] = splitTopLevel(inner.slice(3));
+    return evalTmuxFormat(a, paneCmd) === evalTmuxFormat(b, paneCmd) ? "1" : "0";
+  }
+  if (inner.startsWith("||:")) {
+    const [a = "", b = ""] = splitTopLevel(inner.slice(3));
+    return truthy(evalTmuxFormat(a, paneCmd)) || truthy(evalTmuxFormat(b, paneCmd)) ? "1" : "0";
+  }
+  throw new Error(`evalTmuxFormat: unhandled format ${inner}`);
+}
+
+describe("buildPaneReadyFormat", () => {
+  const fmt = buildPaneReadyFormat();
+  it("matches classifyPaneReadiness across the whole SHELL_COMMANDS set plus ready commands (one source of truth)", () => {
+    // Iterate the real denylist, not a sample, so parity is proven for every shell and a name
+    // added to SHELL_COMMANDS later is covered automatically. tmux reports the lowercase basename,
+    // which is where the case-sensitive format and the case-folding classifier must agree.
+    for (const cmd of [...SHELL_COMMANDS, "node", "bun", "python3", ""]) {
+      const readyByFormat = evalTmuxFormat(fmt, cmd) === "1";
+      expect(readyByFormat).toBe(classifyPaneReadiness(cmd).ready);
+    }
+  });
+  it("fails open: an empty or unrecognized command is ready, a shell is not", () => {
+    expect(evalTmuxFormat(fmt, "")).toBe("1");
+    expect(evalTmuxFormat(fmt, "python3")).toBe("1");
+    expect(evalTmuxFormat(fmt, "bash")).toBe("0");
+  });
+  it("derives the predicate from the passed set, so a new shell name needs no second list", () => {
+    // Deriving from SHELL_COMMANDS is what dissolves #44's two-sources-of-truth objection.
+    const guard = buildPaneReadyFormat(["bash", "myshell"]);
+    expect(evalTmuxFormat(guard, "myshell")).toBe("0"); // the added name is guarded
+    expect(evalTmuxFormat(guard, "node")).toBe("1"); // unlisted stays ready
+  });
+  it("is case-sensitive, unlike the trimming/case-folding classifier (documented #44 divergence)", () => {
+    expect(evalTmuxFormat(fmt, "BASH")).toBe("1"); // the format reads it ready...
+    expect(classifyPaneReadiness("BASH").ready).toBe(false); // ...the classifier does not
+  });
+  it("makes every pane ready when the shell set is empty", () => {
+    expect(buildPaneReadyFormat([])).toBe("1");
+    expect(evalTmuxFormat(buildPaneReadyFormat([]), "bash")).toBe("1");
   });
 });
 

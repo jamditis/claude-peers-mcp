@@ -377,7 +377,10 @@ export function buildTmuxArgs(pane: string, socket: string | null, text: string)
 // command. The detector is a denylist on purpose: an unrecognized foreground fails open and
 // injects, so a live Claude pane is never starved by a name we did not anticipate; the cost
 // of a missing shell name is one stray paste into an already-dead session, not lost mail.
-const SHELL_COMMANDS = new Set([
+// Exported so the atomic-guard builder (buildPaneReadyFormat) and its parity test derive
+// from this one set rather than a hand-copied second list -- the single source of truth
+// that makes the if-shell guard in issue #44 safe to build.
+export const SHELL_COMMANDS = new Set([
   "bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh", "csh",
   "ash", "hush", "mksh",
   "pwsh", "powershell", "nu", "nushell", "xonsh", "elvish",
@@ -397,12 +400,48 @@ export interface PaneReadiness {
  * Detecting a modal or permission prompt inside a live Claude pane needs capture-pane
  * signature matching and is out of scope (issue #5): the foreground process is still node
  * in that state, so this check passes it through.
+ *
+ * See buildPaneReadyFormat for the atomic-guard twin of this check: the same denylist
+ * expressed as a tmux `-F` predicate, for closing the probe-to-send TOCTOU in issue #44.
  */
 export function classifyPaneReadiness(currentCommand: string): PaneReadiness {
   const cmd = currentCommand.trim().toLowerCase();
   if (cmd === "") return { ready: true, reason: "no foreground command reported; injecting" };
   if (SHELL_COMMANDS.has(cmd)) return { ready: false, reason: `pane foreground is a shell (${cmd})` };
   return { ready: true, reason: `pane foreground is ${cmd}` };
+}
+
+/**
+ * Build the tmux `-F` format predicate that evaluates truthy exactly when a pane is ready
+ * for injection: its foreground command is not one of `shellCommands`. This is the
+ * atomic-guard counterpart to classifyPaneReadiness. A single
+ * `tmux if-shell -F <predicate> "send-keys ..."` re-reads pane_current_command and sends
+ * in one process, closing the probe-to-send TOCTOU window (issue #44): a pane that stops
+ * running Claude between an earlier probe and the send cannot receive a stray paste,
+ * because the predicate is re-evaluated at send time inside the same tmux invocation.
+ *
+ * The point of deriving the predicate from the SHELL_COMMANDS set here, rather than
+ * hand-copying the list into a tmux `case` string, is that the classifier and the atomic
+ * guard keep one source of truth: the "two sources of truth" tradeoff #44 raises against
+ * an if-shell guard does not apply when the guard is generated from the same set. Adding a
+ * shell name to SHELL_COMMANDS flows into both paths at once. Shape: OR every
+ * `#{==:#{pane_current_command},<sh>}` comparison, then negate, so an empty or unrecognized
+ * command falls open to ready, matching classifyPaneReadiness's fail-open denylist rule.
+ *
+ * Two differences from the pure classifier a caller must weigh before wiring this into the
+ * send path (they are why #44 needs a deliberate decision, not a reflexive patch): tmux `-F` comparisons are
+ * case-sensitive and do not trim, whereas classifyPaneReadiness folds case and trims, so a
+ * pane reporting "BASH" reads ready here but not-ready there. In practice
+ * pane_current_command is the lowercase basename, so the two agree, but the divergence is
+ * real. And `#{||:...}` / `#{?...}` format conditionals require a tmux new enough to
+ * support them (roughly 2.9+); an older tmux would treat the predicate as a literal.
+ */
+export function buildPaneReadyFormat(shellCommands: Iterable<string> = SHELL_COMMANDS): string {
+  const isShell = [...shellCommands]
+    .map((sh) => `#{==:#{pane_current_command},${sh}}`)
+    .reduce((acc, cmp) => (acc === "" ? cmp : `#{||:${acc},${cmp}}`), "");
+  if (isShell === "") return "1"; // no shells defined: nothing is a shell, so every pane is ready
+  return `#{?${isShell},0,1}`; // truthy (1) only when the command matched no shell name
 }
 
 /** Build the argv that asks tmux for a pane's foreground command name. */
