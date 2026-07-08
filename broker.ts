@@ -541,6 +541,18 @@ if (import.meta.main) {
       .get(toId) as { kind: string; pane: string | null; socket: string | null } | null;
   }
 
+  // Whether this host can auto-push into a recipient at all: it needs a live tmux
+  // pane on a tmux-capable host. A delivery_kind='none' session, a paneless row, or
+  // a host without tmux is never auto-pushed; its mail is poll-only (read via
+  // check_messages, accelerated by the doorbell). deliverNext gates delivery on this,
+  // and the forward path derives its poll_only signal from it, so the sender-facing
+  // "will it still push?" answer cannot drift from the actual push decision (#39).
+  function isPushableTarget(
+    target: { kind: string; pane: string | null; socket: string | null } | null,
+  ): target is { kind: string; pane: string; socket: string | null } {
+    return target?.kind === "tmux" && !!target.pane && tmuxAvailable();
+  }
+
   // True only if the recipient is still registered and its pid still probes alive. Used to
   // re-verify liveness after the tmux send (the lease was claimed before the await), since a
   // 0 exit from send-keys does not prove a live peer consumed the text.
@@ -584,7 +596,7 @@ if (import.meta.main) {
     const row = nextDeliverable(db, toId, now, activeRowIds);
     if (!row) return null;
     const target = peerDelivery(toId);
-    if (target?.kind !== "tmux" || !target.pane || !tmuxAvailable()) return "queued";
+    if (!isPushableTarget(target)) return "queued";
     // The urgency gate: interrupt the recipient only when some pending row is push-due
     // (an interrupt send, or a normal row whose push_delay window has lapsed). Until
     // then everything stays queued for their next check_messages — the cheap path.
@@ -805,7 +817,7 @@ if (import.meta.main) {
       if (!res.ok) return { ok: false, error: `Remote broker error: ${res.status}` };
       const result = await res.json() as ForwardMessageResponse;
       if (!result.ok) return { ok: false, error: "Remote broker rejected message (target peer not found)" };
-      return { ok: true, routed: "remote", delivery: result.delivery ?? "queued" };
+      return { ok: true, routed: "remote", delivery: result.delivery ?? "queued", poll_only: result.poll_only };
     } catch {
       return { ok: false, error: "Remote broker unreachable" };
     } finally {
@@ -854,7 +866,15 @@ if (import.meta.main) {
       if ((await deliverNext(body.to_id)) === "accepted") await drainAfterDelivery(body.to_id);
       delivery = isMessageDelivered(db, forwardedRowId) ? "accepted" : "queued";
     }
-    return { ok: true, delivery };
+    // Report whether this host will ever auto-push the row, so the originating broker can
+    // give its sender an accurate queued-vs-poll-only signal (#39). It is poll-only when
+    // floored (push_after NULL above, never auto-pushed) OR when the recipient is not
+    // push-eligible here at all (a delivery_kind='none' session, a paneless row, or no
+    // tmux backend): deliverNext would return "queued" for those regardless of floor, so
+    // reporting push-eligible would be wrong. Derived from the same predicate deliverNext
+    // gates on, so the two cannot drift.
+    const pollOnly = config.floor_remote_forwards || !isPushableTarget(peerDelivery(body.to_id));
+    return { ok: true, delivery, poll_only: pollOnly };
   }
 
   function handleGossip(body: GossipRequest): { ok: boolean } {
