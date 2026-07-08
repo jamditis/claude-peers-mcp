@@ -23,12 +23,14 @@ import { makeSpawnTmuxQuery, resolveSessionName, resolveTmuxTarget, SESSION_NAME
 import { loadConfig } from "./shared/config.ts";
 import { formatPeerList } from "./shared/format-peers.ts";
 import { buildAutoSummary } from "./shared/summarize.ts";
+import { describeSendOutcome } from "./shared/format-send.ts";
 import type {
   Peer,
   PeerId,
   PeekMessagesResponse,
   PollMessagesResponse,
   RegisterResponse,
+  SendResult,
 } from "./shared/types.ts";
 import { PROTOCOL_VERSION as REQUIRED_BROKER_PROTOCOL } from "./shared/types.ts";
 
@@ -198,9 +200,9 @@ const mcp = new Server(
 
 Peer messages are model-to-model — be telegraphic. No greetings or pleasantries; fragments are fine. Never reply just to acknowledge: the sender already has delivery confirmation. For content over ~50 words, write a file and send the path instead.
 
-Choose send_message urgency honestly: "fyi" = no reply expected, read at the recipient's convenience; "normal" (default) = queued, may batch with other mail; "interrupt" = types into the recipient's session now — only when you are blocked on them.
+Choose send_message urgency honestly: "fyi" = no reply expected, read at the recipient's convenience; "normal" (default) = queued, may batch with other mail; "interrupt" = types into the recipient's session now — only when you are blocked on them. A broker can only type into a pane on its own host, so an interrupt to a peer on another machine does not push from here: by default it queues on the remote host for that session's check_messages, though a host that opts into remote auto-push will push it from its own heartbeat. Either way the send result tells you what happened, so don't assume a remote interrupt landed now.
 
-Pushed messages arrive inline as "[peer <id> #<n>] ..." lines: handle them promptly, reply via send_message only if you have something the sender needs, then resume your task. Queued messages: call check_messages when you finish a task. Sessions not in a tmux pane always receive via check_messages.`,
+Pushed messages arrive inline as "[peer <id> #<n>] ..." lines: handle them promptly, reply via send_message only if you have something the sender needs, then resume your task. Queued messages: call check_messages when you finish a task. A session not in a tmux pane has no pane to push into and receives via check_messages.`,
   }
 );
 
@@ -227,7 +229,7 @@ const TOOLS = [
   {
     name: "send_message",
     description:
-      "Send a message to another Claude Code instance by peer ID or session name. Urgency controls delivery: interrupt pushes into their session now; normal (default) queues until they poll or a short deadline passes; fyi is poll-only with no reply expected.",
+      "Send a message to another Claude Code instance by peer ID or session name. Urgency controls delivery: interrupt pushes into their session now; normal (default) queues until they poll or a short deadline passes; fyi is poll-only with no reply expected. A broker can only push into a pane on its own host, so interrupt to a peer on another machine does not push from here: by default it queues on the remote host for that session's next check_messages (a host that opts into remote auto-push pushes it from its own heartbeat instead). The result line says what happened: pushed, a plain local queue, or a remote queue (poll-only, or push-eligible on the remote host).",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -346,7 +348,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
-        const result = await brokerFetch<{ ok: boolean; error?: string; delivery?: string }>("/send-message", {
+        const result = await brokerFetch<SendResult>("/send-message", {
           from_id: myId,
           to_id,
           text: message,
@@ -360,9 +362,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             isError: true,
           };
         }
-        const how = result.delivery === "accepted" ? "pushed" : "queued";
         return {
-          content: [{ type: "text" as const, text: `Sent to ${to_id} (${how})` }],
+          content: [{ type: "text" as const, text: describeSendOutcome(to_id, result) }],
         };
       } catch (e) {
         return {

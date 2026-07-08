@@ -127,6 +127,13 @@ export interface SendResult {
   // "accepted" = pushed into the recipient's live session; "queued" = left for
   // their next check_messages. (No "injected": only these two states occur in M1.)
   delivery?: "accepted" | "queued";
+  // Only set for a remote (forwarded) send, and only meaningful when delivery is
+  // "queued": true iff the remote host will never auto-push the row (its stored
+  // push_after is NULL because it was floored or sent fyi, or the recipient is not
+  // push-eligible there), false iff it is push-eligible there (the remote heartbeat
+  // pushes it once due). Absent when the send was local or the remote broker predates
+  // the field, so a reader must treat absence as "unknown", not "push-eligible" (#39).
+  poll_only?: boolean;
 }
 
 export interface PollMessagesRequest {
@@ -183,6 +190,15 @@ export interface ForwardMessageResponse {
   // their next check_messages (e.g. floor_remote_forwards, no tmux backend, or a failed
   // push). Absent when ok is false (no recipient to deliver to).
   delivery?: "accepted" | "queued";
+  // Whether this host will never auto-push the forwarded row, so it is poll-only here:
+  // true when the stored push_after is NULL (floored via floor_remote_forwards, or an fyi
+  // whose pushAfterFor is NULL) or when the recipient is not push-eligible on this host at
+  // all (a delivery_kind='none' session, a paneless row, or no tmux backend). Lets the
+  // originating broker tell its sender whether a "queued" remote message waits for
+  // check_messages or still gets pushed by this host's heartbeat. Absent from a broker
+  // predating the field, which the sender-side reader treats as unknown rather than
+  // push-eligible (#39).
+  poll_only?: boolean;
 }
 
 // The parsed body of a control-plane request. Each route reads only the fields of its own

@@ -1692,6 +1692,33 @@ describe("cross-broker send reports the remote delivery disposition", () => {
     expect(log).toContain("push me across");
   }, FED_TIMEOUT_MS);
 
+  it("reports poll_only for an fyi forward even to a push-eligible unfloored sibling (#39)", async () => {
+    // An fyi stores push_after NULL, so nextDeliverable/hasDuePush never auto-push it: it
+    // is poll-only even though floor is off and the recipient has a live pane. The signal
+    // must say so, not the "heartbeat pushes it once due" wording a push-eligible row gets.
+    const sender = await registerAndGetToken(A_PORT, { pid: process.pid, cwd: "/tmp/fwa-fyi-s", machine: "fwd-a" });
+    const recip = await brokerFetch(B_PORT, "/register", {
+      pid: process.pid, cwd: "/tmp/fwb-fyi-r", git_root: null, tty: null, summary: "",
+      machine: "fwd-b", tailscale_ip: "127.0.0.1", tmux_pane: "%9", tmux_socket: null,
+    }) as any;
+
+    await waitRemotePeer(A_PORT, recip.id);
+
+    const send = await brokerFetch(A_PORT, "/send-message", {
+      from_id: sender.id, to_id: recip.id, text: "fyi across, no push", urgency: "fyi",
+    }, sender.token) as any;
+    expect(send.ok).toBe(true);
+    expect(send.routed).toBe("remote");
+    // Queued and poll-only: the sibling will never auto-push an fyi, so the sender must not
+    // be told the heartbeat will deliver it.
+    expect(send.delivery).toBe("queued");
+    expect(send.poll_only).toBe(true);
+
+    // And it really was not pushed into the recipient's pane.
+    const log = existsSync(stub.logFile) ? readFileSync(stub.logFile, "utf-8") : "";
+    expect(log).not.toContain("fyi across, no push");
+  }, FED_TIMEOUT_MS);
+
   it("reports queued when the sibling floors the forward", async () => {
     const sender = await registerAndGetToken(C_PORT, { pid: process.pid, cwd: "/tmp/fwc-s", machine: "fwd-c" });
     const recip = await brokerFetch(D_PORT, "/register", {
