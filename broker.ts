@@ -27,7 +27,11 @@ import type {
   PollMessagesRequest, PollMessagesResponse,
   RegisterRequest, RegisterResponse, SendMessageRequest, SendResult,
 } from "./shared/types.ts";
-import { PROTOCOL_VERSION } from "./shared/types.ts";
+import {
+  LIST_PEERS_SCOPE_ERROR,
+  parseListPeersScope,
+  PROTOCOL_VERSION,
+} from "./shared/types.ts";
 
 const GOSSIP_INTERVAL_MS = 5_000;
 const CLEANUP_INTERVAL_MS = 15_000;
@@ -127,6 +131,41 @@ export function shouldPruneLocalPeer(
   // an extra grace window, so transient sleep/stall gaps can heartbeat and keep their mail/token.
   if (staleHeartbeat && stalePruneReady) return true;
   return false;
+}
+
+export function validateControlPlaneBody(path: string, body: unknown): Response | null {
+  if (path === "/list-peers") {
+    const parsed = parseListPeersScope(body);
+    return "error" in parsed
+      ? Response.json({ ok: false, error: parsed.error }, { status: 400 })
+      : null;
+  }
+  const requiredFields = path === "/send-message"
+    ? ["from_id", "to_id", "text"]
+    : path === "/forward-message"
+      ? ["from_id", "to_id", "text", "from_machine"]
+      : [];
+  if (requiredFields.length === 0) return null;
+  const values = body && typeof body === "object"
+    ? body as Record<string, unknown>
+    : {};
+  for (const field of requiredFields) {
+    const value = values[field];
+    if (field === "to_id") {
+      if (value === undefined) {
+        return Response.json({ ok: false, error: "to_id is required" }, { status: 400 });
+      }
+      if (typeof value !== "string" || value.trim().length === 0) {
+        return Response.json(
+          { ok: false, error: "to_id must be a non-empty string" },
+          { status: 400 },
+        );
+      }
+    } else if (typeof value !== "string") {
+      return Response.json({ ok: false, error: `${field} is required` }, { status: 400 });
+    }
+  }
+  return null;
 }
 
 export function resolveTargetBroker(
@@ -706,6 +745,9 @@ if (import.meta.main) {
   function handleListPeers(body: ListPeersRequest): Peer[] {
     let localPeers: Peer[];
     switch (body.scope) {
+      case "machine":
+        localPeers = selectAllPeers.all() as Peer[];
+        break;
       case "directory":
         localPeers = selectPeersByDirectory.all(body.cwd) as Peer[];
         break;
@@ -715,7 +757,7 @@ if (import.meta.main) {
           : selectPeersByDirectory.all(body.cwd) as Peer[];
         break;
       default:
-        localPeers = selectAllPeers.all() as Peer[];
+        throw new Error(LIST_PEERS_SCOPE_ERROR);
     }
     localPeers = localPeers
       .filter(p => !isPidDead(pidProbe(p.pid)))
@@ -1060,7 +1102,10 @@ if (import.meta.main) {
       try {
         // Loopback-gated control plane, single trusted client (our MCP server) — see
         // ControlPlaneRequest. The cast restores the per-route field types from `unknown`.
-        const body = (await req.json()) as ControlPlaneRequest;
+        const rawBody = await req.json();
+        const bodyFields = rawBody && typeof rawBody === "object"
+          ? rawBody as Record<string, unknown>
+          : {};
         // Per-session capability auth, before the idle bump (an unauthorized request is neither
         // trusted input nor real traffic, like the loopback gate above). Every mutating control-
         // plane call binds to the session that registered it: the presented Authorization: Bearer
@@ -1073,10 +1118,12 @@ if (import.meta.main) {
         // is a genuine pre-v3 NULL-token row (see below); a wrong token always 401s.
         const tokenExempt = path === "/register" || path === "/retire" || path === "/list-peers" || isFederationRoute(path);
         if (!tokenExempt) {
-          const principal = path === "/send-message" ? body.from_id : body.id;
+          const principal = path === "/send-message" ? bodyFields.from_id : bodyFields.id;
           const auth = req.headers.get("authorization") ?? "";
           const presented = auth.startsWith("Bearer ") ? auth.slice(7) : null;
-          const row = principal ? (tokenForPeer.get(principal) as { token: string | null } | null) : null;
+          const row = typeof principal === "string" && principal.length > 0
+            ? tokenForPeer.get(principal) as { token: string | null } | null
+            : null;
           const valid = presented !== null && row?.token != null && row.token === presented;
           // The unsigned grace covers exactly one principal: a genuine pre-v3 row whose token is
           // still NULL — a legacy client that registered before tokens existed and cannot present
@@ -1088,6 +1135,9 @@ if (import.meta.main) {
             return Response.json({ ok: false, error: "unauthorized" }, { status: 401 });
           }
         }
+        const validationError = validateControlPlaneBody(path, rawBody);
+        if (validationError) return validationError;
+        const body = rawBody as ControlPlaneRequest;
         // Refresh the idle window only for local control-plane traffic, not sibling federation
         // (/gossip, /forward-message). Self-exit reaps a broker with no LOCAL work; a federated
         // broker otherwise gets its idle clock reset forever by a sibling's periodic gossip and
@@ -1147,7 +1197,9 @@ if (import.meta.main) {
           default: return Response.json({ error: "not found" }, { status: 404 });
         }
       } catch (e) {
-        return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status: 500 });
+        const message = e instanceof Error ? e.message : String(e);
+        console.error(`[claude-peers broker] ${path} failed: ${message}`);
+        return Response.json({ error: message }, { status: 500 });
       }
     },
   });

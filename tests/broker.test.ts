@@ -12,6 +12,7 @@ import {
   pruneRemotePeers,
   recordGossipResult,
   resolvePeerRef,
+  validateControlPlaneBody,
   resolveTargetBroker,
   shouldPruneLocalPeer,
 } from "../broker.ts";
@@ -232,6 +233,73 @@ describe("resolvePeerRef", () => {
     expect(resolvePeerRef(collide, handle)).toEqual({
       kind: "ambiguous",
       ids: ["alp-11112222", "bet-33334444"],
+    });
+  });
+});
+
+describe("control-plane body validation", () => {
+  it("returns a 400 response when send-message has no target", async () => {
+    const response = validateControlPlaneBody("/send-message", {
+      from_id: "alp-sender",
+      text: "missing target",
+    });
+
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({ ok: false, error: "to_id is required" });
+  });
+
+  it("returns a 400 response when forward-message has no target", async () => {
+    const response = validateControlPlaneBody("/forward-message", {
+      from_id: "alp-sender",
+      text: "missing target",
+      from_machine: "node-a",
+    });
+
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({ ok: false, error: "to_id is required" });
+  });
+
+  it("returns a 400 response when the target is empty", async () => {
+    const response = validateControlPlaneBody("/send-message", {
+      from_id: "alp-sender",
+      to_id: "   ",
+      text: "empty target",
+    });
+
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({
+      ok: false,
+      error: "to_id must be a non-empty string",
+    });
+  });
+
+  it("returns a 400 response when the target is not a string", async () => {
+    const response = validateControlPlaneBody("/send-message", {
+      from_id: "alp-sender",
+      to_id: 42,
+      text: "invalid target",
+    });
+
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({
+      ok: false,
+      error: "to_id must be a non-empty string",
+    });
+  });
+
+  it("accepts each supported list-peers scope", () => {
+    for (const scope of ["machine", "directory", "repo"] as const) {
+      expect(validateControlPlaneBody("/list-peers", { scope })).toBeNull();
+    }
+  });
+
+  it("returns a 400 response for an unsupported list-peers scope", async () => {
+    const response = validateControlPlaneBody("/list-peers", { scope: "network" });
+
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({
+      ok: false,
+      error: "scope must be one of: machine, directory, repo",
     });
   });
 });

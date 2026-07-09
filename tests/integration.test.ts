@@ -1418,6 +1418,58 @@ describe("per-session capability tokens (enforced)", () => {
     expect(poll.messages[0].text).toBe("authed hello");
   });
 
+  it("rejects a send with no target as a bad request", async () => {
+    const sender = await registerAndGetToken(PORT, { cwd: "/tmp/t-missing-target" });
+    const response = await rawPost(PORT, "/send-message", {
+      from_id: sender.id,
+      text: "missing target",
+    }, sender.token);
+
+    expect(response.status).toBe(400);
+    expect(response.json).toEqual({ ok: false, error: "to_id is required" });
+  });
+
+  it("rejects a send with an empty target as a bad request", async () => {
+    const sender = await registerAndGetToken(PORT, { cwd: "/tmp/t-empty-target" });
+    const response = await rawPost(PORT, "/send-message", {
+      from_id: sender.id,
+      to_id: "   ",
+      text: "empty target",
+    }, sender.token);
+
+    expect(response.status).toBe(400);
+    expect(response.json).toEqual({
+      ok: false,
+      error: "to_id must be a non-empty string",
+    });
+  });
+
+  it("authenticates malformed sends before validating the body", async () => {
+    const sender = await registerAndGetToken(PORT, { cwd: "/tmp/t-unauthenticated-malformed" });
+    for (const body of [
+      { from_id: sender.id, text: "missing target" },
+      { to_id: "recipient", text: "missing principal" },
+      { from_id: 42, to_id: "recipient", text: "invalid principal" },
+    ]) {
+      const response = await rawPost(PORT, "/send-message", body);
+
+      expect(response.status).toBe(401);
+      expect(response.json).toEqual({ ok: false, error: "unauthorized" });
+    }
+  });
+
+  it("rejects a forward with no target as a bad request", async () => {
+    const response = await rawPost(PORT, "/forward-message", {
+      protocol_version: PROTOCOL_VERSION,
+      from_id: "remote-sender",
+      text: "missing target",
+      from_machine: "remote-node",
+    });
+
+    expect(response.status).toBe(400);
+    expect(response.json).toEqual({ ok: false, error: "to_id is required" });
+  });
+
   it("rejects a send carrying no token", async () => {
     const sender = await registerAndGetToken(PORT, { cwd: "/tmp/t-s2" });
     const recip = await registerAndGetToken(PORT, { cwd: "/tmp/t-r2" });
@@ -1472,6 +1524,33 @@ describe("per-session capability tokens (enforced)", () => {
     expect(me).toBeDefined();
     expect("token" in me).toBe(false);
     expect((r.json as any[]).every((x) => !("token" in x))).toBe(true);
+  });
+
+  it("accepts each supported list-peers scope", async () => {
+    for (const scope of ["machine", "directory", "repo"] as const) {
+      const response = await rawPost(PORT, "/list-peers", {
+        scope,
+        cwd: "/tmp/t-list-scopes",
+        git_root: "/tmp/repo",
+      });
+
+      expect(response.status).toBe(200);
+      expect(Array.isArray(response.json)).toBe(true);
+    }
+  });
+
+  it("rejects an unsupported list-peers scope as a bad request", async () => {
+    const response = await rawPost(PORT, "/list-peers", {
+      scope: "network",
+      cwd: "/tmp/t-list-invalid",
+      git_root: null,
+    });
+
+    expect(response.status).toBe(400);
+    expect(response.json).toEqual({
+      ok: false,
+      error: "scope must be one of: machine, directory, repo",
+    });
   });
 });
 

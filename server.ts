@@ -22,17 +22,23 @@ import {
 import { makeSpawnTmuxQuery, resolveSessionName, resolveTmuxTarget, SESSION_NAME_TIMEOUT_MS } from "./delivery.ts";
 import { loadConfig } from "./shared/config.ts";
 import { formatPeerList } from "./shared/format-peers.ts";
+import {
+  handleSendMessageTool,
+  SEND_MESSAGE_TOOL_INPUT_SCHEMA,
+} from "./shared/send-message.ts";
 import { buildAutoSummary } from "./shared/summarize.ts";
-import { describeSendOutcome } from "./shared/format-send.ts";
 import type {
   Peer,
   PeerId,
   PeekMessagesResponse,
   PollMessagesResponse,
   RegisterResponse,
-  SendResult,
 } from "./shared/types.ts";
-import { PROTOCOL_VERSION as REQUIRED_BROKER_PROTOCOL } from "./shared/types.ts";
+import {
+  LIST_PEERS_SCOPES,
+  parseListPeersScope,
+  PROTOCOL_VERSION as REQUIRED_BROKER_PROTOCOL,
+} from "./shared/types.ts";
 
 const config = loadConfig();
 
@@ -218,7 +224,7 @@ const TOOLS = [
       properties: {
         scope: {
           type: "string" as const,
-          enum: ["machine", "directory", "repo"],
+          enum: [...LIST_PEERS_SCOPES],
           description:
             'Scope of peer discovery. "machine" = all instances on this computer and across the network. "directory" = same working directory. "repo" = same git repository (including worktrees or subdirectories).',
         },
@@ -230,27 +236,7 @@ const TOOLS = [
     name: "send_message",
     description:
       "Send a message to another Claude Code instance by peer ID or session name. Urgency controls delivery: interrupt pushes into their session now; normal (default) queues until they poll or a short deadline passes; fyi is poll-only with no reply expected. A broker can only push into a pane on its own host, so interrupt to a peer on another machine does not push from here: by default it queues on the remote host for that session's next check_messages (a host that opts into remote auto-push pushes it from its own heartbeat instead). The result line says what happened: pushed, a plain local queue, or a remote queue (poll-only, or push-eligible on the remote host).",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        to_id: {
-          type: "string" as const,
-          description:
-            "The target Claude Code instance: its peer ID, or the session name shown in list_peers (the handle in parentheses). A name that matches no visible peer, or matches more than one, is rejected with guidance to address by peer ID.",
-        },
-        message: {
-          type: "string" as const,
-          description: "The message to send",
-        },
-        urgency: {
-          type: "string" as const,
-          enum: ["interrupt", "normal", "fyi"],
-          description:
-            'Default "normal". Use "interrupt" only when blocked on the recipient (or they may exit soon) — it costs them a full inference turn. Use "fyi" for status notes that need no reply.',
-        },
-      },
-      required: ["to_id", "message"],
-    },
+    inputSchema: SEND_MESSAGE_TOOL_INPUT_SCHEMA,
   },
   {
     name: "set_summary",
@@ -298,7 +284,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
   switch (name) {
     case "list_peers": {
-      const scope = (args as { scope: string }).scope as "machine" | "directory" | "repo";
+      const parsedScope = parseListPeersScope(args);
+      if ("error" in parsedScope) {
+        return {
+          content: [{ type: "text" as const, text: parsedScope.error }],
+          isError: true,
+        };
+      }
+      const { scope } = parsedScope;
       try {
         const peers = await brokerFetch<Peer[]>("/list-peers", {
           scope,
@@ -340,42 +333,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "send_message": {
-      const { to_id, message, urgency } = args as { to_id: string; message: string; urgency?: "interrupt" | "normal" | "fyi" };
-      if (!myId) {
-        return {
-          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
-          isError: true,
-        };
-      }
-      try {
-        const result = await brokerFetch<SendResult>("/send-message", {
-          from_id: myId,
-          to_id,
-          text: message,
-          // The MCP-level default is "normal" (queue, batch, poll-first) — the wire-level
-          // absent-means-interrupt default exists only for pre-urgency clients.
-          urgency: urgency ?? "normal",
-        });
-        if (!result.ok) {
-          return {
-            content: [{ type: "text" as const, text: `Failed to send: ${result.error}` }],
-            isError: true,
-          };
-        }
-        return {
-          content: [{ type: "text" as const, text: describeSendOutcome(to_id, result) }],
-        };
-      } catch (e) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error sending message: ${e instanceof Error ? e.message : String(e)}`,
-            },
-          ],
-          isError: true,
-        };
-      }
+      return handleSendMessageTool(args, myId, brokerFetch);
     }
 
     case "set_summary": {
