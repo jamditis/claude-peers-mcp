@@ -18,6 +18,10 @@ export function ensureMessagesTable(db: Database): void {
   // push_after: epoch ms when the row becomes push-eligible. DEFAULT 0 (due now) so a
   // write that does not know about urgency keeps the old push-on-sight behavior; an
   // explicit NULL means never auto-push (fyi, floored remote forwards) — poll-only.
+  // channel_push_attempts: how many times the best-effort channel tier (#6) has pushed
+  // this row. NOT NULL DEFAULT 0 so every row carries a real count; the cap in
+  // decideChannelPush reads it, and persisting it in the row (not an in-memory map) keeps
+  // the cap honest across a broker restart. Never touched by the acked backends.
   db.run(`CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT NOT NULL, to_id TEXT NOT NULL,
     text TEXT NOT NULL, sent_at TEXT NOT NULL,
@@ -25,6 +29,7 @@ export function ensureMessagesTable(db: Database): void {
     lease_expires_at INTEGER, lease_token TEXT,
     urgency TEXT NOT NULL DEFAULT 'interrupt',
     push_after INTEGER DEFAULT 0,
+    channel_push_attempts INTEGER NOT NULL DEFAULT 0,
     CHECK (delivery_state <> 'delivering' OR (lease_expires_at IS NOT NULL AND lease_token IS NOT NULL))
   )`);
 }
@@ -40,7 +45,9 @@ export function ensureMessagesTable(db: Database): void {
 export function migrateMessagesSchema(db: Database): void {
   const names = (db.query("PRAGMA table_info(messages)").all() as { name: string }[]).map((c) => c.name);
   const has = (c: string) => names.includes(c);
-  if (!has("delivered") && has("delivery_state") && has("urgency") && has("push_after")) return; // already migrated
+  // Include channel_push_attempts in the fast-path guard so a deployment already on the
+  // delivery_state schema but predating the #6 column still falls through to add it.
+  if (!has("delivered") && has("delivery_state") && has("urgency") && has("push_after") && has("channel_push_attempts")) return; // already migrated
 
   db.run("BEGIN IMMEDIATE");
   try {
@@ -53,6 +60,9 @@ export function migrateMessagesSchema(db: Database): void {
     // time — a NULL written explicitly afterwards (fyi) survives later runs because the
     // has() guard above skips this branch once the column exists.
     if (!has("push_after")) db.run("ALTER TABLE messages ADD COLUMN push_after INTEGER DEFAULT 0");
+    // Additive, non-behavior-changing: existing rows backfill to 0 attempts. NOT NULL is
+    // safe with a DEFAULT at ADD COLUMN time; no acked backend reads or writes it.
+    if (!has("channel_push_attempts")) db.run("ALTER TABLE messages ADD COLUMN channel_push_attempts INTEGER NOT NULL DEFAULT 0");
     if (has("delivered")) {
       db.run("UPDATE messages SET delivery_state = CASE WHEN delivered = 1 THEN 'delivered' ELSE 'queued' END");
       db.run("ALTER TABLE messages DROP COLUMN delivered");
@@ -125,6 +135,32 @@ export function decideChannelPush(
   if (cap <= 0) return { push: false, reason: "channel tier disabled (cap <= 0)" };
   if (attempts >= cap) return { push: false, reason: `attempt cap reached (${attempts}/${cap})` };
   return { push: true, reason: `under cap (${attempts}/${cap})` };
+}
+
+/**
+ * Persistence for the channel tier's attempt count (#6, slice 1). The count decideChannelPush
+ * consumes lives in the row, not an in-memory map, so a broker restart cannot reset it and
+ * re-push a row past its cap. These are storage helpers only: they carry no lease, claim, or
+ * confirm, so the never-ack invariant (confirmDelivered's lease-token guard) is untouched.
+ */
+export function getChannelPushAttempts(db: Database, id: number): number {
+  const row = db.query("SELECT channel_push_attempts AS n FROM messages WHERE id=?").get(id) as { n: number } | null;
+  return row?.n ?? 0;
+}
+
+/**
+ * Record one channel push and return the new count. Scoped to 'queued' rows so a channel
+ * push can never advance the counter on a row an acked backend has claimed (delivering) or
+ * finished (delivered) — that is the "a channel push and an acked attempt cannot race the
+ * lease" guard for the counter. A non-queued (or missing) row is a no-op that returns the
+ * stored count unchanged.
+ */
+export function bumpChannelPushAttempts(db: Database, id: number): number {
+  db.run(
+    "UPDATE messages SET channel_push_attempts=channel_push_attempts+1 WHERE id=? AND delivery_state='queued'",
+    [id],
+  );
+  return getChannelPushAttempts(db, id);
 }
 
 export type DeferralEscalationDecision = { escalate: boolean; reason: string };
