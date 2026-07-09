@@ -11,6 +11,26 @@ export type DeliveryState = "queued" | "delivering" | "delivered";
 // so a pre-urgency client keeps its old push-on-send behavior.
 export type Urgency = "interrupt" | "normal" | "fyi";
 
+export const LIST_PEERS_SCOPES = ["machine", "directory", "repo"] as const;
+export type ListPeersScope = (typeof LIST_PEERS_SCOPES)[number];
+export const LIST_PEERS_SCOPE_ERROR = "scope must be one of: machine, directory, repo";
+
+export function isListPeersScope(value: unknown): value is ListPeersScope {
+  return typeof value === "string"
+    && (LIST_PEERS_SCOPES as readonly string[]).includes(value);
+}
+
+export function parseListPeersScope(
+  args: unknown,
+): { scope: ListPeersScope } | { error: typeof LIST_PEERS_SCOPE_ERROR } {
+  const values = args && typeof args === "object"
+    ? args as Record<string, unknown>
+    : {};
+  return isListPeersScope(values.scope)
+    ? { scope: values.scope }
+    : { error: LIST_PEERS_SCOPE_ERROR };
+}
+
 // Broker wire-protocol version. Bumped to 2 for the delivery_state schema and
 // delivery backends; to 3 for per-session capability tokens (a registered peer may
 // act only as the id it holds the token for); to 4 for urgency tiers and the
@@ -106,7 +126,7 @@ export interface SetSummaryRequest {
 }
 
 export interface ListPeersRequest {
-  scope: "machine" | "directory" | "repo";
+  scope: ListPeersScope;
   cwd: string;
   git_root: string | null;
   exclude_id?: PeerId;
