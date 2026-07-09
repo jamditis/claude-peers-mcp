@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildPaneCommandArgs, buildPaneReadyFormat, buildSessionNameArgs, buildTmuxArgs, claimForDelivery, classifyPaneReadiness, SHELL_COMMANDS,
+  bumpChannelPushAttempts, getChannelPushAttempts,
   confirmDelivered, DEFAULT_CHANNEL_PUSH_CAP,
   DEFAULT_DEFERRAL_ESCALATION_CAP, decideChannelPush, decideDeferralEscalation, deliverViaTmux,
   ensureMessagesTable, findLeaklessDelivering, formatPeerMessage, hasDuePush,
@@ -15,6 +16,7 @@ import {
   makeSpawnTmuxQuery, resetDeliveringOnStart, resolveSessionName, resolveTmuxTarget,
   SESSION_NAME_ENV, type TmuxQuery, type TmuxSpawn,
 } from "../delivery.ts";
+import type { DeliveryState } from "../shared/types.ts";
 
 const DB = join(tmpdir(), "test-delivery-migration.db");
 
@@ -103,6 +105,27 @@ describe("migrateMessagesSchema", () => {
     db.close();
   });
 
+  it("adds channel_push_attempts to a pre-#6 table, backfilling existing rows to 0", () => {
+    // A table already on the delivery_state + push_after schema but predating the #6 column.
+    // The fast-path guard must fall through and add it, and a row written before the column
+    // existed must read 0, not NULL, so the cap arithmetic in decideChannelPush is sound.
+    const db = new Database(DB);
+    db.run(`CREATE TABLE messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT NOT NULL, to_id TEXT NOT NULL,
+      text TEXT NOT NULL, sent_at TEXT NOT NULL,
+      delivery_state TEXT NOT NULL DEFAULT 'queued', lease_expires_at INTEGER, lease_token TEXT,
+      urgency TEXT NOT NULL DEFAULT 'interrupt', push_after INTEGER DEFAULT 0
+    )`);
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at) VALUES ('a','b','hi',?)", [new Date().toISOString()]);
+
+    migrateMessagesSchema(db);
+
+    expect(cols(db)).toContain("channel_push_attempts");
+    const id = (db.query("SELECT id FROM messages").get() as { id: number }).id;
+    expect(getChannelPushAttempts(db, id)).toBe(0);
+    db.close();
+  });
+
   it("finishes a partially-migrated table (new columns present, delivered not yet dropped)", () => {
     // Models a crash between ADD COLUMN and DROP COLUMN: both old and new columns exist.
     const db = new Database(DB);
@@ -120,6 +143,81 @@ describe("migrateMessagesSchema", () => {
     expect(c).toContain("delivery_state");
     const row = db.query("SELECT delivery_state FROM messages").get() as { delivery_state: string };
     expect(row.delivery_state).toBe("delivered");
+    db.close();
+  });
+});
+
+const CDB = join(tmpdir(), "test-delivery-channel-attempts.db");
+
+describe("channel push attempt persistence (#6 slice 1)", () => {
+  beforeEach(() => { try { unlinkSync(CDB); } catch {} });
+  afterEach(() => { try { unlinkSync(CDB); } catch {} });
+
+  function seeded(): { db: Database; id: number } {
+    const db = new Database(CDB);
+    ensureMessagesTable(db);
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at) VALUES ('a','b','m',?)", [new Date().toISOString()]);
+    const id = (db.query("SELECT last_insert_rowid() AS id").get() as { id: number }).id;
+    return { db, id };
+  }
+
+  it("reads 0 for a fresh row and increments on each bump", () => {
+    const { db, id } = seeded();
+    expect(getChannelPushAttempts(db, id)).toBe(0);
+    expect(bumpChannelPushAttempts(db, id)).toBe(1);
+    expect(bumpChannelPushAttempts(db, id)).toBe(2);
+    expect(getChannelPushAttempts(db, id)).toBe(2);
+    db.close();
+  });
+
+  it("returns 0 for a row that does not exist", () => {
+    const { db } = seeded();
+    expect(getChannelPushAttempts(db, 9999)).toBe(0);
+    db.close();
+  });
+
+  it("does not advance or reset the count once a row leaves queued", () => {
+    // The channel tier only pushes queued rows; once an acked backend has claimed the row
+    // (delivering) or finished it (delivered), the bump must be a no-op so a channel push
+    // cannot race the lease into the counter. Seed a non-zero count first, so this proves
+    // the transition PRESERVES the accrued attempts, not just that a fresh row stays 0.
+    const { db, id } = seeded();
+    bumpChannelPushAttempts(db, id);
+    bumpChannelPushAttempts(db, id); // count is now 2 while still queued
+    db.run("UPDATE messages SET delivery_state='delivering', lease_expires_at=?, lease_token='t' WHERE id=?", [Date.now() + 1000, id]);
+    expect(bumpChannelPushAttempts(db, id)).toBe(2); // no-op, and the accrued count survives
+    db.run("UPDATE messages SET delivery_state='delivered', lease_expires_at=NULL, lease_token=NULL WHERE id=?", [id]);
+    expect(bumpChannelPushAttempts(db, id)).toBe(2); // delivered is non-queued too: still a no-op
+    db.close();
+  });
+
+  it("survives a broker restart so the cap is not reset", () => {
+    // The whole reason the count is a column and not an in-memory map: a restart must not
+    // hand a never-reading session a fresh cap and re-push a row it already exhausted.
+    const { db, id } = seeded();
+    bumpChannelPushAttempts(db, id);
+    bumpChannelPushAttempts(db, id);
+    db.close();
+
+    const reopened = new Database(CDB);
+    expect(getChannelPushAttempts(reopened, id)).toBe(2);
+    reopened.close();
+  });
+
+  it("drives decideChannelPush to stop pushing once the persisted count hits the cap", () => {
+    // The point of the slice: the durable count is exactly what the pure cap rule reads, so
+    // after `cap` bumps the tier stops re-notifying while the row stays queued for
+    // check_messages.
+    const { db, id } = seeded();
+    const cap = 2;
+    const state = () => (db.query("SELECT delivery_state AS s FROM messages WHERE id=?").get(id) as { s: DeliveryState }).s;
+    expect(decideChannelPush(state(), getChannelPushAttempts(db, id), cap).push).toBe(true);
+    bumpChannelPushAttempts(db, id);
+    expect(decideChannelPush(state(), getChannelPushAttempts(db, id), cap).push).toBe(true);
+    bumpChannelPushAttempts(db, id);
+    expect(decideChannelPush(state(), getChannelPushAttempts(db, id), cap).push).toBe(false);
+    // The row is still queued: check_messages remains the floor, nothing was acked.
+    expect(state()).toBe("queued");
     db.close();
   });
 });

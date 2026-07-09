@@ -340,8 +340,10 @@ if (import.meta.main) {
   );
   // Poll reads pending (queued OR delivering) in id order so it can stop at an in-flight head
   // and never release a younger message ahead of an older one a tmux send still owns.
+  // Project the public Message columns explicitly (not SELECT *) so storage-only columns such
+  // as channel_push_attempts never ride the row object out through PollMessagesResponse.
   const selectPendingForPoll = db.prepare(
-    "SELECT * FROM messages WHERE to_id = ? AND delivery_state IN ('queued','delivering') ORDER BY id ASC"
+    "SELECT id, from_id, to_id, text, sent_at, delivery_state, lease_expires_at, lease_token, urgency, push_after FROM messages WHERE to_id = ? AND delivery_state IN ('queued','delivering') ORDER BY id ASC"
   );
   const markPolled = db.prepare(
     "UPDATE messages SET delivery_state = 'delivered', lease_expires_at = NULL, lease_token = NULL WHERE id = ? AND delivery_state = 'queued'"
