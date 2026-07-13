@@ -138,6 +138,36 @@ export function decideChannelPush(
 }
 
 /**
+ * Resolve the channel tier's per-message push cap from an operator override
+ * (`CLAUDE_PEERS_CHANNEL_PUSH_CAP`), falling back to `DEFAULT_CHANNEL_PUSH_CAP`. `raw` is the
+ * override string, passed in by the broker wiring rather than read from the environment here,
+ * so this stays pure and testable like `decideChannelPush`.
+ *
+ * A well-formed integer >= 0 is honored verbatim, INCLUDING 0: setting the cap to 0 disables
+ * the fallback tier on purpose (`decideChannelPush` treats cap <= 0 as off), distinct from
+ * leaving it unset. Everything else — unset, empty, negative, or non-numeric — is "no valid
+ * override," so the built-in default stands.
+ *
+ * The full-string `/^\d+$/` check is stricter than the broker's other numeric env reads, which
+ * use a bare `parseInt`. For a duration a partial parse is harmless, but here `parseInt("0oops")`
+ * is 0 (which would disable the tier) and `parseInt("1abc")` is 1, so a typo after a leading
+ * digit must reject the whole value rather than silently read as a low or zero cap. Degrading a
+ * bad value to the default keeps delivery working rather than silently disabling or lowering the tier.
+ *
+ * A digit-only value long enough to overflow (parseInt returns Infinity past ~309 digits, or an
+ * imprecise float past 2^53) also degrades to the default: decideChannelPush reads `attempts >= cap`,
+ * and `attempts >= Infinity` is never true, so an overflowed cap would silently remove the ceiling
+ * and re-push every session forever. Number.isSafeInteger rejects both Infinity and the lossy range.
+ */
+export function resolveChannelPushCap(raw: string | undefined | null): number {
+  const trimmed = (raw ?? "").trim();
+  if (!/^\d+$/.test(trimmed)) return DEFAULT_CHANNEL_PUSH_CAP;
+  const parsed = parseInt(trimmed, 10);
+  if (!Number.isSafeInteger(parsed)) return DEFAULT_CHANNEL_PUSH_CAP;
+  return parsed;
+}
+
+/**
  * Persistence for the channel tier's attempt count (#6, slice 1). The count decideChannelPush
  * consumes lives in the row, not an in-memory map, so a broker restart cannot reset it and
  * re-push a row past its cap. These are storage helpers only: they carry no lease, claim, or

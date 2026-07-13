@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildPaneCommandArgs, buildPaneReadyFormat, buildSessionNameArgs, buildTmuxArgs, claimForDelivery, classifyPaneReadiness, SHELL_COMMANDS,
-  bumpChannelPushAttempts, getChannelPushAttempts,
+  bumpChannelPushAttempts, getChannelPushAttempts, resolveChannelPushCap,
   confirmDelivered, DEFAULT_CHANNEL_PUSH_CAP,
   DEFAULT_DEFERRAL_ESCALATION_CAP, decideChannelPush, decideDeferralEscalation, deliverViaTmux,
   ensureMessagesTable, findLeaklessDelivering, formatPeerMessage, hasDuePush,
@@ -219,6 +219,62 @@ describe("channel push attempt persistence (#6 slice 1)", () => {
     // The row is still queued: check_messages remains the floor, nothing was acked.
     expect(state()).toBe("queued");
     db.close();
+  });
+});
+
+describe("resolveChannelPushCap (#6 operator override)", () => {
+  it("falls back to the default when the override is unset or blank", () => {
+    // Not configured means "use the built-in," never "disable" — an operator who never set
+    // the var still gets the fallback tier at its default cap.
+    expect(resolveChannelPushCap(undefined)).toBe(DEFAULT_CHANNEL_PUSH_CAP);
+    expect(resolveChannelPushCap(null)).toBe(DEFAULT_CHANNEL_PUSH_CAP);
+    expect(resolveChannelPushCap("")).toBe(DEFAULT_CHANNEL_PUSH_CAP);
+    expect(resolveChannelPushCap("   ")).toBe(DEFAULT_CHANNEL_PUSH_CAP);
+  });
+
+  it("honors a well-formed non-negative integer", () => {
+    expect(resolveChannelPushCap("5")).toBe(5);
+    expect(resolveChannelPushCap("1")).toBe(1);
+    expect(resolveChannelPushCap(" 7 ")).toBe(7);
+  });
+
+  it("treats 0 as a deliberate off switch, not a fallback trigger", () => {
+    // 0 is a deliberate operator choice: decideChannelPush reads cap <= 0 as the tier disabled, so
+    // an operator can turn the fallback off without a code change. It must NOT be rewritten to
+    // the default the way a malformed value is.
+    expect(resolveChannelPushCap("0")).toBe(0);
+    expect(decideChannelPush("queued", 0, resolveChannelPushCap("0")).push).toBe(false);
+  });
+
+  it("falls back to the default on a negative or non-numeric override", () => {
+    // A fat-fingered value must degrade to the safe built-in rather than silently reading as a
+    // low/zero cap and dropping the fallback push for every session.
+    expect(resolveChannelPushCap("-1")).toBe(DEFAULT_CHANNEL_PUSH_CAP);
+    expect(resolveChannelPushCap("abc")).toBe(DEFAULT_CHANNEL_PUSH_CAP);
+    expect(resolveChannelPushCap("NaN")).toBe(DEFAULT_CHANNEL_PUSH_CAP);
+    expect(resolveChannelPushCap("3.5")).toBe(DEFAULT_CHANNEL_PUSH_CAP);
+  });
+
+  it("rejects a numeric prefix followed by junk instead of truncating it", () => {
+    // parseInt would read "0oops" as 0 (disabling the tier) and "1abc" as 1 (lowering the cap);
+    // the whole-string check rejects both so the safe default stands.
+    expect(resolveChannelPushCap("0oops")).toBe(DEFAULT_CHANNEL_PUSH_CAP);
+    expect(resolveChannelPushCap("1abc")).toBe(DEFAULT_CHANNEL_PUSH_CAP);
+    expect(resolveChannelPushCap("2 3")).toBe(DEFAULT_CHANNEL_PUSH_CAP);
+  });
+
+  it("falls back to the default on an all-digit value that overflows to Infinity", () => {
+    // A digit-only string passes /^\d+$/ but parseInt returns Infinity past ~309 digits. Left
+    // unchecked it would flow into decideChannelPush as the cap, where `attempts >= Infinity` is
+    // always false: the ceiling silently vanishes and the tier re-pushes every session forever.
+    const overflow = "9".repeat(400);
+    expect(resolveChannelPushCap(overflow)).toBe(DEFAULT_CHANNEL_PUSH_CAP);
+    expect(Number.isFinite(parseInt(overflow, 10))).toBe(false); // guards against the test going stale
+    // A value inside the digit count but past the safe-integer range is lossy, not Infinity, and
+    // must degrade too — a cap read imprecisely is still a broken ceiling.
+    expect(resolveChannelPushCap("9007199254740993")).toBe(DEFAULT_CHANNEL_PUSH_CAP);
+    // The largest exact integer still reads through unchanged.
+    expect(resolveChannelPushCap("9007199254740991")).toBe(Number.MAX_SAFE_INTEGER);
   });
 });
 
