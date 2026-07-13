@@ -262,6 +262,20 @@ describe("resolveChannelPushCap (#6 operator override)", () => {
     expect(resolveChannelPushCap("1abc")).toBe(DEFAULT_CHANNEL_PUSH_CAP);
     expect(resolveChannelPushCap("2 3")).toBe(DEFAULT_CHANNEL_PUSH_CAP);
   });
+
+  it("falls back to the default on an all-digit value that overflows to Infinity", () => {
+    // A digit-only string passes /^\d+$/ but parseInt returns Infinity past ~309 digits. Left
+    // unchecked it would flow into decideChannelPush as the cap, where `attempts >= Infinity` is
+    // always false: the ceiling silently vanishes and the tier re-pushes every session forever.
+    const overflow = "9".repeat(400);
+    expect(resolveChannelPushCap(overflow)).toBe(DEFAULT_CHANNEL_PUSH_CAP);
+    expect(Number.isFinite(parseInt(overflow, 10))).toBe(false); // guards against the test going stale
+    // A value inside the digit count but past the safe-integer range is lossy, not Infinity, and
+    // must degrade too — a cap read imprecisely is still a broken ceiling.
+    expect(resolveChannelPushCap("9007199254740993")).toBe(DEFAULT_CHANNEL_PUSH_CAP);
+    // The largest exact integer still reads through unchanged.
+    expect(resolveChannelPushCap("9007199254740991")).toBe(Number.MAX_SAFE_INTEGER);
+  });
 });
 
 const LDB = join(tmpdir(), "test-delivery-lease.db");

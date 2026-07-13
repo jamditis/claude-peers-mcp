@@ -153,11 +153,18 @@ export function decideChannelPush(
  * is 0 (which would disable the tier) and `parseInt("1abc")` is 1, so a typo after a leading
  * digit must reject the whole value rather than silently read as a low or zero cap. Degrading a
  * bad value to the default keeps delivery working rather than silently disabling or lowering the tier.
+ *
+ * A digit-only value long enough to overflow (parseInt returns Infinity past ~309 digits, or an
+ * imprecise float past 2^53) also degrades to the default: decideChannelPush reads `attempts >= cap`,
+ * and `attempts >= Infinity` is never true, so an overflowed cap would silently remove the ceiling
+ * and re-push every session forever. Number.isSafeInteger rejects both Infinity and the lossy range.
  */
 export function resolveChannelPushCap(raw: string | undefined | null): number {
   const trimmed = (raw ?? "").trim();
   if (!/^\d+$/.test(trimmed)) return DEFAULT_CHANNEL_PUSH_CAP;
-  return parseInt(trimmed, 10);
+  const parsed = parseInt(trimmed, 10);
+  if (!Number.isSafeInteger(parsed)) return DEFAULT_CHANNEL_PUSH_CAP;
+  return parsed;
 }
 
 /**
