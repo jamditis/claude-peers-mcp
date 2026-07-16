@@ -408,6 +408,12 @@ if (import.meta.main) {
   const countPollOnlyQueued = db.prepare(
     "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivery_state = 'queued' AND push_after IS NULL"
   );
+  // Recipients holding such a row, for the startup reconcile below. A delivery_kind='none'
+  // peer needs no entry it would not already have: its rows never reach 'delivering' (see
+  // ringDoorbell), so a ring was never withheld from it and its marker is already current.
+  const selectPollOnlyRecipients = db.prepare(
+    "SELECT DISTINCT to_id FROM messages WHERE delivery_state = 'queued' AND push_after IS NULL"
+  );
 
   // In-memory delivery guards (this process only). Declared up here, before
   // cleanStalePeers, so the sweep can skip a recipient that is mid-delivery;
@@ -480,6 +486,18 @@ if (import.meta.main) {
       || (countPollOnlyQueued.get(toId) as { n: number }).n > 0;
     if (!waiting) return;
     writeDoorbell(DB_PATH, toId, pending.max_id);
+  }
+
+  // Startup reconcile. resetDeliveringOnStart requeued whatever a dead broker left mid-lease,
+  // so those recipients' queued prefixes are releasable again — but any ring that broker
+  // withheld while the lease was open died with it: the re-ring is owed by deliverNext's
+  // finally, and that stack is gone. Nothing else would ever write those markers, because a
+  // poll-only row is never pushed and so no future settle is guaranteed. Ring for every
+  // recipient still holding poll-only mail, so a crash inside the lease window costs a wake
+  // rather than a message. Idempotent: a row that already rang re-rings the same max-pending
+  // id, which is no advance and so no spurious wake.
+  for (const r of selectPollOnlyRecipients.all() as { to_id: string }[]) {
+    ringDoorbellAfterSettle(r.to_id);
   }
 
   // Remove a peer now, or defer until its in-flight delivery's lease resolves. Deleting the

@@ -5,6 +5,7 @@
 // id; a send to a tmux recipient writes no marker (it already gets an active push); /peek
 // reports the backlog without consuming it; and /peek is token-gated to the caller's id.
 
+import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe as bunDescribe, expect, it } from "bun:test";
 import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -204,6 +205,27 @@ describe("doorbell covers every row that will never be pushed", () => {
 // Only a tmux recipient can reach this. A delivery_kind='none' peer never has a row in
 // 'delivering' at all (deliverNext bails at !isPushableTarget), so its poll always drains.
 describe("a ring is withheld until the mail it announces is readable", () => {
+  // Wait for the lease to actually exist rather than sleeping and hoping. A fixed sleep pins
+  // the stub's wall-clock timing, not the invariant: on a slow box the fyi lands before
+  // claimForDelivery, the race is never set up, and the test fails against correct code.
+  // Read-only, and it throws rather than proceeding if the lease never appears — a race that
+  // silently failed to happen would make these tests pass for the wrong reason.
+  const waitForLease = async (toId: string, timeoutMs = 5000) => {
+    const probe = new Database(DB_PATH, { readonly: true });
+    try {
+      const q = probe.query(
+        "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivery_state = 'delivering'");
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if ((q.get(toId) as { n: number }).n > 0) return;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      throw new Error(`no delivering row for ${toId} within ${timeoutMs}ms; the race never set up`);
+    } finally {
+      probe.close();
+    }
+  };
+
   const raceSetup = async (tag: string) => {
     const rcpt = await regRcpt({ cwd: `/tmp/${tag}`, tmux_pane: SLOW_PANE });
     const sender = await regSender({ cwd: `/tmp/${tag}-s` });
@@ -211,7 +233,7 @@ describe("a ring is withheld until the mail it announces is readable", () => {
     // lease still open — while the fyi below lands.
     const push = ok("/send-message",
       { from_id: sender.id, to_id: rcpt.id, text: "slow push", urgency: "interrupt" }, sender.token);
-    await new Promise((r) => setTimeout(r, 250)); // let deliverNext claim the lease
+    await waitForLease(rcpt.id);
     await ok("/send-message",
       { from_id: sender.id, to_id: rcpt.id, text: "fyi mid-push", urgency: "fyi" }, sender.token);
     return { rcpt, push };
