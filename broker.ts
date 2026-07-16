@@ -396,6 +396,18 @@ if (import.meta.main) {
   const peekPending = db.prepare(
     "SELECT COUNT(*) AS count, MAX(id) AS max_id FROM messages WHERE to_id = ? AND delivery_state IN ('queued','delivering')"
   );
+  // Is a delivery lease open for this recipient? The doorbell asks so it can withhold a ring
+  // that a poll could not honour (see ringDoorbell). Deliberately counts ANY 'delivering' row,
+  // expired lease or not: releasableQueuedPrefix stops at the first row that is not 'queued'
+  // without consulting the deadline, so an expired lease blocks the poll just as hard. The bell
+  // must ask exactly the question the poll answers, not a more optimistic one.
+  const countDeliveringForPeer = db.prepare(
+    "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivery_state = 'delivering'"
+  );
+  // The rows nextDeliverable will never take: push_after IS NULL is the poll-only channel.
+  const countPollOnlyQueued = db.prepare(
+    "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivery_state = 'queued' AND push_after IS NULL"
+  );
 
   // In-memory delivery guards (this process only). Declared up here, before
   // cleanStalePeers, so the sweep can skip a recipient that is mid-delivery;
@@ -434,8 +446,40 @@ if (import.meta.main) {
   // a bell would only duplicate it. Best-effort and never throws into the send path:
   // writeDoorbell swallows its own IO errors, and the lookup behind isPollOnly is a primary-key
   // hit that cannot fail for a row we just inserted against.
+  //
+  // The marker means "your mail is readable up to here", not "it exists up to here". A poll
+  // releases only the contiguous queued prefix, stopping at an in-flight head to preserve
+  // ordering, so ringing while an older row is mid-push spends the counter's one advance on
+  // mail the woken session cannot read: it polls, gets nothing, re-arms at the new value, and
+  // — since a poll-only row is never pushed and nothing writes the marker again — the row
+  // strands until unrelated mail happens to ring. Withhold the ring while a lease is open;
+  // ringDoorbellAfterSettle re-rings once it clears, so the advance and the readability are
+  // the same event.
+  //
+  // A delivery_kind='none' recipient — the doorbell's original case — cannot reach this:
+  // deliverNext bails at !isPushableTarget, so none of its rows ever enter 'delivering' and
+  // its poll always drains. Only a tmux recipient, which the isPollOnly union brought into the
+  // bell's scope, can hold the lease that blocks the prefix.
   function ringDoorbell(toId: string, seq: number, pushAfter: number | null): void {
-    if (isPollOnly(toId, pushAfter)) writeDoorbell(DB_PATH, toId, seq);
+    if (!isPollOnly(toId, pushAfter)) return;
+    if ((countDeliveringForPeer.get(toId) as { n: number }).n > 0) return;
+    writeDoorbell(DB_PATH, toId, seq);
+  }
+
+  // Ring the bell the insert path withheld, once a lease resolves and the queued prefix is
+  // releasable again. Writes the same max-pending-id the insert path would have written, so the
+  // counter still only grows and a watcher armed at the older value fires exactly once.
+  function ringDoorbellAfterSettle(toId: string): void {
+    if ((countDeliveringForPeer.get(toId) as { n: number }).n > 0) return;
+    const pending = peekPending.get(toId) as { count: number; max_id: number | null };
+    if (pending.max_id === null) return;
+    // Only if a poll-only row is actually waiting. For a recipient this host cannot push to,
+    // every pending row is poll-only; for a tmux recipient only the push_after IS NULL rows
+    // are, and a backlog of merely-delayed rows is the next deliverNext's job, not the bell's.
+    const waiting = !isPushableTarget(peerDelivery(toId))
+      || (countPollOnlyQueued.get(toId) as { n: number }).n > 0;
+    if (!waiting) return;
+    writeDoorbell(DB_PATH, toId, pending.max_id);
   }
 
   // Remove a peer now, or defer until its in-flight delivery's lease resolves. Deleting the
@@ -719,6 +763,12 @@ if (import.meta.main) {
       if (pendingPeerDeletes.has(toId)) {
         pendingPeerDeletes.delete(toId);
         deletePeerAndMail(toId);
+      } else {
+        // The lease has resolved, so a poll can release the queued prefix behind it. Ring the
+        // bell the insert path withheld while it was open. Not on the teardown branch:
+        // deletePeerAndMail drops this peer's mail and its marker, and a ring would only
+        // recreate the file it just removed.
+        ringDoorbellAfterSettle(toId);
       }
     }
   }

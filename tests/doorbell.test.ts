@@ -20,6 +20,9 @@ import { PROTOCOL_VERSION } from "../shared/types.ts";
 const describe = bunDescribe.skipIf(process.platform === "win32");
 
 const PORT = 17940;
+// The pane the tmux stub deliberately stalls on, so a delivery lease is genuinely open while a
+// second send lands. Any pane not equal to this one returns instantly.
+const SLOW_PANE = "%77";
 const work = mkdtempSync(join(tmpdir(), "doorbell-it-"));
 const DB_PATH = join(work, "broker.db");
 const CONFIG_PATH = join(work, "config.json");
@@ -62,8 +65,20 @@ beforeAll(async () => {
   if (process.platform === "win32") return;
   // Stub tmux: reports a version (so the broker sees tmux available and a %pane registers as
   // 'tmux'), records argv, exits 0 — enough for a tmux recipient to take the push path.
+  // A send-keys to SLOW_PANE sleeps, holding the delivery lease open long enough for a second
+  // send to land mid-push. Only the lease-race tests register that pane; every other pane still
+  // returns instantly, so the rest of the suite keeps its old timing.
   const stub = join(work, "tmux");
-  writeFileSync(stub, `#!/usr/bin/env bash\nif [ "$1" = "-V" ]; then echo "tmux 3.4"; exit 0; fi\nexit 0\n`);
+  writeFileSync(stub, `#!/usr/bin/env bash
+if [ "$1" = "-V" ]; then echo "tmux 3.4"; exit 0; fi
+_sk=0; _slow=0
+for _a in "$@"; do
+  [ "$_a" = "send-keys" ] && _sk=1
+  [ "$_a" = "${SLOW_PANE}" ] && _slow=1
+done
+[ "$_sk" = 1 ] && [ "$_slow" = 1 ] && sleep 1
+exit 0
+`);
   chmodSync(stub, 0o755);
   writeFileSync(CONFIG_PATH, JSON.stringify({
     machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT,
@@ -175,6 +190,47 @@ describe("doorbell covers every row that will never be pushed", () => {
     const sender = await regSender({ cwd: "/tmp/tmux-normal-s" });
     await ok("/send-message", { from_id: sender.id, to_id: rcpt.id, text: "later", urgency: "normal" }, sender.token);
     expect(existsSync(doorbellPath(DB_PATH, rcpt.id) as string)).toBe(false);
+  });
+});
+
+// The marker means "your mail is readable up to here", not "it exists up to here". A poll
+// releases only the contiguous queued prefix (releasableQueuedPrefix), stopping at an in-flight
+// head to preserve ordering, so a ring during an open lease announces mail the woken session
+// cannot yet read. It polls, gets nothing, re-arms at the new value, and — since a poll-only row
+// is never pushed and nothing writes the marker again — the row strands until unrelated mail
+// happens to ring. These two hold the withhold and the re-ring together: drop either half and a
+// poll-only row that lands mid-push is silently lost.
+//
+// Only a tmux recipient can reach this. A delivery_kind='none' peer never has a row in
+// 'delivering' at all (deliverNext bails at !isPushableTarget), so its poll always drains.
+describe("a ring is withheld until the mail it announces is readable", () => {
+  const raceSetup = async (tag: string) => {
+    const rcpt = await regRcpt({ cwd: `/tmp/${tag}`, tmux_pane: SLOW_PANE });
+    const sender = await regSender({ cwd: `/tmp/${tag}-s` });
+    // Not awaited: the stub stalls send-keys for ~1s, so this call is still in flight — and its
+    // lease still open — while the fyi below lands.
+    const push = ok("/send-message",
+      { from_id: sender.id, to_id: rcpt.id, text: "slow push", urgency: "interrupt" }, sender.token);
+    await new Promise((r) => setTimeout(r, 250)); // let deliverNext claim the lease
+    await ok("/send-message",
+      { from_id: sender.id, to_id: rcpt.id, text: "fyi mid-push", urgency: "fyi" }, sender.token);
+    return { rcpt, push };
+  };
+
+  it("does not ring while an older row is mid-push", async () => {
+    const { rcpt, push } = await raceSetup("race-hold");
+    // The fyi is poll-only, so nothing will ever push it — but the poll cannot release it yet
+    // either. Ringing now would spend the counter's only advance on unreadable mail.
+    expect(existsSync(doorbellPath(DB_PATH, rcpt.id) as string)).toBe(false);
+    await push;
+  });
+
+  it("rings once the lease settles, so the withheld row is not stranded", async () => {
+    const { rcpt, push } = await raceSetup("race-settle");
+    await push; // lease resolves; the queued prefix is releasable again
+    const peek = await ok("/peek", { id: rcpt.id }, rcpt.token);
+    expect(peek.count).toBe(1); // the pushed row is delivered; only the fyi is still pending
+    expect(readDoorbell(DB_PATH, rcpt.id)).toBe(peek.max_id);
   });
 });
 
