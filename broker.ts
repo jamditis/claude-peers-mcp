@@ -396,9 +396,6 @@ if (import.meta.main) {
   const peekPending = db.prepare(
     "SELECT COUNT(*) AS count, MAX(id) AS max_id FROM messages WHERE to_id = ? AND delivery_state IN ('queued','delivering')"
   );
-  // The recipient's delivery backend, to gate the doorbell to delivery_kind='none' sessions:
-  // a tmux peer already gets an active push, so it needs no marker.
-  const deliveryKindForPeer = db.prepare("SELECT delivery_kind AS kind FROM peers WHERE id = ?");
 
   // In-memory delivery guards (this process only). Declared up here, before
   // cleanStalePeers, so the sweep can skip a recipient that is mid-delivery;
@@ -429,16 +426,16 @@ if (import.meta.main) {
     removeDoorbell(DB_PATH, id);
   }
 
-  // Ring the doorbell for a delivery_kind='none' recipient: record that it has pending mail up
-  // to `seq` (the just-inserted row id, which is the new max pending id since ids only grow).
-  // A watcher armed via `cli.ts doorbell` wakes within seconds; a session with no watcher is
-  // unaffected (the write lands in an unwatched file) and still drains on its next
-  // check_messages. tmux recipients are skipped — they already get an active push. Best-effort
-  // and never throws into the send path: writeDoorbell swallows its own IO errors, and the
-  // kind lookup is a primary-key hit that cannot fail for a row we just inserted against.
-  function ringDoorbell(toId: string, seq: number): void {
-    const row = deliveryKindForPeer.get(toId) as { kind: string } | null;
-    if (row?.kind === "none") writeDoorbell(DB_PATH, toId, seq);
+  // Ring the doorbell for a recipient nothing will push this row to (isPollOnly): record that
+  // it has pending mail up to `seq` (the just-inserted row id, which is the new max pending id
+  // since ids only grow). A watcher armed via `cli.ts doorbell` wakes within seconds; a session
+  // with no watcher is unaffected (the write lands in an unwatched file) and still drains on its
+  // next check_messages. A recipient that WILL be pushed is skipped — the push is the wake, and
+  // a bell would only duplicate it. Best-effort and never throws into the send path:
+  // writeDoorbell swallows its own IO errors, and the lookup behind isPollOnly is a primary-key
+  // hit that cannot fail for a row we just inserted against.
+  function ringDoorbell(toId: string, seq: number, pushAfter: number | null): void {
+    if (isPollOnly(toId, pushAfter)) writeDoorbell(DB_PATH, toId, seq);
   }
 
   // Remove a peer now, or defer until its in-flight delivery's lease resolves. Deleting the
@@ -592,6 +589,20 @@ if (import.meta.main) {
     target: { kind: string; pane: string | null; socket: string | null } | null,
   ): target is { kind: string; pane: string; socket: string | null } {
     return target?.kind === "tmux" && !!target.pane && tmuxAvailable();
+  }
+
+  // "Will anything ever auto-push this row to this recipient?" — false on two independent
+  // counts, and each is blind to the other:
+  //   - the recipient is not push-eligible here at all (isPushableTarget above), whatever
+  //     push_after holds — deliverNext bails before it ever reads the column;
+  //   - the row sits outside the push channel (push_after NULL: an fyi, or a forward floored
+  //     by floor_remote_forwards), whatever the pane holds — nextDeliverable filters it out.
+  // Both the doorbell and the sender-facing poll_only report answer this one question, so it
+  // lives in one place. They disagreed before: the doorbell asked only about delivery_kind,
+  // which is the push-eligibility half, so a floored forward to a peer that HAS a pane got
+  // neither a push nor a bell and sat unseen until a manual check_messages (#39, #49).
+  function isPollOnly(toId: string, pushAfter: number | null): boolean {
+    return pushAfter === null || !isPushableTarget(peerDelivery(toId));
   }
 
   // True only if the recipient is still registered and its pid still probes alive. Used to
@@ -826,14 +837,14 @@ if (import.meta.main) {
     // found") instead of an ok that silently drops the message.
     const urgency = body.urgency ?? "interrupt"; // absent = pre-urgency client, keep its old push-on-send
     if (localTarget && peerStillLive(toId) && !pendingPeerDeletes.has(toId)) {
+      const pushAfter = pushAfterFor(urgency, Date.now(), config.push_delay_ms);
       const inserted = insertMessage.run(
-        body.from_id, toId, body.text, new Date().toISOString(),
-        urgency, pushAfterFor(urgency, Date.now(), config.push_delay_ms),
+        body.from_id, toId, body.text, new Date().toISOString(), urgency, pushAfter,
       );
       const ownRowId = Number(inserted.lastInsertRowid);
-      // Ring the doorbell before the push attempt: a none recipient gets no inject, so this is
-      // its near-real-time wake (issue #49); a tmux recipient is skipped inside ringDoorbell.
-      ringDoorbell(toId, ownRowId);
+      // Ring the doorbell before the push attempt: a poll-only recipient gets no inject, so this
+      // is its near-real-time wake (issue #49). ringDoorbell skips anything that will be pushed.
+      ringDoorbell(toId, ownRowId, pushAfter);
       if ((await deliverNext(toId)) === "accepted") await drainAfterDelivery(toId);
       // Report THIS message's own disposition, not the queue head's (the local edition of
       // issue #14): deliverNext works head-first, so the row just inserted may have ridden
@@ -893,10 +904,11 @@ if (import.meta.main) {
       : pushAfterFor(urgency, Date.now(), config.push_delay_ms);
     const inserted = insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString(), urgency, pushAfter);
     const forwardedRowId = Number(inserted.lastInsertRowid);
-    // Ring the doorbell for a none recipient regardless of floor_remote_forwards: a floored
-    // forward is poll-only (push_after NULL, never auto-injected), which is exactly the case the
-    // doorbell accelerates — the recipient still needs to know to check (issue #49, related #39).
-    ringDoorbell(body.to_id, forwardedRowId);
+    // Ring regardless of floor_remote_forwards: a floored forward is poll-only (push_after NULL,
+    // never auto-injected), which is exactly the case the doorbell accelerates — the recipient
+    // still needs to know to check (issue #49, related #39). The floor suppresses the paste, not
+    // the sender's intent, so the bell carries the signal the push would have.
+    ringDoorbell(body.to_id, forwardedRowId, pushAfter);
     // floor_remote_forwards leaves a forwarded message queued for pull-only retrieval;
     // by default a forward auto-injects into the recipient's backend like a local send.
     // Report the honest per-message disposition so the originating broker can tell the
@@ -910,18 +922,11 @@ if (import.meta.main) {
       if ((await deliverNext(body.to_id)) === "accepted") await drainAfterDelivery(body.to_id);
       delivery = isMessageDelivered(db, forwardedRowId) ? "accepted" : "queued";
     }
-    // Report whether this host will ever auto-push the row, so the originating broker can
-    // give its sender an accurate queued-vs-poll-only signal (#39). It is poll-only when
-    // the stored push_after is NULL, i.e. the row never enters the push channel: floored,
-    // or an fyi whose pushAfterFor is NULL (hasDuePush/nextDeliverable both filter
-    // push_after IS NOT NULL, so a NULL row is only ever read via check_messages). It is
-    // also poll-only when the recipient is not push-eligible here at all (a
-    // delivery_kind='none' session, a paneless row, or no tmux backend), which deliverNext
-    // would leave "queued" regardless of push_after. Derived from the same push_after the
-    // row carries and the same predicate deliverNext gates on, so the signal cannot drift
-    // from the actual push behavior.
-    const pollOnly = pushAfter === null || !isPushableTarget(peerDelivery(body.to_id));
-    return { ok: true, delivery, poll_only: pollOnly };
+    // Report whether this host will ever auto-push the row, so the originating broker can give
+    // its sender an accurate queued-vs-poll-only signal (#39). Same predicate the doorbell rang
+    // on above and deliverNext gates delivery on, so the sender's answer, the recipient's bell,
+    // and the actual push behavior cannot drift apart.
+    return { ok: true, delivery, poll_only: isPollOnly(body.to_id, pushAfter) };
   }
 
   function handleGossip(body: GossipRequest): { ok: boolean } {

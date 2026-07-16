@@ -10,6 +10,7 @@ import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { doorbellPath, readDoorbell, writeDoorbell } from "../shared/notify.ts";
+import { PROTOCOL_VERSION } from "../shared/types.ts";
 
 // #22: this suite spins up a real broker with a shell-based `tmux` stub (shebang +
 // `chmodSync` executable bit), which native Windows cannot exec. Gate it behind a
@@ -112,6 +113,67 @@ describe("doorbell marker", () => {
     const sender = await regSender({ cwd: "/tmp/tmux-1-s" });
     const send = await ok("/send-message", { from_id: sender.id, to_id: rcpt.id, text: "push" }, sender.token);
     expect(send.delivery).toBe("accepted");
+    expect(existsSync(doorbellPath(DB_PATH, rcpt.id) as string)).toBe(false);
+  });
+});
+
+// The doorbell's question is "will anything ever push this row to this recipient?", and there
+// are two independent reasons the answer is no. Neither test sees the other's case:
+//   - not push-eligible: deliverNext bails at !isPushableTarget, whatever push_after holds
+//     (no pane, or no tmux backend on this host).
+//   - outside the push channel: nextDeliverable filters `push_after IS NOT NULL`, whatever
+//     the pane holds (an fyi, or a forward floored by floor_remote_forwards).
+// handleForwardMessage already computes exactly that union to report `poll_only` to the
+// sending broker; ringDoorbell asked a narrower question and disagreed with it about the
+// same row. These lock the two conditions apart so neither can be dropped for the other.
+describe("doorbell covers every row that will never be pushed", () => {
+  it("rings for a floored remote forward to a tmux recipient", async () => {
+    // Written from a live failure, 2026-07-16: a normal-urgency forward from a peer on another
+    // machine landed with push_after NULL and sat unseen, its doorbell dir empty. The recipient
+    // HAD a pane, so the old delivery_kind check skipped the bell; floor_remote_forwards set
+    // push_after NULL, so nextDeliverable skipped the push. Mail with neither.
+    const rcpt = await regRcpt({ cwd: "/tmp/fwd-tmux", tmux_pane: "%20" });
+    const res = await ok("/forward-message", {
+      protocol_version: PROTOCOL_VERSION, from_id: "remote-peer-x", to_id: rcpt.id,
+      text: "from another machine", from_machine: "db-b", urgency: "normal",
+    });
+    expect(res.ok).toBe(true);
+    expect(res.poll_only).toBe(true); // the broker's own verdict: nothing here will push
+
+    const peek = await ok("/peek", { id: rcpt.id }, rcpt.token);
+    expect(peek.count).toBe(1);
+    expect(readDoorbell(DB_PATH, rcpt.id)).toBe(peek.max_id);
+  });
+
+  it("rings for an fyi to a tmux recipient (poll-only, so the bell is its only signal)", async () => {
+    // pushAfterFor('fyi') is NULL, so the row sits outside the push channel exactly like a
+    // floored forward. A session that armed a watcher opted into hearing about poll-only mail.
+    const rcpt = await regRcpt({ cwd: "/tmp/fyi-tmux", tmux_pane: "%21" });
+    const sender = await regSender({ cwd: "/tmp/fyi-tmux-s" });
+    await ok("/send-message", { from_id: sender.id, to_id: rcpt.id, text: "no rush", urgency: "fyi" }, sender.token);
+    const peek = await ok("/peek", { id: rcpt.id }, rcpt.token);
+    expect(readDoorbell(DB_PATH, rcpt.id)).toBe(peek.max_id);
+  });
+
+  it("still rings for a none recipient whose row IS push-due", async () => {
+    // The regression guard. pushAfterFor('interrupt') returns now, NOT null, so a fix written
+    // as `push_after === null` alone would silently stop ringing for the very sessions the
+    // doorbell was built for (#49) — they have no pane, so push_after is meaningless to them.
+    const rcpt = await regRcpt({ cwd: "/tmp/none-interrupt" });
+    const sender = await regSender({ cwd: "/tmp/none-interrupt-s" });
+    await ok("/send-message", { from_id: sender.id, to_id: rcpt.id, text: "urgent", urgency: "interrupt" }, sender.token);
+    const peek = await ok("/peek", { id: rcpt.id }, rcpt.token);
+    expect(peek.max_id).toBeGreaterThan(0);
+    expect(readDoorbell(DB_PATH, rcpt.id)).toBe(peek.max_id);
+  });
+
+  it("does not ring for a tmux recipient whose row is only delayed", async () => {
+    // The other half of the guard: `normal` sets push_after = now + push_delay_ms. Non-NULL
+    // and the peer is push-eligible, so the row IS in the channel and the flush will carry it.
+    // Ringing here would wake a session that is already going to be interrupted.
+    const rcpt = await regRcpt({ cwd: "/tmp/tmux-normal", tmux_pane: "%22" });
+    const sender = await regSender({ cwd: "/tmp/tmux-normal-s" });
+    await ok("/send-message", { from_id: sender.id, to_id: rcpt.id, text: "later", urgency: "normal" }, sender.token);
     expect(existsSync(doorbellPath(DB_PATH, rcpt.id) as string)).toBe(false);
   });
 });
