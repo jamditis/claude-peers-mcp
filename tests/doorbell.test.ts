@@ -587,6 +587,64 @@ describe("startup reconcile over a persisted poll-only backlog", () => {
     }
   }, 30_000);
 
+  // The test above makes the pushable row due before the restart, which is why silence is right
+  // there: a burst is one heartbeat away. Leave it ahead instead and the same skip is wrong --
+  // nothing claims a row that is not due, so nothing settles and nothing rings, and the poll-only
+  // row behind it waits out a push_delay_ms it has no part in. "A push exists" and "a push is
+  // due" are the same question only until a delay separates them, and nextDeliverable has always
+  // asked the second.
+  it("rings for a poll-only row when the push behind it is not due yet", async () => {
+    const PORT_LATE = 17946;
+    const DB_PATH_LATE = join(work, "late-boot.db");
+    const CONFIG_PATH_LATE = join(work, "late-boot-config.json");
+    writeFileSync(CONFIG_PATH_LATE, JSON.stringify({
+      machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_LATE,
+      id_prefix: "dbl", siblings: [], allowed_ips: ["127.0.0.1"], db_path: DB_PATH_LATE,
+      push_delay_ms: 600_000,
+    }));
+    const spawnBroker = () => Bun.spawn(["bun", "broker.ts"], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH_LATE, PATH: `${work}:${process.env.PATH}` },
+      stdout: "ignore", stderr: "ignore",
+    });
+
+    let boot = spawnBroker();
+    try {
+      expect(await waitForHealth(PORT_LATE)).toBe(true);
+      const rcpt = await regRcpt({ cwd: "/tmp/boot-late", tmux_pane: SLOW_PANE }, PORT_LATE);
+      const sender = await regSender({ cwd: "/tmp/boot-late-s" }, PORT_LATE);
+      await okAt(PORT_LATE, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "not due for ten minutes", urgency: "normal" }, sender.token);
+      await okAt(PORT_LATE, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "poll only", urgency: "fyi" }, sender.token);
+      const peek = await okAt(PORT_LATE, "/peek", { id: rcpt.id }, rcpt.token);
+      expect(peek.count).toBe(2);
+
+      boot.kill();
+      await boot.exited;
+      // The lost marker the reconcile exists to repair. Unlike the test above, push_after is left
+      // where it was: ten minutes out, and the restart cannot claim it.
+      rmSync(doorbellPath(DB_PATH_LATE, rcpt.id) as string, { force: true });
+
+      boot = spawnBroker();
+      expect(await waitForHealth(PORT_LATE)).toBe(true);
+
+      // Prove the push really is still withheld, so this is testing the skip and not a broker
+      // that quietly delivered everything.
+      const probe = new Database(DB_PATH_LATE, { readonly: true });
+      const states = probe.query(
+        "SELECT delivery_state FROM messages WHERE to_id = ? ORDER BY id",
+      ).all(rcpt.id) as { delivery_state: string }[];
+      probe.close();
+      expect(states.map((s) => s.delivery_state)).toEqual(["queued", "queued"]);
+
+      expect(readDoorbell(DB_PATH_LATE, rcpt.id)).toBe(peek.max_id);
+    } finally {
+      boot.kill();
+      await boot.exited;
+    }
+  }, 30_000);
+
   // The reconcile is the only doorbell write that runs without an HTTP request behind it, so it
   // is the only one that can happen in a broker that never serves. ensureBroker() checks /health
   // and then spawns, which is a check-then-act: two sessions racing that gap both spawn, and the

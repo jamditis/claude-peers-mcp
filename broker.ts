@@ -414,8 +414,14 @@ if (import.meta.main) {
   // and push_after is set from urgency alone at insert, never from the target -- so a peer
   // this host cannot push to holds normal and interrupt rows with a push_after on them, and
   // "push_after IS NULL" cannot see the one backlog nothing will ever push.
-  const countPushableQueued = db.prepare(
-    "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivery_state = 'queued' AND push_after IS NOT NULL"
+  //
+  // Due, not merely present: nextDeliverable takes the same `now`, so a row whose push_after
+  // is still ahead starts no burst, settles nothing, and rings nothing. Counting it as a push
+  // that is coming let a poll-only row sitting behind one wait out the whole push_delay_ms --
+  // silent for the length of a delay it has nothing to do with, on the one path whose job is
+  // to repair a marker that was lost.
+  const countDuePushable = db.prepare(
+    "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivery_state = 'queued' AND push_after IS NOT NULL AND push_after <= ?"
   );
   const selectQueuedRecipients = db.prepare(
     "SELECT DISTINCT to_id FROM messages WHERE delivery_state = 'queued'"
@@ -1348,9 +1354,10 @@ if (import.meta.main) {
   // is the one ring path that does not go through it. ringDoorbellAfterSettle's own guard
   // cannot stand in for this test: resetDeliveringOnStart has just requeued every lease, so the
   // guard sees zero delivering rows and is blind to the push that is one heartbeat away.
+  const startupNow = Date.now();
   for (const r of selectQueuedRecipients.all() as { to_id: string }[]) {
     if (isPushableTarget(peerDelivery(r.to_id))
-      && (countPushableQueued.get(r.to_id) as { n: number }).n > 0) continue;
+      && (countDuePushable.get(r.to_id, startupNow) as { n: number }).n > 0) continue;
     ringDoorbellAfterSettle(r.to_id);
   }
 }
