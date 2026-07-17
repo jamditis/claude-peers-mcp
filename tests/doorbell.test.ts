@@ -380,12 +380,18 @@ describe("a ring waits for the recipient's whole delivery burst, not just one le
     expect(readDoorbell(DB_PATH_DRAIN, rcpt.id)).toBe(peek.max_id);
   }, 30_000);
 
-  // Every case above rings at the recipient's max pending id, which is right while that id only
-  // climbs. It does not climb here. A settle fires whenever a burst ends, and a burst that
-  // delivers a LATER pushable row while an EARLIER poll-only row waits leaves a smaller max
-  // pending id behind than the settle before it rang. Ringing that id walks the marker backwards,
-  // under a watcher that already armed at the higher one and now cannot fire.
-  it("holds the marker when a burst delivers a later row than the waiting poll-only one", async () => {
+  // Every case above rings at the recipient's max pending id, and that id does not only climb: a
+  // burst that delivers a LATER pushable row while an EARLIER poll-only row waits leaves a
+  // smaller max pending id behind than there was before it. Ringing the higher id and then the
+  // lower one walks the marker backwards, under a watcher already armed at the higher one, which
+  // can then never fire. writeDoorbell's clamp refuses the decrease, but a broker that needs the
+  // clamp to stay correct is one input away from a marker that means nothing.
+  //
+  // It never gets there. A pushable row is exactly what the bell withholds for, so the higher id
+  // is never announced in the first place, and the only value this recipient's marker can take is
+  // its max queued POLL-ONLY id, which does only climb, since nothing but a poll retires those
+  // rows and every new row outranks them. The backwards step is unreachable rather than caught.
+  it("never announces a pushable row, so the marker cannot fall back when it is delivered", async () => {
     const rcpt = await regRcpt({ cwd: "/tmp/burst-mixed", tmux_pane: "%12" }, PORT_DRAIN);
     const sender = await regSender({ cwd: "/tmp/burst-mixed-s" }, PORT_DRAIN);
     // Nothing ever pushes an fyi, so it rings and then waits for a check_messages.
@@ -395,13 +401,14 @@ describe("a ring waits for the recipient's whole delivery burst, not just one le
     expect(readDoorbell(DB_PATH_DRAIN, rcpt.id)).toBe(fyiId);
 
     // A later `normal` row is pushable but not yet due, so this send delivers nothing and its
-    // settle rings the higher id. This is the value a woken watcher arms at.
+    // settle is free to ring. It must not: the row it would announce is one the heartbeat claims
+    // the moment it comes due, and the marker is the only wake the fyi behind it has.
     await okAt(PORT_DRAIN, "/send-message",
       { from_id: sender.id, to_id: rcpt.id, text: "delayed", urgency: "normal" }, sender.token);
     const normalId = (await okAt(PORT_DRAIN, "/peek", { id: rcpt.id }, rcpt.token)).max_id;
     expect(normalId).toBeGreaterThan(fyiId);
     const armed = readDoorbell(DB_PATH_DRAIN, rcpt.id);
-    expect(armed).toBe(normalId);
+    expect(armed).toBe(fyiId); // withheld at the poll-only id, not advanced to the pushable one
 
     // The row comes due and a heartbeat drains it, so the fyi is all that is left pending.
     await new Promise((r) => setTimeout(r, PUSH_DELAY_MS + 200));
@@ -410,9 +417,65 @@ describe("a ring waits for the recipient's whole delivery burst, not just one le
     const peek = await okAt(PORT_DRAIN, "/peek", { id: rcpt.id }, rcpt.token);
     expect(peek.count).toBe(1);      // the pushed row is delivered
     expect(peek.max_id).toBe(fyiId); // and max pending id really has fallen back to the fyi
-    // The marker must not follow it down. A watcher armed at `armed` would never fire again, and
-    // the fyi would strand until unrelated mail climbed back past it.
+    // Which is the id the marker already held, so this settle rewrites the same value and the
+    // clamp refuses the repeat. Nothing to fall back from, and the fyi is still announced.
     expect(readDoorbell(DB_PATH_DRAIN, rcpt.id)).toBe(armed);
+  }, 20_000);
+});
+
+// Counting the drivers answers "is a lease open, or coming from this burst?" -- and a queued row
+// whose push_after is still in the future makes the second half false without opening anything.
+// No driver holds it, so the burst ends and the bell rings; the next heartbeat claims it the
+// moment it comes due. The marker's promise is about what a poll WILL find, not what one would
+// have found at the instant it was written, so a row this host has not yet claimed but certainly
+// will counts as a lease already. That is the shape the startup reconcile withholds for, and it
+// reaches the live path by the same road.
+describe("a ring waits for a push that is coming later, not just one already in flight", () => {
+  const PORT_HOLD = 17947;
+  const DB_PATH_HOLD = join(work, "hold.db");
+  const CONFIG_PATH_HOLD = join(work, "hold-config.json");
+
+  it("stays silent while a push that will block the poll is still queued", async () => {
+    writeFileSync(CONFIG_PATH_HOLD, JSON.stringify({
+      machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_HOLD,
+      id_prefix: "dbh", siblings: [], allowed_ips: ["127.0.0.1"], db_path: DB_PATH_HOLD,
+      push_delay_ms: 600_000,
+    }));
+    const held = Bun.spawn(["bun", "broker.ts"], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH_HOLD, PATH: `${work}:${process.env.PATH}` },
+      stdout: "ignore", stderr: "ignore",
+    });
+    try {
+      expect(await waitForHealth(PORT_HOLD)).toBe(true);
+      const rcpt = await regRcpt({ cwd: "/tmp/hold", tmux_pane: SLOW_PANE }, PORT_HOLD);
+      const sender = await regSender({ cwd: "/tmp/hold-s" }, PORT_HOLD);
+      await okAt(PORT_HOLD, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "not due for ten minutes", urgency: "normal" }, sender.token);
+      await okAt(PORT_HOLD, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "poll only", urgency: "fyi" }, sender.token);
+      const peek = await okAt(PORT_HOLD, "/peek", { id: rcpt.id }, rcpt.token);
+      expect(peek.count).toBe(2);
+
+      // Both rows are queued, so a poll at this instant would release them and the marker would
+      // read true. The next instant is what breaks it: the push comes due, a heartbeat claims it,
+      // and the poll this very bell triggered stops at the now-delivering head and returns
+      // nothing. The woken session re-arms at this same marker, the settle rewrites the same max
+      // id, writeDoorbell clamps the repeat, and the fyi row strands until unrelated mail rings.
+      expect(existsSync(doorbellPath(DB_PATH_HOLD, rcpt.id) as string)).toBe(false);
+
+      // Silence is only correct because the bell arrives by the other road, bounded by the push
+      // delay rather than by whenever someone happens to write next.
+      const rw = new Database(DB_PATH_HOLD);
+      rw.run("UPDATE messages SET push_after = ? WHERE to_id = ? AND push_after IS NOT NULL",
+        [Date.now() - 1000, rcpt.id]);
+      rw.close();
+      await okAt(PORT_HOLD, "/heartbeat", { id: rcpt.id }, rcpt.token);
+      expect(readDoorbell(DB_PATH_HOLD, rcpt.id)).toBe(peek.max_id);
+    } finally {
+      held.kill();
+      await held.exited;
+    }
   }, 20_000);
 });
 

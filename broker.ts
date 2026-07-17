@@ -404,16 +404,10 @@ if (import.meta.main) {
   const countDeliveringForPeer = db.prepare(
     "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivery_state = 'delivering'"
   );
-  // The rows nextDeliverable will never take: push_after IS NULL is the poll-only channel.
-  const countPollOnlyQueued = db.prepare(
-    "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivery_state = 'queued' AND push_after IS NULL"
-  );
-  // Every recipient holding queued mail, for the startup reconcile below, which decides one
-  // by one which of them still needs a bell. Selecting the poll-only rows here instead asked
-  // half the question: isPollOnly is (push_after === null) OR (the target is not pushable),
-  // and push_after is set from urgency alone at insert, never from the target -- so a peer
-  // this host cannot push to holds normal and interrupt rows with a push_after on them, and
-  // "push_after IS NULL" cannot see the one backlog nothing will ever push.
+  // The rows nextDeliverable would take, so the rows a poll-only one can be claimed ahead of.
+  // Callers pair this with isPushableTarget rather than reading it alone: push_after is set from
+  // urgency alone at insert, never from the target, so a peer this host cannot push to also
+  // holds normal and interrupt rows carrying a push_after that nothing will ever act on.
   //
   // Present, not due. Narrowing this to "push_after <= now" reads better -- a row that is not
   // due starts no burst, so a poll-only row behind it waits out the push_delay_ms (120s) for a
@@ -429,6 +423,11 @@ if (import.meta.main) {
   const countPushableQueued = db.prepare(
     "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivery_state = 'queued' AND push_after IS NOT NULL"
   );
+  // Every recipient holding queued mail, for the startup reconcile below, which offers each one
+  // to the bell's own rule. Selecting the poll-only rows here instead asked half the question:
+  // isPollOnly is (push_after === null) OR (the target is not pushable), and push_after is set
+  // from urgency alone at insert, never from the target -- so "push_after IS NULL" cannot see
+  // the one backlog nothing will ever push.
   const selectQueuedRecipients = db.prepare(
     "SELECT DISTINCT to_id FROM messages WHERE delivery_state = 'queued'"
   );
@@ -501,12 +500,22 @@ if (import.meta.main) {
     if ((countDeliveringForPeer.get(toId) as { n: number }).n > 0) return;
     const pending = peekPending.get(toId) as { count: number; max_id: number | null };
     if (pending.max_id === null) return;
-    // Only if a poll-only row is actually waiting. For a recipient this host cannot push to,
-    // every pending row is poll-only; for a tmux recipient only the push_after IS NULL rows
-    // are, and a backlog of merely-delayed rows is the next deliverNext's job, not the bell's.
-    const waiting = !isPushableTarget(peerDelivery(toId))
-      || (countPollOnlyQueued.get(toId) as { n: number }).n > 0;
-    if (!waiting) return;
+    // A queued push is a lease this host has not opened yet but certainly will: the heartbeat
+    // claims it the moment it comes due, and the poll THIS bell triggers then stops at that
+    // now-in-flight head and returns nothing. So withhold, and let that push's own settle ring
+    // once its row is gone and the marker can mean what it says. The wait is bounded by the push
+    // delay; a marker spent on mail the poll cannot reach strands the row behind it until
+    // unrelated mail happens to ring, because the session re-arms at the value the settle then
+    // rewrites and writeDoorbell clamps the repeat.
+    //
+    // Past this test, every pending row is one a poll releases now and nothing will intervene:
+    // no lease is open, and none is coming. That is the marker's whole promise, so asking
+    // separately whether a poll-only row is waiting would be redundant -- with nothing delivering
+    // and no push queued, pending mail IS poll-only mail. A recipient this host cannot push to
+    // reaches the write for the same reason: deliverNext bails at !isPushableTarget, so no row
+    // of its can ever take a lease.
+    if (isPushableTarget(peerDelivery(toId))
+      && (countPushableQueued.get(toId) as { n: number }).n > 0) return;
     writeDoorbell(DB_PATH, toId, pending.max_id);
   }
 
@@ -1350,19 +1359,12 @@ if (import.meta.main) {
   // ("10" over "9" leaves "90"; O_TRUNC lands at open, not at write). Bun.serve throws on a taken
   // port and nothing catches it, so past this line the loser is gone and the clamp has the single
   // writer it needs. Anything ringing before this line reopens that race.
-  // Ring exactly where no future settle will. A recipient with a row still to be pushed gets
-  // its bell from that push's own withDeliveryBurst, which fires as the last driver leaves and
-  // so cannot land on mail the poll's prefix has not reached yet. Ringing here as well would
-  // spend the counter's one advance before the heartbeat claims that older row: the woken
-  // session polls, stops at the in-flight head, gets nothing, and re-arms at the same value the
-  // settle then rewrites -- no advance, no second wake, and the poll-only row behind it strands
-  // until unrelated mail rings. That is the strand the burst scope exists to prevent, and this
-  // is the one ring path that does not go through it. ringDoorbellAfterSettle's own guard
-  // cannot stand in for this test: resetDeliveringOnStart has just requeued every lease, so the
-  // guard sees zero delivering rows and is blind to the push that is one heartbeat away.
+  // Ring exactly where no future settle will, which is ringDoorbellAfterSettle's own rule and
+  // needs no help here: it withholds from any recipient with a push still queued, so a
+  // recipient whose backlog resetDeliveringOnStart just requeued is skipped and gets its bell
+  // from that push's own withDeliveryBurst instead. This loop only has to say which recipients
+  // to offer, because the reconcile is the one ring path with no burst to fire on its behalf.
   for (const r of selectQueuedRecipients.all() as { to_id: string }[]) {
-    if (isPushableTarget(peerDelivery(r.to_id))
-      && (countPushableQueued.get(r.to_id) as { n: number }).n > 0) continue;
     ringDoorbellAfterSettle(r.to_id);
   }
 }
