@@ -379,6 +379,41 @@ describe("a ring waits for the recipient's whole delivery burst, not just one le
     expect(peek.count).toBe(1); // all three pushable rows delivered; only the fyi is pending
     expect(readDoorbell(DB_PATH_DRAIN, rcpt.id)).toBe(peek.max_id);
   }, 30_000);
+
+  // Every case above rings at the recipient's max pending id, which is right while that id only
+  // climbs. It does not climb here. A settle fires whenever a burst ends, and a burst that
+  // delivers a LATER pushable row while an EARLIER poll-only row waits leaves a smaller max
+  // pending id behind than the settle before it rang. Ringing that id walks the marker backwards,
+  // under a watcher that already armed at the higher one and now cannot fire.
+  it("holds the marker when a burst delivers a later row than the waiting poll-only one", async () => {
+    const rcpt = await regRcpt({ cwd: "/tmp/burst-mixed", tmux_pane: "%12" }, PORT_DRAIN);
+    const sender = await regSender({ cwd: "/tmp/burst-mixed-s" }, PORT_DRAIN);
+    // Nothing ever pushes an fyi, so it rings and then waits for a check_messages.
+    await okAt(PORT_DRAIN, "/send-message",
+      { from_id: sender.id, to_id: rcpt.id, text: "fyi", urgency: "fyi" }, sender.token);
+    const fyiId = (await okAt(PORT_DRAIN, "/peek", { id: rcpt.id }, rcpt.token)).max_id;
+    expect(readDoorbell(DB_PATH_DRAIN, rcpt.id)).toBe(fyiId);
+
+    // A later `normal` row is pushable but not yet due, so this send delivers nothing and its
+    // settle rings the higher id. This is the value a woken watcher arms at.
+    await okAt(PORT_DRAIN, "/send-message",
+      { from_id: sender.id, to_id: rcpt.id, text: "delayed", urgency: "normal" }, sender.token);
+    const normalId = (await okAt(PORT_DRAIN, "/peek", { id: rcpt.id }, rcpt.token)).max_id;
+    expect(normalId).toBeGreaterThan(fyiId);
+    const armed = readDoorbell(DB_PATH_DRAIN, rcpt.id);
+    expect(armed).toBe(normalId);
+
+    // The row comes due and a heartbeat drains it, so the fyi is all that is left pending.
+    await new Promise((r) => setTimeout(r, PUSH_DELAY_MS + 200));
+    await okAt(PORT_DRAIN, "/heartbeat", { id: rcpt.id }, rcpt.token);
+
+    const peek = await okAt(PORT_DRAIN, "/peek", { id: rcpt.id }, rcpt.token);
+    expect(peek.count).toBe(1);      // the pushed row is delivered
+    expect(peek.max_id).toBe(fyiId); // and max pending id really has fallen back to the fyi
+    // The marker must not follow it down. A watcher armed at `armed` would never fire again, and
+    // the fyi would strand until unrelated mail climbed back past it.
+    expect(readDoorbell(DB_PATH_DRAIN, rcpt.id)).toBe(armed);
+  }, 20_000);
 });
 
 // The reconcile runs at startup, so everything it reaches must already be initialized. It calls

@@ -59,6 +59,20 @@ describe("doorbell read/write/remove", () => {
     expect(readDoorbell(dbPath, "p-1")).toBe(9);
   });
 
+  // The watcher arms at the value it last read and fires only above it, so a marker that can fall
+  // silences every watcher already armed higher. Max pending id does fall (a later pushable row
+  // delivered while an earlier poll-only row waits), so the clamp lives here rather than at each
+  // ring site, where the next caller would have to remember it.
+  it("never lowers the counter, whatever a caller passes", () => {
+    expect(writeDoorbell(dbPath, "p-1", 9)).toBe(true);
+    expect(writeDoorbell(dbPath, "p-1", 4)).toBe(false); // a lower max pending id is not an advance
+    expect(readDoorbell(dbPath, "p-1")).toBe(9);
+    expect(writeDoorbell(dbPath, "p-1", 9)).toBe(false); // nor is the same one again
+    expect(readDoorbell(dbPath, "p-1")).toBe(9);
+    expect(writeDoorbell(dbPath, "p-1", 10)).toBe(true);
+    expect(readDoorbell(dbPath, "p-1")).toBe(10);
+  });
+
   it("returns the missing sentinel when no marker exists", () => {
     expect(readDoorbell(dbPath, "never")).toBe(-1);
     expect(readDoorbell(dbPath, "never", 0)).toBe(0);
