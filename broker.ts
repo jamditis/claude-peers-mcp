@@ -500,9 +500,10 @@ if (import.meta.main) {
     if ((countDeliveringForPeer.get(toId) as { n: number }).n > 0) return;
     const pending = peekPending.get(toId) as { count: number; max_id: number | null };
     if (pending.max_id === null) return;
-    // A queued push is a lease this host has not opened yet but will open the moment the row comes
-    // due: the heartbeat claims it, and the poll THIS bell triggers then stops at that
-    // now-in-flight head and returns nothing. So withhold, and let that push's own settle ring
+    // A queued push is a lease this host has not opened yet but will: push_after lapsing fires
+    // nothing by itself, so the next heartbeat or send to reach deliverNext is what claims the
+    // row, and the poll THIS bell triggers then stops at that now-in-flight head and returns
+    // nothing. So withhold, and let that push's own settle ring
     // once its row is gone and the marker can mean what it says. A marker spent on mail the poll
     // cannot reach strands the row behind it until unrelated mail happens to ring, because the
     // session re-arms at the value the settle then rewrites and writeDoorbell clamps the repeat.

@@ -436,8 +436,9 @@ describe("a ring waits for the recipient's whole delivery burst, not just one le
 // written, and the next heartbeat claims that row the moment it comes due -- so a row this host
 // has not claimed yet, but will, already counts as a lease. That is the shape the startup
 // reconcile withholds for, and it reaches the live path by the same road. The last test here pins
-// where "but will" stops being true: a push that fails to land is requeued still pushable and is
-// never claimed at all (issue #70).
+// where that reasoning runs out: a push that fails to land IS claimed, every attempt, and released
+// again each time. It is forever about to be claimed and never leaves the queue, so the guard it
+// holds shut never opens (issue #70).
 describe("a ring waits for a push that is coming later, not just one already in flight", () => {
   const PORT_HOLD = 17947;
   const DB_PATH_HOLD = join(work, "hold.db");
