@@ -461,6 +461,60 @@ describe("startup reconcile over a persisted poll-only backlog", () => {
       await boot.exited; // same fixed-port handover as afterAll: drain before the next run binds
     }
   }, 30_000);
+
+  // The reconcile is the only doorbell write that runs without an HTTP request behind it, so it
+  // is the only one that can happen in a broker that never serves. ensureBroker() checks /health
+  // and then spawns, which is a check-then-act: two sessions racing that gap both spawn, and the
+  // loser of the port bind is still a live process with the db open until Bun.serve throws.
+  // writeDoorbell's clamp is a read-then-write, safe only for a single writer -- and two of these
+  // interleaving leave a torn count ("10" over "9" truncates at open, not at write, so the file
+  // reads "90"). Ringing only after the bind is what makes the winner the sole writer, so a
+  // second process cannot exist to interleave with. Verified against Bun: a taken port throws out
+  // of Bun.serve, and nothing catches it here.
+  it("writes no marker when it loses the port bind", async () => {
+    const PORT_LOSER = 17943;
+    const DB_PATH_LOSER = join(work, "loser.db");
+    const CONFIG_PATH_LOSER = join(work, "loser-config.json");
+    writeFileSync(CONFIG_PATH_LOSER, JSON.stringify({
+      machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_LOSER,
+      id_prefix: "dbl", siblings: [], allowed_ips: ["127.0.0.1"], db_path: DB_PATH_LOSER,
+    }));
+    const spawnBroker = () => Bun.spawn(["bun", "broker.ts"], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH_LOSER, PATH: `${work}:${process.env.PATH}` },
+      stdout: "ignore", stderr: "ignore",
+    });
+
+    // Leave a persisted poll-only backlog, which is the one shape the reconcile rings for.
+    const first = spawnBroker();
+    let marker: string;
+    try {
+      expect(await waitForHealth(PORT_LOSER)).toBe(true);
+      const rcpt = await regRcpt({ cwd: "/tmp/loser-tmux", tmux_pane: "%31" }, PORT_LOSER);
+      const sender = await regSender({ cwd: "/tmp/loser-tmux-s" }, PORT_LOSER);
+      await okAt(PORT_LOSER, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "fyi", urgency: "fyi" }, sender.token);
+      expect((await okAt(PORT_LOSER, "/peek", { id: rcpt.id }, rcpt.token)).count).toBe(1);
+      marker = doorbellPath(DB_PATH_LOSER, rcpt.id) as string;
+    } finally {
+      first.kill();
+      await first.exited;
+    }
+    // Drop the marker the live broker wrote. Anything here afterwards was written by the loser.
+    rmSync(marker, { force: true });
+    expect(existsSync(marker)).toBe(false);
+
+    // Hold the port with something that is not a broker, so the losing broker is provably the
+    // only process that could write the marker -- a real broker here could ring on its own.
+    const squatter = Bun.serve({ port: PORT_LOSER, hostname: "0.0.0.0", fetch: () => new Response("squat") });
+    try {
+      const loser = spawnBroker();
+      await loser.exited; // the bind throws, uncaught, so this must terminate on its own
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      squatter.stop(true);
+    }
+  }, 30_000);
 });
 
 describe("/peek (non-consuming read)", () => {

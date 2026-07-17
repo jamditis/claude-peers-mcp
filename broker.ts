@@ -528,17 +528,6 @@ if (import.meta.main) {
     }
   }
 
-  // Startup reconcile. resetDeliveringOnStart requeued whatever a dead broker left mid-lease,
-  // so those recipients' queued prefixes are releasable again — but any ring that broker
-  // withheld while the lease was open died with it: the re-ring is owed by a burst that ended
-  // with the process. Nothing else would ever write those markers, because a poll-only row is
-  // never pushed and so no future settle is guaranteed. Ring for every recipient still holding
-  // poll-only mail, so a crash inside the lease window costs a wake rather than a message.
-  // Idempotent: a row that already rang re-rings the same max-pending id, which is no advance
-  // and so no spurious wake.
-  for (const r of selectPollOnlyRecipients.all() as { to_id: string }[]) {
-    ringDoorbellAfterSettle(r.to_id);
-  }
 
   // Remove a peer now, or defer until its in-flight delivery's lease resolves. Deleting the
   // peer row mid-delivery strands the attempt: peerStillLive() would fail against the missing
@@ -1324,4 +1313,26 @@ if (import.meta.main) {
   });
 
   console.error(`[claude-peers broker] listening on 0.0.0.0:${PORT} (machine: ${config.machine}, db: ${DB_PATH})`);
+
+  // Startup reconcile. resetDeliveringOnStart requeued whatever a dead broker left mid-lease,
+  // so those recipients' queued prefixes are releasable again — but any ring that broker
+  // withheld while the lease was open died with it: the re-ring is owed by a burst that ended
+  // with the process. Nothing else would ever write those markers, because a poll-only row is
+  // never pushed and so no future settle is guaranteed. Ring for every recipient still holding
+  // poll-only mail, so a crash inside the lease window costs a wake rather than a message.
+  // Idempotent: a row that already rang re-rings the same max-pending id, which is no advance
+  // and so no spurious wake.
+  //
+  // After the bind, deliberately, and this is the only ring that needs saying so: every other
+  // one is behind an HTTP request and so cannot happen before the port is ours. ensureBroker()
+  // probes /health and then spawns, so two sessions racing that gap both start and both open the
+  // db; only the port bind picks one. Ringing first meant the loser wrote markers on its way out
+  // of a process that never served, and worse, wrote them concurrently with the winner --
+  // writeDoorbell's clamp is a read-then-write, and two of those interleaving tear the count
+  // ("10" over "9" leaves "90"; O_TRUNC lands at open, not at write). Bun.serve throws on a taken
+  // port and nothing catches it, so past this line the loser is gone and the clamp has the single
+  // writer it needs. Anything ringing before this line reopens that race.
+  for (const r of selectPollOnlyRecipients.all() as { to_id: string }[]) {
+    ringDoorbellAfterSettle(r.to_id);
+  }
 }
