@@ -84,6 +84,26 @@ describe("doorbell read/write/remove", () => {
     expect(readDoorbell(dbPath, "p-1", 7)).toBe(7);
   });
 
+  // "not-a-number" above is the garbage shape that always healed, because parseInt returns NaN
+  // for it. The shape that did not is garbage with a numeric prefix: parseInt takes the digits
+  // and drops the rest, so the clamp read a number nobody wrote and refused every ring at or
+  // below it. Whole-file-or-nothing is what makes the clamp's "damaged markers heal" contract
+  // true rather than true-for-some-garbage.
+  it("reads a marker whole, so partial digits cannot wedge the clamp", () => {
+    writeDoorbell(dbPath, "p-junk", 1); // seeds the marker dir, as the cases above do
+    for (const junk of ["999999junk", "12abc", "9 9", "0x10", "1e3", "-5", "3.7", " ", "+7"]) {
+      writeFileSync(doorbellPath(dbPath, "p-junk") as string, junk);
+      expect(readDoorbell(dbPath, "p-junk", -1)).toBe(-1);
+      // The point of the sentinel: a damaged marker must not silence the next ring.
+      expect(writeDoorbell(dbPath, "p-junk", 5)).toBe(true);
+      expect(readDoorbell(dbPath, "p-junk")).toBe(5);
+    }
+    // Surrounding whitespace is not damage -- the writer's own value trims back to itself.
+    writeFileSync(doorbellPath(dbPath, "p-ws") as string, "  7 \n");
+    expect(readDoorbell(dbPath, "p-ws")).toBe(7);
+    expect(writeDoorbell(dbPath, "p-ws", 7)).toBe(false); // still clamped, still not an advance
+  });
+
   it("removeDoorbell deletes the marker and is a no-op when already gone", () => {
     writeDoorbell(dbPath, "p-1", 1);
     expect(existsSync(doorbellPath(dbPath, "p-1") as string)).toBe(true);

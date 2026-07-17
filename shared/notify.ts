@@ -91,13 +91,24 @@ export function writeDoorbell(dbPath: string, id: string, seq: number): boolean 
  * Watcher side: read a recipient's marker counter, or `missing` (default -1) when the marker
  * does not exist yet or is unreadable/garbage. The watcher compares this against the baseline
  * it armed with; a higher value means new mail.
+ *
+ * The whole file must be one run of digits. parseInt takes a numeric prefix and drops the rest,
+ * so "999999junk" read as 999999, and Number.isFinite could not tell: it was handed what parseInt
+ * had already salvaged, never the file. That was harmless while nothing compared against the
+ * value, and stopped being harmless when writeDoorbell's clamp started refusing any seq at or
+ * below it -- a damaged marker then suppressed every ring until the ids passed it, which is the
+ * one thing the clamp's contract above promises cannot happen. Deciding it here, on the bytes,
+ * is what makes a marker either a whole count or absent, with no third state for the clamp to
+ * lock in. Absent rings, so the failure that remains is a spare ring rather than silence.
  */
 export function readDoorbell(dbPath: string, id: string, missing = -1): number {
   const path = doorbellPath(dbPath, id);
   if (path === null) return missing;
   try {
-    const n = Number.parseInt(readFileSync(path, "utf8").trim(), 10);
-    return Number.isFinite(n) ? n : missing;
+    const raw = readFileSync(path, "utf8").trim();
+    if (!/^\d+$/.test(raw)) return missing;
+    const n = Number.parseInt(raw, 10);
+    return Number.isSafeInteger(n) ? n : missing;
   } catch {
     return missing;
   }

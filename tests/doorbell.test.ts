@@ -567,6 +567,19 @@ describe("startup reconcile over a persisted poll-only backlog", () => {
       // own heartbeat is what claims a due row -- there is no broker-side push timer -- and it
       // awaits the whole burst, so the settle, and its ring, are done when this returns.
       await okAt(PORT_MIX, "/heartbeat", { id: rcpt.id }, rcpt.token);
+
+      // Assert the push actually happened before reading the marker. The heartbeat's burst rings
+      // from its finally whatever the drain did, so the fyi row alone is enough to produce the
+      // expected marker -- this test would pass on a broker that never claimed the older row at
+      // all, and would then be asserting nothing about the skip it exists to justify.
+      const probe = new Database(DB_PATH_MIX, { readonly: true });
+      const states = probe.query(
+        "SELECT delivery_state, push_after FROM messages WHERE to_id = ? ORDER BY id",
+      ).all(rcpt.id) as { delivery_state: string; push_after: number | null }[];
+      probe.close();
+      expect(states.map((s) => s.delivery_state)).toEqual(["delivered", "queued"]);
+      expect(states[1].push_after).toBeNull(); // the survivor is the poll-only row, not a push
+
       expect(readDoorbell(DB_PATH_MIX, rcpt.id)).toBe(peek.max_id);
     } finally {
       boot.kill();
