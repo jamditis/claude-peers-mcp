@@ -415,13 +415,19 @@ if (import.meta.main) {
   // this host cannot push to holds normal and interrupt rows with a push_after on them, and
   // "push_after IS NULL" cannot see the one backlog nothing will ever push.
   //
-  // Due, not merely present: nextDeliverable takes the same `now`, so a row whose push_after
-  // is still ahead starts no burst, settles nothing, and rings nothing. Counting it as a push
-  // that is coming let a poll-only row sitting behind one wait out the whole push_delay_ms --
-  // silent for the length of a delay it has nothing to do with, on the one path whose job is
-  // to repair a marker that was lost.
-  const countDuePushable = db.prepare(
-    "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivery_state = 'queued' AND push_after IS NOT NULL AND push_after <= ?"
+  // Present, not due. Narrowing this to "push_after <= now" reads better -- a row that is not
+  // due starts no burst, so a poll-only row behind it waits out the push_delay_ms (120s) for a
+  // delay it has no part in -- but it trades a bounded wait for an unbounded strand. Ringing
+  // announces the max pending id, and the marker only ever grows. If the older push comes due
+  // between that ring and the woken session's poll, the poll stops at the now-delivering head
+  // (releasableQueuedPrefix), returns nothing, and re-arms at the id just rung. The settle then
+  // rings that same id and the clamp refuses it, so the poll-only row is silent until unrelated
+  // mail happens past it. The 120s wait ends in a correct ring; this does not end.
+  //
+  // So the question is whether a push exists at all, not whether it is due yet: any pushable row
+  // can be claimed ahead of the poll-only one, and a ring is only safe once none can.
+  const countPushableQueued = db.prepare(
+    "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivery_state = 'queued' AND push_after IS NOT NULL"
   );
   const selectQueuedRecipients = db.prepare(
     "SELECT DISTINCT to_id FROM messages WHERE delivery_state = 'queued'"
@@ -1354,10 +1360,9 @@ if (import.meta.main) {
   // is the one ring path that does not go through it. ringDoorbellAfterSettle's own guard
   // cannot stand in for this test: resetDeliveringOnStart has just requeued every lease, so the
   // guard sees zero delivering rows and is blind to the push that is one heartbeat away.
-  const startupNow = Date.now();
   for (const r of selectQueuedRecipients.all() as { to_id: string }[]) {
     if (isPushableTarget(peerDelivery(r.to_id))
-      && (countDuePushable.get(r.to_id, startupNow) as { n: number }).n > 0) continue;
+      && (countPushableQueued.get(r.to_id) as { n: number }).n > 0) continue;
     ringDoorbellAfterSettle(r.to_id);
   }
 }

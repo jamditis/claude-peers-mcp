@@ -587,13 +587,21 @@ describe("startup reconcile over a persisted poll-only backlog", () => {
     }
   }, 30_000);
 
-  // The test above makes the pushable row due before the restart, which is why silence is right
-  // there: a burst is one heartbeat away. Leave it ahead instead and the same skip is wrong --
-  // nothing claims a row that is not due, so nothing settles and nothing rings, and the poll-only
-  // row behind it waits out a push_delay_ms it has no part in. "A push exists" and "a push is
-  // due" are the same question only until a delay separates them, and nextDeliverable has always
-  // asked the second.
-  it("rings for a poll-only row when the push behind it is not due yet", async () => {
+  // The test above makes the pushable row due before restarting. This one leaves it ahead, which
+  // looks like the case the skip gets wrong: nothing claims a row that is not due, so the
+  // poll-only row behind it waits out the push_delay_ms (120s) for a delay it has no part in.
+  //
+  // Silence is still right, and the reason is worth keeping. Ringing here announces the max
+  // pending id, and the marker only grows. Let the older push come due between that ring and the
+  // woken session's poll -- 120s is long, and the ring is what starts the session looking -- and
+  // the poll stops at the now-delivering head, returns nothing, and re-arms at the id just rung.
+  // The settle rings that same id, the clamp refuses it, and the poll-only row is silent until
+  // unrelated mail happens past it. A bounded wait that ends in a correct ring is the better
+  // trade against a strand that does not end.
+  //
+  // This pins the silence so the "obvious" narrowing to push_after <= now cannot come back
+  // without this reasoning being re-read.
+  it("stays silent for a poll-only row behind a push that is not due yet", async () => {
     const PORT_LATE = 17946;
     const DB_PATH_LATE = join(work, "late-boot.db");
     const CONFIG_PATH_LATE = join(work, "late-boot-config.json");
@@ -637,7 +645,20 @@ describe("startup reconcile over a persisted poll-only backlog", () => {
       ).all(rcpt.id) as { delivery_state: string }[];
       probe.close();
       expect(states.map((s) => s.delivery_state)).toEqual(["queued", "queued"]);
+      expect(peek.count).toBe(2);
 
+      // No bell: the push ahead of the poll-only row can still be claimed, and a ring that
+      // cannot be read burns the only signal that would have carried the row.
+      expect(existsSync(doorbellPath(DB_PATH_LATE, rcpt.id) as string)).toBe(false);
+
+      // Silence is only correct if the bell arrives by the other road. Make the push due and
+      // let the recipient's own heartbeat claim it; the settle rings, and the poll-only row is
+      // readable by then because it is the head.
+      const rw = new Database(DB_PATH_LATE);
+      rw.run("UPDATE messages SET push_after = ? WHERE to_id = ? AND push_after IS NOT NULL",
+        [Date.now() - 1000, rcpt.id]);
+      rw.close();
+      await okAt(PORT_LATE, "/heartbeat", { id: rcpt.id }, rcpt.token);
       expect(readDoorbell(DB_PATH_LATE, rcpt.id)).toBe(peek.max_id);
     } finally {
       boot.kill();
