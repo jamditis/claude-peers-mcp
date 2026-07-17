@@ -396,9 +396,9 @@ if (import.meta.main) {
   const peekPending = db.prepare(
     "SELECT COUNT(*) AS count, MAX(id) AS max_id FROM messages WHERE to_id = ? AND delivery_state IN ('queued','delivering')"
   );
-  // Is a delivery lease open for this recipient? The doorbell asks so it can withhold a ring
-  // that a poll could not honour (see ringDoorbell). Deliberately counts ANY 'delivering' row,
-  // expired lease or not: releasableQueuedPrefix stops at the first row that is not 'queued'
+  // Is a delivery lease open for this recipient? The doorbell asks so it can withhold a ring that
+  // a poll could not honour (see ringDoorbellAfterSettle). Deliberately counts ANY 'delivering'
+  // row, expired lease or not: releasableQueuedPrefix stops at the first row that is not 'queued'
   // without consulting the deadline, so an expired lease blocks the poll just as hard. The bell
   // must ask exactly the question the poll answers, not a more optimistic one.
   const countDeliveringForPeer = db.prepare(
@@ -410,7 +410,7 @@ if (import.meta.main) {
   );
   // Recipients holding such a row, for the startup reconcile below. A delivery_kind='none'
   // peer needs no entry it would not already have: its rows never reach 'delivering' (see
-  // ringDoorbell), so a ring was never withheld from it and its marker is already current.
+  // ringDoorbellAfterSettle), so a ring was never withheld from it and its marker is current.
   const selectPollOnlyRecipients = db.prepare(
     "SELECT DISTINCT to_id FROM messages WHERE delivery_state = 'queued' AND push_after IS NULL"
   );
@@ -431,6 +431,22 @@ if (import.meta.main) {
   // drains this set the instant the lease frees.
   const pendingPeerDeletes = new Set<string>();
 
+  // Probed once, lazily: a host without tmux can never auto-push, and spawning `tmux -V` on a
+  // host that has no tmux recipient would be wasted work. Declared up here with the other
+  // process-lifetime state, not beside tmuxAvailable further down, because the startup reconcile
+  // below reaches it through isPushableTarget. Function declarations hoist but a `let` does not:
+  // read from a startup statement while the declaration still sits below, this is a temporal
+  // dead zone throw that kills the broker before it listens — and it would land on exactly the
+  // persisted tmux backlog the reconcile exists to repair.
+  let tmuxPresent: boolean | null = null;
+  function tmuxAvailable(): boolean {
+    if (tmuxPresent === null) {
+      try { tmuxPresent = Bun.spawnSync(["tmux", "-V"]).exitCode === 0; }
+      catch { tmuxPresent = false; }
+    }
+    return tmuxPresent;
+  }
+
   // Delete a peer's row and all its undelivered mail. A peer id is ephemeral (a fresh
   // generatePeerId per session, never reused), so once the session is gone (unregister)
   // or replaced (same-pid re-register) its undelivered mail is addressed to an id nothing
@@ -444,37 +460,25 @@ if (import.meta.main) {
     removeDoorbell(DB_PATH, id);
   }
 
-  // Ring the doorbell for a recipient nothing will push this row to (isPollOnly): record that
-  // it has pending mail up to `seq` (the just-inserted row id, which is the new max pending id
-  // since ids only grow). A watcher armed via `cli.ts doorbell` wakes within seconds; a session
-  // with no watcher is unaffected (the write lands in an unwatched file) and still drains on its
-  // next check_messages. A recipient that WILL be pushed is skipped — the push is the wake, and
-  // a bell would only duplicate it. Best-effort and never throws into the send path:
-  // writeDoorbell swallows its own IO errors, and the lookup behind isPollOnly is a primary-key
-  // hit that cannot fail for a row we just inserted against.
+  // Ring the doorbell for a recipient nothing will push its pending mail to: record that it has
+  // mail up to its max pending id. A watcher armed via `cli.ts doorbell` wakes within seconds; a
+  // session with no watcher is unaffected (the write lands in an unwatched file) and still drains
+  // on its next check_messages. A recipient whose backlog WILL be pushed is skipped — the push is
+  // the wake, and a bell would only duplicate it. Best-effort and never throws into the send path:
+  // writeDoorbell swallows its own IO errors, and the lookups here are primary-key hits.
   //
   // The marker means "your mail is readable up to here", not "it exists up to here". A poll
   // releases only the contiguous queued prefix, stopping at an in-flight head to preserve
   // ordering, so ringing while an older row is mid-push spends the counter's one advance on
   // mail the woken session cannot read: it polls, gets nothing, re-arms at the new value, and
   // — since a poll-only row is never pushed and nothing writes the marker again — the row
-  // strands until unrelated mail happens to ring. Withhold the ring while a lease is open;
-  // ringDoorbellAfterSettle re-rings once it clears, so the advance and the readability are
-  // the same event.
+  // strands until unrelated mail happens to ring. Hence the open-lease guard below, and the
+  // burst scope (withDeliveryBurst) that decides WHEN this may be called at all.
   //
-  // A delivery_kind='none' recipient — the doorbell's original case — cannot reach this:
+  // A delivery_kind='none' recipient — the doorbell's original case — cannot be blocked here:
   // deliverNext bails at !isPushableTarget, so none of its rows ever enter 'delivering' and
-  // its poll always drains. Only a tmux recipient, which the isPollOnly union brought into the
+  // its poll always drains. Only a tmux recipient, which the poll-only union brought into the
   // bell's scope, can hold the lease that blocks the prefix.
-  function ringDoorbell(toId: string, seq: number, pushAfter: number | null): void {
-    if (!isPollOnly(toId, pushAfter)) return;
-    if ((countDeliveringForPeer.get(toId) as { n: number }).n > 0) return;
-    writeDoorbell(DB_PATH, toId, seq);
-  }
-
-  // Ring the bell the insert path withheld, once a lease resolves and the queued prefix is
-  // releasable again. Writes the same max-pending-id the insert path would have written, so the
-  // counter still only grows and a watcher armed at the older value fires exactly once.
   function ringDoorbellAfterSettle(toId: string): void {
     if ((countDeliveringForPeer.get(toId) as { n: number }).n > 0) return;
     const pending = peekPending.get(toId) as { count: number; max_id: number | null };
@@ -488,14 +492,50 @@ if (import.meta.main) {
     writeDoorbell(DB_PATH, toId, pending.max_id);
   }
 
+  // How many delivery drivers are currently working a recipient: deliverNext itself, plus any
+  // drain loop a caller runs on top of it. The bell may only ring as the last one leaves.
+  //
+  // "Is a lease open right now?" is the wrong question, because the answer goes stale the moment
+  // the asker opens one. Both drivers did exactly that: the insert path rang and THEN called
+  // deliverNext, and deliverNext rang from its own finally while the caller's drain loop still
+  // had older pushable rows to claim. Either way the marker lands on an id the poll cannot
+  // reach; the woken session polls, gets nothing, and re-arms at that value (cli.ts arms at the
+  // marker's current value, not at what it drained), so when the settle rewrites the same
+  // max-pending id there is no advance and no second wake — the poll-only row strands until
+  // unrelated mail rings.
+  //
+  // Counting the drivers instead of the leases makes that window unrepresentable. At zero, no
+  // lease is open and none is coming from this host, so every pending row is queued and the
+  // marker's promise ("readable up to here") is exactly what a poll would honour. Every path
+  // that may claim a lease declares itself here, so a ring can never land mid-burst.
+  const deliveryDrivers = new Map<string, number>();
+
+  async function withDeliveryBurst<T>(toId: string, work: () => Promise<T>): Promise<T> {
+    deliveryDrivers.set(toId, (deliveryDrivers.get(toId) ?? 0) + 1);
+    try {
+      return await work();
+    } finally {
+      const left = (deliveryDrivers.get(toId) ?? 1) - 1;
+      if (left > 0) {
+        deliveryDrivers.set(toId, left);
+      } else {
+        deliveryDrivers.delete(toId);
+        // Safe on the teardown path too: deletePeerAndMail has already dropped this peer's
+        // pending rows, so max_id is NULL and the ring is a no-op rather than recreating the
+        // marker file it just removed.
+        ringDoorbellAfterSettle(toId);
+      }
+    }
+  }
+
   // Startup reconcile. resetDeliveringOnStart requeued whatever a dead broker left mid-lease,
   // so those recipients' queued prefixes are releasable again — but any ring that broker
-  // withheld while the lease was open died with it: the re-ring is owed by deliverNext's
-  // finally, and that stack is gone. Nothing else would ever write those markers, because a
-  // poll-only row is never pushed and so no future settle is guaranteed. Ring for every
-  // recipient still holding poll-only mail, so a crash inside the lease window costs a wake
-  // rather than a message. Idempotent: a row that already rang re-rings the same max-pending
-  // id, which is no advance and so no spurious wake.
+  // withheld while the lease was open died with it: the re-ring is owed by a burst that ended
+  // with the process. Nothing else would ever write those markers, because a poll-only row is
+  // never pushed and so no future settle is guaranteed. Ring for every recipient still holding
+  // poll-only mail, so a crash inside the lease window costs a wake rather than a message.
+  // Idempotent: a row that already rang re-rings the same max-pending id, which is no advance
+  // and so no spurious wake.
   for (const r of selectPollOnlyRecipients.all() as { to_id: string }[]) {
     ringDoorbellAfterSettle(r.to_id);
   }
@@ -615,14 +655,6 @@ if (import.meta.main) {
     db.close();
     process.exit(0);
   }
-  let tmuxPresent: boolean | null = null;
-  function tmuxAvailable(): boolean {
-    if (tmuxPresent === null) {
-      try { tmuxPresent = Bun.spawnSync(["tmux", "-V"]).exitCode === 0; }
-      catch { tmuxPresent = false; }
-    }
-    return tmuxPresent;
-  }
 
   const realTmuxSpawn: TmuxSpawn = async (args) => {
     const proc = Bun.spawn(args, { stdout: "ignore", stderr: "ignore" });
@@ -659,10 +691,11 @@ if (import.meta.main) {
   //     push_after holds — deliverNext bails before it ever reads the column;
   //   - the row sits outside the push channel (push_after NULL: an fyi, or a forward floored
   //     by floor_remote_forwards), whatever the pane holds — nextDeliverable filters it out.
-  // Both the doorbell and the sender-facing poll_only report answer this one question, so it
-  // lives in one place. They disagreed before: the doorbell asked only about delivery_kind,
-  // which is the push-eligibility half, so a floored forward to a peer that HAS a pane got
-  // neither a push nor a bell and sat unseen until a manual check_messages (#39, #49).
+  // The sender-facing poll_only report answers it for one row; ringDoorbellAfterSettle answers
+  // the same question over the recipient's whole pending set (!isPushableTarget, or a queued
+  // push_after IS NULL row). Both halves must stay in the union: the doorbell once asked only
+  // about delivery_kind, the push-eligibility half, so a floored forward to a peer that HAS a
+  // pane got neither a push nor a bell and sat unseen until a manual check_messages (#39, #49).
   function isPollOnly(toId: string, pushAfter: number | null): boolean {
     return pushAfter === null || !isPushableTarget(peerDelivery(toId));
   }
@@ -704,7 +737,15 @@ if (import.meta.main) {
   // Attempt to deliver the recipient's head-of-line row. Serial per recipient.
   // Returns the delivery disposition for an immediately-attempted send, or null
   // when nothing was attempted (blocked / no backend / already in flight).
+  //
+  // Burst-scoped so a bare call still rings the bell it owes when it settles. A caller that
+  // loops (drainAfterDelivery, the heartbeat) declares its own burst around the whole loop, and
+  // the nesting means the outermost frame pays: one ring per burst, after the last lease.
   async function deliverNext(toId: string): Promise<"accepted" | "queued" | null> {
+    return withDeliveryBurst(toId, () => attemptDeliverNext(toId));
+  }
+
+  async function attemptDeliverNext(toId: string): Promise<"accepted" | "queued" | null> {
     if (recipientsInFlight.has(toId)) return null;
     const now = Date.now();
     const row = nextDeliverable(db, toId, now, activeRowIds);
@@ -781,13 +822,11 @@ if (import.meta.main) {
       if (pendingPeerDeletes.has(toId)) {
         pendingPeerDeletes.delete(toId);
         deletePeerAndMail(toId);
-      } else {
-        // The lease has resolved, so a poll can release the queued prefix behind it. Ring the
-        // bell the insert path withheld while it was open. Not on the teardown branch:
-        // deletePeerAndMail drops this peer's mail and its marker, and a ring would only
-        // recreate the file it just removed.
-        ringDoorbellAfterSettle(toId);
       }
+      // The bell is not rung here. This lease has resolved, but the caller's drain loop may
+      // claim the next older row before the woken session could poll, which would spend the
+      // marker on mail that is unreadable again by the time anyone looks. withDeliveryBurst
+      // rings once the whole burst is done.
     }
   }
 
@@ -910,10 +949,13 @@ if (import.meta.main) {
         body.from_id, toId, body.text, new Date().toISOString(), urgency, pushAfter,
       );
       const ownRowId = Number(inserted.lastInsertRowid);
-      // Ring the doorbell before the push attempt: a poll-only recipient gets no inject, so this
-      // is its near-real-time wake (issue #49). ringDoorbell skips anything that will be pushed.
-      ringDoorbell(toId, ownRowId, pushAfter);
-      if ((await deliverNext(toId)) === "accepted") await drainAfterDelivery(toId);
+      // A poll-only recipient gets no inject, so the doorbell is its near-real-time wake (issue
+      // #49). The bell is owed from the insert above but rung by the burst, not before it: this
+      // request's own deliverNext claims the head-of-line row next, and a ring placed here would
+      // announce mail that claim immediately makes unreadable (see withDeliveryBurst).
+      await withDeliveryBurst(toId, async () => {
+        if ((await deliverNext(toId)) === "accepted") await drainAfterDelivery(toId);
+      });
       // Report THIS message's own disposition, not the queue head's (the local edition of
       // issue #14): deliverNext works head-first, so the row just inserted may have ridden
       // out behind older backlog, still be queued (normal/fyi), or had its own push fail
@@ -972,28 +1014,29 @@ if (import.meta.main) {
       : pushAfterFor(urgency, Date.now(), config.push_delay_ms);
     const inserted = insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString(), urgency, pushAfter);
     const forwardedRowId = Number(inserted.lastInsertRowid);
-    // Ring regardless of floor_remote_forwards: a floored forward is poll-only (push_after NULL,
-    // never auto-injected), which is exactly the case the doorbell accelerates — the recipient
-    // still needs to know to check (issue #49, related #39). The floor suppresses the paste, not
-    // the sender's intent, so the bell carries the signal the push would have.
-    ringDoorbell(body.to_id, forwardedRowId, pushAfter);
     // floor_remote_forwards leaves a forwarded message queued for pull-only retrieval;
     // by default a forward auto-injects into the recipient's backend like a local send.
     // Report the honest per-message disposition so the originating broker can tell the
     // sender whether the message was pushed or left for their next check (issue #14).
     let delivery: "accepted" | "queued" = "queued";
-    if (!config.floor_remote_forwards) {
+    // The burst rings for both branches. A floored forward is poll-only (push_after NULL, never
+    // auto-injected), which is exactly the case the doorbell accelerates — the recipient still
+    // needs to know to check (issue #49, related #39). The floor suppresses the paste, not the
+    // sender's intent, so the bell carries the signal the push would have. Unfloored, the same
+    // burst withholds the bell until this drain stops claiming leases.
+    await withDeliveryBurst(body.to_id, async () => {
+      if (config.floor_remote_forwards) return;
       // deliverNext delivers the recipient's queue HEAD (possibly older backlog, not this
       // forward); drainAfterDelivery then works down the queue. Report THIS message's own
       // fate — it may have ridden out behind the backlog, or still be queued if the drain
       // cap was hit — not the head's disposition.
       if ((await deliverNext(body.to_id)) === "accepted") await drainAfterDelivery(body.to_id);
       delivery = isMessageDelivered(db, forwardedRowId) ? "accepted" : "queued";
-    }
+    });
     // Report whether this host will ever auto-push the row, so the originating broker can give
-    // its sender an accurate queued-vs-poll-only signal (#39). Same predicate the doorbell rang
-    // on above and deliverNext gates delivery on, so the sender's answer, the recipient's bell,
-    // and the actual push behavior cannot drift apart.
+    // its sender an accurate queued-vs-poll-only signal (#39). The same union the burst's bell
+    // asks over the pending set, and the one deliverNext gates delivery on, so the sender's
+    // answer, the recipient's bell, and the actual push behavior cannot drift apart.
     return { ok: true, delivery, poll_only: isPollOnly(body.to_id, pushAfter) };
   }
 
@@ -1232,12 +1275,15 @@ if (import.meta.main) {
             // continuing only while each attempt delivers. A non-delivery (no backend,
             // or a failed/blocked head-of-line) stops the drain: under FIFO nothing
             // behind a blocked head can go first, and stopping avoids re-spawning
-            // against a failing pane on every iteration.
+            // against a failing pane on every iteration. Burst-scoped so the bell rings once,
+            // after the last lease of the drain, rather than between two of them.
             let drained = 0;
-            for (; drained < MAX_HEARTBEAT_DRAIN; drained++) {
-              const d = await deliverNext(body.id);
-              if (d !== "accepted") break; // only a successful inject continues the drain
-            }
+            await withDeliveryBurst(body.id, async () => {
+              for (; drained < MAX_HEARTBEAT_DRAIN; drained++) {
+                const d = await deliverNext(body.id);
+                if (d !== "accepted") break; // only a successful inject continues the drain
+              }
+            });
             if (drained === MAX_HEARTBEAT_DRAIN) {
               console.error(`[claude-peers broker] heartbeat drain hit the ${MAX_HEARTBEAT_DRAIN}-message cap for ${body.id}; backlog continues next heartbeat`);
             }

@@ -29,21 +29,34 @@ const DB_PATH = join(work, "broker.db");
 const CONFIG_PATH = join(work, "config.json");
 let proc: any;
 
-async function call(path: string, body: unknown, token?: string) {
+// A second broker for the drain-race suite below. Those cases need a pushable row that is
+// push-due but not yet claimed at the instant a poll-only row lands, and the 2-minute default
+// push_delay_ms cannot stage that inside a test. Its own port and db keep the shortened delay
+// off the suites above, whose timing assertions assume the default.
+const PORT_DRAIN = 17941;
+const DB_PATH_DRAIN = join(work, "drain.db");
+const CONFIG_PATH_DRAIN = join(work, "drain-config.json");
+const PUSH_DELAY_MS = 400;
+let drainProc: any;
+
+async function callAt(port: number, path: string, body: unknown, token?: string) {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (token) headers.Authorization = `Bearer ${token}`;
-  return fetch(`http://127.0.0.1:${PORT}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
+  return fetch(`http://127.0.0.1:${port}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
 }
-async function ok(path: string, body: unknown, token?: string) {
-  const res = await call(path, body, token);
+async function okAt(port: number, path: string, body: unknown, token?: string) {
+  const res = await callAt(port, path, body, token);
   if (!res.ok) throw new Error(`${path} -> ${res.status} ${await res.text()}`);
   return res.json() as any;
 }
+const call = (path: string, body: unknown, token?: string) => callAt(PORT, path, body, token);
+const ok = (path: string, body: unknown, token?: string) => okAt(PORT, path, body, token);
+
 // A recipient must be a LIVE pid (sends check recipient liveness), so it uses this process's
 // pid. A same-pid re-register supersedes the prior row, so only one live recipient exists at a
 // time — fine, since each test uses its own and never references a prior test's recipient.
-function regRcpt(overrides: Record<string, unknown> = {}) {
-  return ok("/register", {
+function regRcpt(overrides: Record<string, unknown> = {}, port = PORT) {
+  return okAt(port, "/register", {
     pid: process.pid, cwd: "/tmp/db", git_root: null, tty: null, summary: "",
     machine: "db-a", tailscale_ip: "127.0.0.1", tmux_pane: null, tmux_socket: null, ...overrides,
   });
@@ -51,11 +64,38 @@ function regRcpt(overrides: Record<string, unknown> = {}) {
 // A sender is never a delivery target and its liveness is never probed, so it can use a unique
 // fake pid — which also keeps it from superseding the live recipient's same-pid row.
 let fakePid = 900_000;
-function regSender(overrides: Record<string, unknown> = {}) {
-  return ok("/register", {
+function regSender(overrides: Record<string, unknown> = {}, port = PORT) {
+  return okAt(port, "/register", {
     pid: ++fakePid, cwd: "/tmp/db-s", git_root: null, tty: null, summary: "",
     machine: "db-a", tailscale_ip: "127.0.0.1", tmux_pane: null, tmux_socket: null, ...overrides,
   });
+}
+
+async function waitForHealth(port: number, timeoutMs = 8000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) return true; } catch {}
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return false;
+}
+
+// Wait for a specific row to reach a delivery_state, rather than sleeping and hoping. A fixed
+// sleep pins the tmux stub's wall-clock timing instead of the invariant under test, and a race
+// that silently failed to set up would pass for the wrong reason — so this throws instead.
+async function waitForRowState(dbPath: string, rowId: number, state: string, timeoutMs = 8000) {
+  const probe = new Database(dbPath, { readonly: true });
+  try {
+    const q = probe.query("SELECT delivery_state AS s FROM messages WHERE id = ?");
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if ((q.get(rowId) as { s: string } | null)?.s === state) return;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error(`row ${rowId} never reached '${state}' within ${timeoutMs}ms; the race never set up`);
+  } finally {
+    probe.close();
+  }
 }
 
 beforeAll(async () => {
@@ -89,14 +129,28 @@ exit 0
     env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH, PATH: `${work}:${process.env.PATH}` },
     stdout: "ignore", stderr: "ignore",
   });
-  for (let i = 0; i < 20; i++) {
-    try { if ((await fetch(`http://127.0.0.1:${PORT}/health`)).ok) break; } catch {}
-    await new Promise((r) => setTimeout(r, 300));
-  }
+  writeFileSync(CONFIG_PATH_DRAIN, JSON.stringify({
+    machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_DRAIN,
+    id_prefix: "dbd", siblings: [], allowed_ips: ["127.0.0.1"], db_path: DB_PATH_DRAIN,
+    push_delay_ms: PUSH_DELAY_MS,
+  }));
+  drainProc = Bun.spawn(["bun", "broker.ts"], {
+    env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH_DRAIN, PATH: `${work}:${process.env.PATH}` },
+    stdout: "ignore", stderr: "ignore",
+  });
+  await waitForHealth(PORT);
+  await waitForHealth(PORT_DRAIN);
 });
 
-afterAll(() => {
+afterAll(async () => {
+  // Await the exits, don't just signal them. kill() is a SIGTERM, and the broker's handler runs
+  // retire(): it keeps serving on its fixed port while it drains, answering /health but refusing
+  // /register with 503. Returning here without waiting leaves that window open across a
+  // back-to-back run, whose health probe then passes against the PREVIOUS run's dying broker and
+  // whose first register gets the 503.
   proc?.kill();
+  drainProc?.kill();
+  await Promise.all([proc?.exited, drainProc?.exited]);
   try { rmSync(work, { recursive: true, force: true }); } catch {}
 });
 
@@ -254,6 +308,124 @@ describe("a ring is withheld until the mail it announces is readable", () => {
     expect(peek.count).toBe(1); // the pushed row is delivered; only the fyi is still pending
     expect(readDoorbell(DB_PATH, rcpt.id)).toBe(peek.max_id);
   });
+});
+
+// The withhold above only asks "is a lease open right now?", and that answer goes stale the
+// instant the caller opens the next one. Both drivers do exactly that: the insert path rings and
+// THEN calls deliverNext, and a settle inside deliverNext's finally rings while the caller's
+// drain loop is still holding older pushable rows to send. Either way the marker is spent at an
+// id the poll cannot reach, the woken session re-arms at that value (cli.ts arms at the marker's
+// current value, not at what it drained), and the later settle rewrites the same max-pending id —
+// no advance, no second wake, and the poll-only row strands until unrelated mail rings.
+//
+// So the bell may only ring when no lease is open AND none is coming: the end of the recipient's
+// whole delivery burst. These pin both drivers.
+describe("a ring waits for the recipient's whole delivery burst, not just one lease", () => {
+  it("does not ring when the send's own deliverNext is about to claim an older due row", async () => {
+    const rcpt = await regRcpt({ cwd: "/tmp/burst-insert", tmux_pane: SLOW_PANE }, PORT_DRAIN);
+    const sender = await regSender({ cwd: "/tmp/burst-insert-s" }, PORT_DRAIN);
+    // A `normal` row is push_after = now + PUSH_DELAY_MS: pushable, so no bell, and not yet due,
+    // so deliverNext leaves it queued and claims no lease.
+    await okAt(PORT_DRAIN, "/send-message",
+      { from_id: sender.id, to_id: rcpt.id, text: "delayed", urgency: "normal" }, sender.token);
+    const older = (await okAt(PORT_DRAIN, "/peek", { id: rcpt.id }, rcpt.token)).max_id;
+    expect(existsSync(doorbellPath(DB_PATH_DRAIN, rcpt.id) as string)).toBe(false);
+    await new Promise((r) => setTimeout(r, PUSH_DELAY_MS + 200)); // the older row is now push-due
+
+    // The fyi lands with no lease open, so the insert-time bell sees a clear queue — but this
+    // very request's deliverNext claims the older due row next, retracting the readability the
+    // bell just announced. Not awaited: the stub stalls that push, so the sample below lands
+    // inside the window.
+    const fyi = okAt(PORT_DRAIN, "/send-message",
+      { from_id: sender.id, to_id: rcpt.id, text: "fyi", urgency: "fyi" }, sender.token);
+    await waitForRowState(DB_PATH_DRAIN, older, "delivering");
+    expect(existsSync(doorbellPath(DB_PATH_DRAIN, rcpt.id) as string)).toBe(false);
+
+    await fyi;
+    const peek = await okAt(PORT_DRAIN, "/peek", { id: rcpt.id }, rcpt.token);
+    expect(peek.count).toBe(1); // the pushed row is delivered; only the fyi is still pending
+    expect(readDoorbell(DB_PATH_DRAIN, rcpt.id)).toBe(peek.max_id);
+  }, 20_000);
+
+  it("does not ring while the drain still has an older pushable row to send", async () => {
+    const rcpt = await regRcpt({ cwd: "/tmp/burst-drain", tmux_pane: SLOW_PANE }, PORT_DRAIN);
+    const sender = await regSender({ cwd: "/tmp/burst-drain-s" }, PORT_DRAIN);
+    // Two delayed pushable rows: neither is claimed on insert, so the drain below has more than
+    // one lease to take — the case a single settle cannot see the end of.
+    await okAt(PORT_DRAIN, "/send-message",
+      { from_id: sender.id, to_id: rcpt.id, text: "one", urgency: "normal" }, sender.token);
+    const first = (await okAt(PORT_DRAIN, "/peek", { id: rcpt.id }, rcpt.token)).max_id;
+    await okAt(PORT_DRAIN, "/send-message",
+      { from_id: sender.id, to_id: rcpt.id, text: "two", urgency: "normal" }, sender.token);
+    const second = (await okAt(PORT_DRAIN, "/peek", { id: rcpt.id }, rcpt.token)).max_id;
+    await new Promise((r) => setTimeout(r, PUSH_DELAY_MS + 200)); // both are now push-due
+
+    // An interrupt starts the burst: its own row rings nothing (it is pushable), and its
+    // deliverNext takes the head-of-line lease, so the fyi below is withheld for the right
+    // reason — leaving only the settle-side driver under test.
+    const push = okAt(PORT_DRAIN, "/send-message",
+      { from_id: sender.id, to_id: rcpt.id, text: "now", urgency: "interrupt" }, sender.token);
+    await waitForRowState(DB_PATH_DRAIN, first, "delivering");
+    await okAt(PORT_DRAIN, "/send-message",
+      { from_id: sender.id, to_id: rcpt.id, text: "fyi mid-drain", urgency: "fyi" }, sender.token);
+
+    // The first lease settles here, but the drain claims `second` immediately after. Ringing on
+    // that settle spends the counter on mail the next claim makes unreadable again.
+    await waitForRowState(DB_PATH_DRAIN, second, "delivering");
+    expect(existsSync(doorbellPath(DB_PATH_DRAIN, rcpt.id) as string)).toBe(false);
+
+    await push;
+    const peek = await okAt(PORT_DRAIN, "/peek", { id: rcpt.id }, rcpt.token);
+    expect(peek.count).toBe(1); // all three pushable rows delivered; only the fyi is pending
+    expect(readDoorbell(DB_PATH_DRAIN, rcpt.id)).toBe(peek.max_id);
+  }, 30_000);
+});
+
+// The reconcile runs at startup, so everything it reaches must already be initialized. It calls
+// ringDoorbellAfterSettle -> isPushableTarget -> tmuxAvailable, and tmuxAvailable closes over a
+// `let` declared further down the module: reading it from a startup statement is a temporal dead
+// zone throw, and the broker dies before it ever listens. Only a tmux recipient reaches it —
+// isPushableTarget short-circuits on kind !== 'tmux' — which is exactly the backlog shape this
+// reconcile exists to repair.
+describe("startup reconcile over a persisted poll-only backlog", () => {
+  it("starts, and rings, when a tmux recipient already holds a queued poll-only row", async () => {
+    const PORT_BOOT = 17942;
+    const DB_PATH_BOOT = join(work, "boot.db");
+    const CONFIG_PATH_BOOT = join(work, "boot-config.json");
+    writeFileSync(CONFIG_PATH_BOOT, JSON.stringify({
+      machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_BOOT,
+      id_prefix: "dbb", siblings: [], allowed_ips: ["127.0.0.1"], db_path: DB_PATH_BOOT,
+    }));
+    const spawnBroker = () => Bun.spawn(["bun", "broker.ts"], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH_BOOT, PATH: `${work}:${process.env.PATH}` },
+      stdout: "ignore", stderr: "ignore",
+    });
+
+    let boot = spawnBroker();
+    try {
+      expect(await waitForHealth(PORT_BOOT)).toBe(true);
+      const rcpt = await regRcpt({ cwd: "/tmp/boot-tmux", tmux_pane: "%30" }, PORT_BOOT);
+      const sender = await regSender({ cwd: "/tmp/boot-tmux-s" }, PORT_BOOT);
+      await okAt(PORT_BOOT, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "fyi", urgency: "fyi" }, sender.token);
+      const peek = await okAt(PORT_BOOT, "/peek", { id: rcpt.id }, rcpt.token);
+      expect(peek.count).toBe(1);
+
+      boot.kill();
+      await boot.exited;
+      // Drop the marker the live broker wrote, so what the restart reports is the reconcile's own
+      // work and not a leftover file.
+      rmSync(doorbellPath(DB_PATH_BOOT, rcpt.id) as string, { force: true });
+
+      boot = spawnBroker();
+      expect(await waitForHealth(PORT_BOOT)).toBe(true);
+      expect(readDoorbell(DB_PATH_BOOT, rcpt.id)).toBe(peek.max_id);
+    } finally {
+      boot.kill();
+      await boot.exited; // same fixed-port handover as afterAll: drain before the next run binds
+    }
+  }, 30_000);
 });
 
 describe("/peek (non-consuming read)", () => {
