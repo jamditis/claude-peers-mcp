@@ -500,13 +500,20 @@ if (import.meta.main) {
     if ((countDeliveringForPeer.get(toId) as { n: number }).n > 0) return;
     const pending = peekPending.get(toId) as { count: number; max_id: number | null };
     if (pending.max_id === null) return;
-    // A queued push is a lease this host has not opened yet but certainly will: the heartbeat
-    // claims it the moment it comes due, and the poll THIS bell triggers then stops at that
+    // A queued push is a lease this host has not opened yet but will open the moment the row comes
+    // due: the heartbeat claims it, and the poll THIS bell triggers then stops at that
     // now-in-flight head and returns nothing. So withhold, and let that push's own settle ring
-    // once its row is gone and the marker can mean what it says. The wait is bounded by the push
-    // delay; a marker spent on mail the poll cannot reach strands the row behind it until
-    // unrelated mail happens to ring, because the session re-arms at the value the settle then
-    // rewrites and writeDoorbell clamps the repeat.
+    // once its row is gone and the marker can mean what it says. A marker spent on mail the poll
+    // cannot reach strands the row behind it until unrelated mail happens to ring, because the
+    // session re-arms at the value the settle then rewrites and writeDoorbell clamps the repeat.
+    //
+    // What bounds the silence is the push LEAVING the queue, which is not the same as the push
+    // delay lapsing: releaseToQueued requeues a failed attempt with its push_after intact, so a
+    // pane whose send-keys keeps failing holds this guard closed on every heartbeat and the
+    // poll-only mail behind it is never announced (issue #70, pinned by a test). That mail is
+    // still readable and its check_messages still drains it; the near-real-time wake is the loss.
+    // Ringing anyway is not the fix -- it strands the row outright, per the reason above -- so
+    // #70 has to change what a failed push IS, not what this asks.
     //
     // Past this test, every pending row is one a poll releases now and nothing will intervene:
     // no lease is open, and none is coming. That is the marker's whole promise, so asking
