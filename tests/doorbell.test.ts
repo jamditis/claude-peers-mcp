@@ -462,6 +462,118 @@ describe("startup reconcile over a persisted poll-only backlog", () => {
     }
   }, 30_000);
 
+  // push_after is computed from urgency alone at insert and never from the target, so a peer
+  // this host cannot push to still gets a push_after on a normal or interrupt row. Nothing will
+  // ever push it: isPollOnly reads (push_after === null) OR (target not pushable), and only the
+  // second disjunct is true here. A reconcile keyed on "push_after IS NULL" asks the first and
+  // so cannot see this backlog at all.
+  it("rings for a none recipient whose queued row carries a push_after", async () => {
+    const PORT_NONE = 17944;
+    const DB_PATH_NONE = join(work, "none-boot.db");
+    const CONFIG_PATH_NONE = join(work, "none-boot-config.json");
+    writeFileSync(CONFIG_PATH_NONE, JSON.stringify({
+      machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_NONE,
+      id_prefix: "dbn", siblings: [], allowed_ips: ["127.0.0.1"], db_path: DB_PATH_NONE,
+    }));
+    const spawnBroker = () => Bun.spawn(["bun", "broker.ts"], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH_NONE, PATH: `${work}:${process.env.PATH}` },
+      stdout: "ignore", stderr: "ignore",
+    });
+
+    let boot = spawnBroker();
+    try {
+      expect(await waitForHealth(PORT_NONE)).toBe(true);
+      // No pane: delivery_kind 'none', so isPushableTarget is false for every row it holds.
+      const rcpt = await regRcpt({ cwd: "/tmp/boot-none", tmux_pane: null }, PORT_NONE);
+      const sender = await regSender({ cwd: "/tmp/boot-none-s" }, PORT_NONE);
+      await okAt(PORT_NONE, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "normal", urgency: "normal" }, sender.token);
+      const peek = await okAt(PORT_NONE, "/peek", { id: rcpt.id }, rcpt.token);
+      expect(peek.count).toBe(1);
+
+      const probe = new Database(DB_PATH_NONE, { readonly: true });
+      const row = probe.query(
+        "SELECT push_after FROM messages WHERE to_id = ? ORDER BY id DESC LIMIT 1",
+      ).get(rcpt.id) as { push_after: number | null };
+      probe.close();
+      // The premise: poll-only by target, yet carrying a push_after. If this ever goes null the
+      // test below passes for a reason that has nothing to do with the reconcile.
+      expect(row.push_after).not.toBeNull();
+
+      boot.kill();
+      await boot.exited;
+      // writeDoorbell swallows its own IO errors and the marker lives outside the db, so a lost
+      // or unwritten marker is exactly the state the reconcile exists to repair.
+      rmSync(doorbellPath(DB_PATH_NONE, rcpt.id) as string, { force: true });
+
+      boot = spawnBroker();
+      expect(await waitForHealth(PORT_NONE)).toBe(true);
+      expect(readDoorbell(DB_PATH_NONE, rcpt.id)).toBe(peek.max_id);
+    } finally {
+      boot.kill();
+      await boot.exited;
+    }
+  }, 30_000);
+
+  // The other half: a recipient whose backlog still has a push coming must NOT be rung here.
+  // resetDeliveringOnStart requeues every lease before this runs, so ringDoorbellAfterSettle's
+  // own "is anything delivering?" guard sees zero and cannot see the push one heartbeat away.
+  it("stays silent when a push is still coming, and rings once it settles", async () => {
+    const PORT_MIX = 17945;
+    const DB_PATH_MIX = join(work, "mix-boot.db");
+    const CONFIG_PATH_MIX = join(work, "mix-boot-config.json");
+    writeFileSync(CONFIG_PATH_MIX, JSON.stringify({
+      machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_MIX,
+      id_prefix: "dbm", siblings: [], allowed_ips: ["127.0.0.1"], db_path: DB_PATH_MIX,
+      push_delay_ms: 600_000,
+    }));
+    const spawnBroker = () => Bun.spawn(["bun", "broker.ts"], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH_MIX, PATH: `${work}:${process.env.PATH}` },
+      stdout: "ignore", stderr: "ignore",
+    });
+
+    let boot = spawnBroker();
+    try {
+      expect(await waitForHealth(PORT_MIX)).toBe(true);
+      const rcpt = await regRcpt({ cwd: "/tmp/boot-mix", tmux_pane: SLOW_PANE }, PORT_MIX);
+      const sender = await regSender({ cwd: "/tmp/boot-mix-s" }, PORT_MIX);
+      // The long push_delay_ms keeps this queued rather than pushed while the broker is up.
+      await okAt(PORT_MIX, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "pushable", urgency: "normal" }, sender.token);
+      await okAt(PORT_MIX, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "poll only", urgency: "fyi" }, sender.token);
+      const peek = await okAt(PORT_MIX, "/peek", { id: rcpt.id }, rcpt.token);
+      expect(peek.count).toBe(2);
+
+      boot.kill();
+      await boot.exited;
+      rmSync(doorbellPath(DB_PATH_MIX, rcpt.id) as string, { force: true });
+      // A broker down long enough for its delayed rows to come due is the ordinary case; make
+      // the older row due so the restart's heartbeat claims it, without waiting out the delay.
+      const rw = new Database(DB_PATH_MIX);
+      rw.run("UPDATE messages SET push_after = ? WHERE to_id = ? AND push_after IS NOT NULL",
+        [Date.now() - 1000, rcpt.id]);
+      rw.close();
+
+      boot = spawnBroker();
+      // The reconcile is synchronous after the port bind, so a served /health proves it has
+      // already run: no handler, and no heartbeat, can interleave ahead of it.
+      expect(await waitForHealth(PORT_MIX)).toBe(true);
+      expect(existsSync(doorbellPath(DB_PATH_MIX, rcpt.id) as string)).toBe(false);
+
+      // Silence is only correct if the bell still arrives by the other road. The recipient's
+      // own heartbeat is what claims a due row -- there is no broker-side push timer -- and it
+      // awaits the whole burst, so the settle, and its ring, are done when this returns.
+      await okAt(PORT_MIX, "/heartbeat", { id: rcpt.id }, rcpt.token);
+      expect(readDoorbell(DB_PATH_MIX, rcpt.id)).toBe(peek.max_id);
+    } finally {
+      boot.kill();
+      await boot.exited;
+    }
+  }, 30_000);
+
   // The reconcile is the only doorbell write that runs without an HTTP request behind it, so it
   // is the only one that can happen in a broker that never serves. ensureBroker() checks /health
   // and then spawns, which is a check-then-act: two sessions racing that gap both spawn, and the

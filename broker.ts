@@ -408,11 +408,17 @@ if (import.meta.main) {
   const countPollOnlyQueued = db.prepare(
     "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivery_state = 'queued' AND push_after IS NULL"
   );
-  // Recipients holding such a row, for the startup reconcile below. A delivery_kind='none'
-  // peer needs no entry it would not already have: its rows never reach 'delivering' (see
-  // ringDoorbellAfterSettle), so a ring was never withheld from it and its marker is current.
-  const selectPollOnlyRecipients = db.prepare(
-    "SELECT DISTINCT to_id FROM messages WHERE delivery_state = 'queued' AND push_after IS NULL"
+  // Every recipient holding queued mail, for the startup reconcile below, which decides one
+  // by one which of them still needs a bell. Selecting the poll-only rows here instead asked
+  // half the question: isPollOnly is (push_after === null) OR (the target is not pushable),
+  // and push_after is set from urgency alone at insert, never from the target -- so a peer
+  // this host cannot push to holds normal and interrupt rows with a push_after on them, and
+  // "push_after IS NULL" cannot see the one backlog nothing will ever push.
+  const countPushableQueued = db.prepare(
+    "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivery_state = 'queued' AND push_after IS NOT NULL"
+  );
+  const selectQueuedRecipients = db.prepare(
+    "SELECT DISTINCT to_id FROM messages WHERE delivery_state = 'queued'"
   );
 
   // In-memory delivery guards (this process only). Declared up here, before
@@ -1332,7 +1338,19 @@ if (import.meta.main) {
   // ("10" over "9" leaves "90"; O_TRUNC lands at open, not at write). Bun.serve throws on a taken
   // port and nothing catches it, so past this line the loser is gone and the clamp has the single
   // writer it needs. Anything ringing before this line reopens that race.
-  for (const r of selectPollOnlyRecipients.all() as { to_id: string }[]) {
+  // Ring exactly where no future settle will. A recipient with a row still to be pushed gets
+  // its bell from that push's own withDeliveryBurst, which fires as the last driver leaves and
+  // so cannot land on mail the poll's prefix has not reached yet. Ringing here as well would
+  // spend the counter's one advance before the heartbeat claims that older row: the woken
+  // session polls, stops at the in-flight head, gets nothing, and re-arms at the same value the
+  // settle then rewrites -- no advance, no second wake, and the poll-only row behind it strands
+  // until unrelated mail rings. That is the strand the burst scope exists to prevent, and this
+  // is the one ring path that does not go through it. ringDoorbellAfterSettle's own guard
+  // cannot stand in for this test: resetDeliveringOnStart has just requeued every lease, so the
+  // guard sees zero delivering rows and is blind to the push that is one heartbeat away.
+  for (const r of selectQueuedRecipients.all() as { to_id: string }[]) {
+    if (isPushableTarget(peerDelivery(r.to_id))
+      && (countPushableQueued.get(r.to_id) as { n: number }).n > 0) continue;
     ringDoorbellAfterSettle(r.to_id);
   }
 }
