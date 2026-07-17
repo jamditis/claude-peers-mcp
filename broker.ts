@@ -513,8 +513,10 @@ if (import.meta.main) {
     // pane whose send-keys keeps failing holds this guard closed on every heartbeat and the
     // poll-only mail behind it is never announced (issue #70, pinned by a test). That mail is
     // still readable and its check_messages still drains it; the near-real-time wake is the loss.
-    // Ringing anyway is not the fix -- it strands the row outright, per the reason above -- so
-    // #70 has to change what a failed push IS, not what this asks.
+    // Ringing anyway is no fix for a max-pending-id marker: it strands the row, per the reason
+    // above. That reason is the clamp refusing a repeat, though, not the push failing, and only a
+    // marker whose value can revisit a number produces a repeat to refuse. Whether #70 is fixed in
+    // the push path or in what the marker counts is open (#70).
     //
     // Past this test, every pending row is one a poll releases now and nothing will intervene:
     // no lease is open, and none is coming. That is the marker's whole promise, so asking
