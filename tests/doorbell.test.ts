@@ -5,11 +5,13 @@
 // id; a send to a tmux recipient writes no marker (it already gets an active push); /peek
 // reports the backlog without consuming it; and /peek is token-gated to the caller's id.
 
+import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe as bunDescribe, expect, it } from "bun:test";
 import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { doorbellPath, readDoorbell, writeDoorbell } from "../shared/notify.ts";
+import { PROTOCOL_VERSION } from "../shared/types.ts";
 
 // #22: this suite spins up a real broker with a shell-based `tmux` stub (shebang +
 // `chmodSync` executable bit), which native Windows cannot exec. Gate it behind a
@@ -19,26 +21,46 @@ import { doorbellPath, readDoorbell, writeDoorbell } from "../shared/notify.ts";
 const describe = bunDescribe.skipIf(process.platform === "win32");
 
 const PORT = 17940;
+// The pane the tmux stub deliberately stalls on, so a delivery lease is genuinely open while a
+// second send lands. Any pane not equal to this one returns instantly.
+const SLOW_PANE = "%77";
+// A pane whose send-keys always exits non-zero: deliverViaTmux returns false, so deliverNext
+// requeues the row with its push_after intact and retries on every later heartbeat. This is the
+// pane that never recovers -- the case the push-delay bound does not cover.
+const FAIL_PANE = "%78";
 const work = mkdtempSync(join(tmpdir(), "doorbell-it-"));
 const DB_PATH = join(work, "broker.db");
 const CONFIG_PATH = join(work, "config.json");
 let proc: any;
 
-async function call(path: string, body: unknown, token?: string) {
+// A second broker for the drain-race suite below. Those cases need a pushable row that is
+// push-due but not yet claimed at the instant a poll-only row lands, and the 2-minute default
+// push_delay_ms cannot stage that inside a test. Its own port and db keep the shortened delay
+// off the suites above, whose timing assertions assume the default.
+const PORT_DRAIN = 17941;
+const DB_PATH_DRAIN = join(work, "drain.db");
+const CONFIG_PATH_DRAIN = join(work, "drain-config.json");
+const PUSH_DELAY_MS = 400;
+let drainProc: any;
+
+async function callAt(port: number, path: string, body: unknown, token?: string) {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (token) headers.Authorization = `Bearer ${token}`;
-  return fetch(`http://127.0.0.1:${PORT}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
+  return fetch(`http://127.0.0.1:${port}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
 }
-async function ok(path: string, body: unknown, token?: string) {
-  const res = await call(path, body, token);
+async function okAt(port: number, path: string, body: unknown, token?: string) {
+  const res = await callAt(port, path, body, token);
   if (!res.ok) throw new Error(`${path} -> ${res.status} ${await res.text()}`);
   return res.json() as any;
 }
+const call = (path: string, body: unknown, token?: string) => callAt(PORT, path, body, token);
+const ok = (path: string, body: unknown, token?: string) => okAt(PORT, path, body, token);
+
 // A recipient must be a LIVE pid (sends check recipient liveness), so it uses this process's
 // pid. A same-pid re-register supersedes the prior row, so only one live recipient exists at a
 // time — fine, since each test uses its own and never references a prior test's recipient.
-function regRcpt(overrides: Record<string, unknown> = {}) {
-  return ok("/register", {
+function regRcpt(overrides: Record<string, unknown> = {}, port = PORT) {
+  return okAt(port, "/register", {
     pid: process.pid, cwd: "/tmp/db", git_root: null, tty: null, summary: "",
     machine: "db-a", tailscale_ip: "127.0.0.1", tmux_pane: null, tmux_socket: null, ...overrides,
   });
@@ -46,11 +68,38 @@ function regRcpt(overrides: Record<string, unknown> = {}) {
 // A sender is never a delivery target and its liveness is never probed, so it can use a unique
 // fake pid — which also keeps it from superseding the live recipient's same-pid row.
 let fakePid = 900_000;
-function regSender(overrides: Record<string, unknown> = {}) {
-  return ok("/register", {
+function regSender(overrides: Record<string, unknown> = {}, port = PORT) {
+  return okAt(port, "/register", {
     pid: ++fakePid, cwd: "/tmp/db-s", git_root: null, tty: null, summary: "",
     machine: "db-a", tailscale_ip: "127.0.0.1", tmux_pane: null, tmux_socket: null, ...overrides,
   });
+}
+
+async function waitForHealth(port: number, timeoutMs = 8000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) return true; } catch {}
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return false;
+}
+
+// Wait for a specific row to reach a delivery_state, rather than sleeping and hoping. A fixed
+// sleep pins the tmux stub's wall-clock timing instead of the invariant under test, and a race
+// that silently failed to set up would pass for the wrong reason — so this throws instead.
+async function waitForRowState(dbPath: string, rowId: number, state: string, timeoutMs = 8000) {
+  const probe = new Database(dbPath, { readonly: true });
+  try {
+    const q = probe.query("SELECT delivery_state AS s FROM messages WHERE id = ?");
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if ((q.get(rowId) as { s: string } | null)?.s === state) return;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error(`row ${rowId} never reached '${state}' within ${timeoutMs}ms; the race never set up`);
+  } finally {
+    probe.close();
+  }
 }
 
 beforeAll(async () => {
@@ -61,8 +110,22 @@ beforeAll(async () => {
   if (process.platform === "win32") return;
   // Stub tmux: reports a version (so the broker sees tmux available and a %pane registers as
   // 'tmux'), records argv, exits 0 — enough for a tmux recipient to take the push path.
+  // A send-keys to SLOW_PANE sleeps, holding the delivery lease open long enough for a second
+  // send to land mid-push. Only the lease-race tests register that pane; every other pane still
+  // returns instantly, so the rest of the suite keeps its old timing.
   const stub = join(work, "tmux");
-  writeFileSync(stub, `#!/usr/bin/env bash\nif [ "$1" = "-V" ]; then echo "tmux 3.4"; exit 0; fi\nexit 0\n`);
+  writeFileSync(stub, `#!/usr/bin/env bash
+if [ "$1" = "-V" ]; then echo "tmux 3.4"; exit 0; fi
+_sk=0; _slow=0; _fail=0
+for _a in "$@"; do
+  [ "$_a" = "send-keys" ] && _sk=1
+  [ "$_a" = "${SLOW_PANE}" ] && _slow=1
+  [ "$_a" = "${FAIL_PANE}" ] && _fail=1
+done
+[ "$_sk" = 1 ] && [ "$_slow" = 1 ] && sleep 1
+[ "$_sk" = 1 ] && [ "$_fail" = 1 ] && exit 1
+exit 0
+`);
   chmodSync(stub, 0o755);
   writeFileSync(CONFIG_PATH, JSON.stringify({
     machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT,
@@ -72,14 +135,28 @@ beforeAll(async () => {
     env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH, PATH: `${work}:${process.env.PATH}` },
     stdout: "ignore", stderr: "ignore",
   });
-  for (let i = 0; i < 20; i++) {
-    try { if ((await fetch(`http://127.0.0.1:${PORT}/health`)).ok) break; } catch {}
-    await new Promise((r) => setTimeout(r, 300));
-  }
+  writeFileSync(CONFIG_PATH_DRAIN, JSON.stringify({
+    machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_DRAIN,
+    id_prefix: "dbd", siblings: [], allowed_ips: ["127.0.0.1"], db_path: DB_PATH_DRAIN,
+    push_delay_ms: PUSH_DELAY_MS,
+  }));
+  drainProc = Bun.spawn(["bun", "broker.ts"], {
+    env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH_DRAIN, PATH: `${work}:${process.env.PATH}` },
+    stdout: "ignore", stderr: "ignore",
+  });
+  await waitForHealth(PORT);
+  await waitForHealth(PORT_DRAIN);
 });
 
-afterAll(() => {
+afterAll(async () => {
+  // Await the exits, don't just signal them. kill() is a SIGTERM, and the broker's handler runs
+  // retire(): it keeps serving on its fixed port while it drains, answering /health but refusing
+  // /register with 503. Returning here without waiting leaves that window open across a
+  // back-to-back run, whose health probe then passes against the PREVIOUS run's dying broker and
+  // whose first register gets the 503.
   proc?.kill();
+  drainProc?.kill();
+  await Promise.all([proc?.exited, drainProc?.exited]);
   try { rmSync(work, { recursive: true, force: true }); } catch {}
 });
 
@@ -114,6 +191,670 @@ describe("doorbell marker", () => {
     expect(send.delivery).toBe("accepted");
     expect(existsSync(doorbellPath(DB_PATH, rcpt.id) as string)).toBe(false);
   });
+});
+
+// The doorbell's question is "will anything ever push this row to this recipient?", and there
+// are two independent reasons the answer is no. Neither test sees the other's case:
+//   - not push-eligible: deliverNext bails at !isPushableTarget, whatever push_after holds
+//     (no pane, or no tmux backend on this host).
+//   - outside the push channel: nextDeliverable filters `push_after IS NOT NULL`, whatever
+//     the pane holds (an fyi, or a forward floored by floor_remote_forwards).
+// handleForwardMessage already computes exactly that union to report `poll_only` to the
+// sending broker; ringDoorbell asked a narrower question and disagreed with it about the
+// same row. These lock the two conditions apart so neither can be dropped for the other.
+describe("doorbell covers every row that will never be pushed", () => {
+  it("rings for a floored remote forward to a tmux recipient", async () => {
+    // Written from a live failure, 2026-07-16: a normal-urgency forward from a peer on another
+    // machine landed with push_after NULL and sat unseen, its doorbell dir empty. The recipient
+    // HAD a pane, so the old delivery_kind check skipped the bell; floor_remote_forwards set
+    // push_after NULL, so nextDeliverable skipped the push. Mail with neither.
+    const rcpt = await regRcpt({ cwd: "/tmp/fwd-tmux", tmux_pane: "%20" });
+    const res = await ok("/forward-message", {
+      protocol_version: PROTOCOL_VERSION, from_id: "remote-peer-x", to_id: rcpt.id,
+      text: "from another machine", from_machine: "db-b", urgency: "normal",
+    });
+    expect(res.ok).toBe(true);
+    expect(res.poll_only).toBe(true); // the broker's own verdict: nothing here will push
+
+    const peek = await ok("/peek", { id: rcpt.id }, rcpt.token);
+    expect(peek.count).toBe(1);
+    expect(readDoorbell(DB_PATH, rcpt.id)).toBe(peek.max_id);
+  });
+
+  it("rings for an fyi to a tmux recipient (poll-only, so the bell is its only signal)", async () => {
+    // pushAfterFor('fyi') is NULL, so the row sits outside the push channel exactly like a
+    // floored forward. A session that armed a watcher opted into hearing about poll-only mail.
+    const rcpt = await regRcpt({ cwd: "/tmp/fyi-tmux", tmux_pane: "%21" });
+    const sender = await regSender({ cwd: "/tmp/fyi-tmux-s" });
+    await ok("/send-message", { from_id: sender.id, to_id: rcpt.id, text: "no rush", urgency: "fyi" }, sender.token);
+    const peek = await ok("/peek", { id: rcpt.id }, rcpt.token);
+    expect(readDoorbell(DB_PATH, rcpt.id)).toBe(peek.max_id);
+  });
+
+  it("still rings for a none recipient whose row IS push-due", async () => {
+    // The regression guard. pushAfterFor('interrupt') returns now, NOT null, so a fix written
+    // as `push_after === null` alone would silently stop ringing for the very sessions the
+    // doorbell was built for (#49) — they have no pane, so push_after is meaningless to them.
+    const rcpt = await regRcpt({ cwd: "/tmp/none-interrupt" });
+    const sender = await regSender({ cwd: "/tmp/none-interrupt-s" });
+    await ok("/send-message", { from_id: sender.id, to_id: rcpt.id, text: "urgent", urgency: "interrupt" }, sender.token);
+    const peek = await ok("/peek", { id: rcpt.id }, rcpt.token);
+    expect(peek.max_id).toBeGreaterThan(0);
+    expect(readDoorbell(DB_PATH, rcpt.id)).toBe(peek.max_id);
+  });
+
+  it("does not ring for a tmux recipient whose row is only delayed", async () => {
+    // The other half of the guard: `normal` sets push_after = now + push_delay_ms. Non-NULL
+    // and the peer is push-eligible, so the row IS in the channel and the flush will carry it.
+    // Ringing here would wake a session that is already going to be interrupted.
+    const rcpt = await regRcpt({ cwd: "/tmp/tmux-normal", tmux_pane: "%22" });
+    const sender = await regSender({ cwd: "/tmp/tmux-normal-s" });
+    await ok("/send-message", { from_id: sender.id, to_id: rcpt.id, text: "later", urgency: "normal" }, sender.token);
+    expect(existsSync(doorbellPath(DB_PATH, rcpt.id) as string)).toBe(false);
+  });
+});
+
+// The marker means "your mail is readable up to here", not "it exists up to here". A poll
+// releases only the contiguous queued prefix (releasableQueuedPrefix), stopping at an in-flight
+// head to preserve ordering, so a ring during an open lease announces mail the woken session
+// cannot yet read. It polls, gets nothing, re-arms at the new value, and — since a poll-only row
+// is never pushed and nothing writes the marker again — the row strands until unrelated mail
+// happens to ring. These two hold the withhold and the re-ring together: drop either half and a
+// poll-only row that lands mid-push is silently lost.
+//
+// Only a tmux recipient can reach this. A delivery_kind='none' peer never has a row in
+// 'delivering' at all (deliverNext bails at !isPushableTarget), so its poll always drains.
+describe("a ring is withheld until the mail it announces is readable", () => {
+  // Wait for the lease to actually exist rather than sleeping and hoping. A fixed sleep pins
+  // the stub's wall-clock timing, not the invariant: on a slow box the fyi lands before
+  // claimForDelivery, the race is never set up, and the test fails against correct code.
+  // Read-only, and it throws rather than proceeding if the lease never appears — a race that
+  // silently failed to happen would make these tests pass for the wrong reason.
+  const waitForLease = async (toId: string, timeoutMs = 5000) => {
+    const probe = new Database(DB_PATH, { readonly: true });
+    try {
+      const q = probe.query(
+        "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivery_state = 'delivering'");
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if ((q.get(toId) as { n: number }).n > 0) return;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      throw new Error(`no delivering row for ${toId} within ${timeoutMs}ms; the race never set up`);
+    } finally {
+      probe.close();
+    }
+  };
+
+  const raceSetup = async (tag: string) => {
+    const rcpt = await regRcpt({ cwd: `/tmp/${tag}`, tmux_pane: SLOW_PANE });
+    const sender = await regSender({ cwd: `/tmp/${tag}-s` });
+    // Not awaited: the stub stalls send-keys for ~1s, so this call is still in flight — and its
+    // lease still open — while the fyi below lands.
+    const push = ok("/send-message",
+      { from_id: sender.id, to_id: rcpt.id, text: "slow push", urgency: "interrupt" }, sender.token);
+    await waitForLease(rcpt.id);
+    await ok("/send-message",
+      { from_id: sender.id, to_id: rcpt.id, text: "fyi mid-push", urgency: "fyi" }, sender.token);
+    return { rcpt, push };
+  };
+
+  it("does not ring while an older row is mid-push", async () => {
+    const { rcpt, push } = await raceSetup("race-hold");
+    // The fyi is poll-only, so nothing will ever push it — but the poll cannot release it yet
+    // either. Ringing now would spend the counter's only advance on unreadable mail.
+    expect(existsSync(doorbellPath(DB_PATH, rcpt.id) as string)).toBe(false);
+    await push;
+  });
+
+  it("rings once the lease settles, so the withheld row is not stranded", async () => {
+    const { rcpt, push } = await raceSetup("race-settle");
+    await push; // lease resolves; the queued prefix is releasable again
+    const peek = await ok("/peek", { id: rcpt.id }, rcpt.token);
+    expect(peek.count).toBe(1); // the pushed row is delivered; only the fyi is still pending
+    expect(readDoorbell(DB_PATH, rcpt.id)).toBe(peek.max_id);
+  });
+});
+
+// The withhold above only asks "is a lease open right now?", and that answer goes stale the
+// instant the caller opens the next one. Both drivers do exactly that: the insert path rings and
+// THEN calls deliverNext, and a settle inside deliverNext's finally rings while the caller's
+// drain loop is still holding older pushable rows to send. Either way the marker is spent at an
+// id the poll cannot reach, the woken session re-arms at that value (cli.ts arms at the marker's
+// current value, not at what it drained), and the later settle rewrites the same max-pending id —
+// no advance, no second wake, and the poll-only row strands until unrelated mail rings.
+//
+// So the bell may only ring when no lease is open AND none is coming: the end of the recipient's
+// whole delivery burst. These pin both drivers.
+describe("a ring waits for the recipient's whole delivery burst, not just one lease", () => {
+  it("does not ring when the send's own deliverNext is about to claim an older due row", async () => {
+    const rcpt = await regRcpt({ cwd: "/tmp/burst-insert", tmux_pane: SLOW_PANE }, PORT_DRAIN);
+    const sender = await regSender({ cwd: "/tmp/burst-insert-s" }, PORT_DRAIN);
+    // A `normal` row is push_after = now + PUSH_DELAY_MS: pushable, so no bell, and not yet due,
+    // so deliverNext leaves it queued and claims no lease.
+    await okAt(PORT_DRAIN, "/send-message",
+      { from_id: sender.id, to_id: rcpt.id, text: "delayed", urgency: "normal" }, sender.token);
+    const older = (await okAt(PORT_DRAIN, "/peek", { id: rcpt.id }, rcpt.token)).max_id;
+    expect(existsSync(doorbellPath(DB_PATH_DRAIN, rcpt.id) as string)).toBe(false);
+    await new Promise((r) => setTimeout(r, PUSH_DELAY_MS + 200)); // the older row is now push-due
+
+    // The fyi lands with no lease open, so the insert-time bell sees a clear queue — but this
+    // very request's deliverNext claims the older due row next, retracting the readability the
+    // bell just announced. Not awaited: the stub stalls that push, so the sample below lands
+    // inside the window.
+    const fyi = okAt(PORT_DRAIN, "/send-message",
+      { from_id: sender.id, to_id: rcpt.id, text: "fyi", urgency: "fyi" }, sender.token);
+    await waitForRowState(DB_PATH_DRAIN, older, "delivering");
+    expect(existsSync(doorbellPath(DB_PATH_DRAIN, rcpt.id) as string)).toBe(false);
+
+    await fyi;
+    const peek = await okAt(PORT_DRAIN, "/peek", { id: rcpt.id }, rcpt.token);
+    expect(peek.count).toBe(1); // the pushed row is delivered; only the fyi is still pending
+    expect(readDoorbell(DB_PATH_DRAIN, rcpt.id)).toBe(peek.max_id);
+  }, 20_000);
+
+  it("does not ring while the drain still has an older pushable row to send", async () => {
+    const rcpt = await regRcpt({ cwd: "/tmp/burst-drain", tmux_pane: SLOW_PANE }, PORT_DRAIN);
+    const sender = await regSender({ cwd: "/tmp/burst-drain-s" }, PORT_DRAIN);
+    // Two delayed pushable rows: neither is claimed on insert, so the drain below has more than
+    // one lease to take — the case a single settle cannot see the end of.
+    await okAt(PORT_DRAIN, "/send-message",
+      { from_id: sender.id, to_id: rcpt.id, text: "one", urgency: "normal" }, sender.token);
+    const first = (await okAt(PORT_DRAIN, "/peek", { id: rcpt.id }, rcpt.token)).max_id;
+    await okAt(PORT_DRAIN, "/send-message",
+      { from_id: sender.id, to_id: rcpt.id, text: "two", urgency: "normal" }, sender.token);
+    const second = (await okAt(PORT_DRAIN, "/peek", { id: rcpt.id }, rcpt.token)).max_id;
+    await new Promise((r) => setTimeout(r, PUSH_DELAY_MS + 200)); // both are now push-due
+
+    // An interrupt starts the burst: its own row rings nothing (it is pushable), and its
+    // deliverNext takes the head-of-line lease, so the fyi below is withheld for the right
+    // reason — leaving only the settle-side driver under test.
+    const push = okAt(PORT_DRAIN, "/send-message",
+      { from_id: sender.id, to_id: rcpt.id, text: "now", urgency: "interrupt" }, sender.token);
+    await waitForRowState(DB_PATH_DRAIN, first, "delivering");
+    await okAt(PORT_DRAIN, "/send-message",
+      { from_id: sender.id, to_id: rcpt.id, text: "fyi mid-drain", urgency: "fyi" }, sender.token);
+
+    // The first lease settles here, but the drain claims `second` immediately after. Ringing on
+    // that settle spends the counter on mail the next claim makes unreadable again.
+    await waitForRowState(DB_PATH_DRAIN, second, "delivering");
+    expect(existsSync(doorbellPath(DB_PATH_DRAIN, rcpt.id) as string)).toBe(false);
+
+    await push;
+    const peek = await okAt(PORT_DRAIN, "/peek", { id: rcpt.id }, rcpt.token);
+    expect(peek.count).toBe(1); // all three pushable rows delivered; only the fyi is pending
+    expect(readDoorbell(DB_PATH_DRAIN, rcpt.id)).toBe(peek.max_id);
+  }, 30_000);
+
+  // Every case above rings at the recipient's max pending id, and that id does not only climb: a
+  // burst that delivers a LATER pushable row while an EARLIER poll-only row waits leaves a
+  // smaller max pending id behind than there was before it. Ringing the higher id and then the
+  // lower one walks the marker backwards, under a watcher already armed at the higher one, which
+  // can then never fire. writeDoorbell's clamp refuses the decrease, but a broker that needs the
+  // clamp to stay correct is one input away from a marker that means nothing.
+  //
+  // It never gets there. A pushable row is exactly what the bell withholds for, so the higher id
+  // is never announced in the first place, and the only value this recipient's marker can take is
+  // its max queued POLL-ONLY id, which does only climb, since nothing but a poll retires those
+  // rows and every new row outranks them. The backwards step is unreachable rather than caught.
+  it("never announces a pushable row, so the marker cannot fall back when it is delivered", async () => {
+    const rcpt = await regRcpt({ cwd: "/tmp/burst-mixed", tmux_pane: "%12" }, PORT_DRAIN);
+    const sender = await regSender({ cwd: "/tmp/burst-mixed-s" }, PORT_DRAIN);
+    // Nothing ever pushes an fyi, so it rings and then waits for a check_messages.
+    await okAt(PORT_DRAIN, "/send-message",
+      { from_id: sender.id, to_id: rcpt.id, text: "fyi", urgency: "fyi" }, sender.token);
+    const fyiId = (await okAt(PORT_DRAIN, "/peek", { id: rcpt.id }, rcpt.token)).max_id;
+    expect(readDoorbell(DB_PATH_DRAIN, rcpt.id)).toBe(fyiId);
+
+    // A later `normal` row is pushable but not yet due, so this send delivers nothing and its
+    // settle is free to ring. It must not: the row it would announce is one the heartbeat claims
+    // the moment it comes due, and the marker is the only wake the fyi behind it has.
+    await okAt(PORT_DRAIN, "/send-message",
+      { from_id: sender.id, to_id: rcpt.id, text: "delayed", urgency: "normal" }, sender.token);
+    const normalId = (await okAt(PORT_DRAIN, "/peek", { id: rcpt.id }, rcpt.token)).max_id;
+    expect(normalId).toBeGreaterThan(fyiId);
+    const armed = readDoorbell(DB_PATH_DRAIN, rcpt.id);
+    expect(armed).toBe(fyiId); // withheld at the poll-only id, not advanced to the pushable one
+
+    // The row comes due and a heartbeat drains it, so the fyi is all that is left pending.
+    await new Promise((r) => setTimeout(r, PUSH_DELAY_MS + 200));
+    await okAt(PORT_DRAIN, "/heartbeat", { id: rcpt.id }, rcpt.token);
+
+    const peek = await okAt(PORT_DRAIN, "/peek", { id: rcpt.id }, rcpt.token);
+    expect(peek.count).toBe(1);      // the pushed row is delivered
+    expect(peek.max_id).toBe(fyiId); // and max pending id really has fallen back to the fyi
+    // Which is the id the marker already held, so this settle rewrites the same value and the
+    // clamp refuses the repeat. Nothing to fall back from, and the fyi is still announced.
+    expect(readDoorbell(DB_PATH_DRAIN, rcpt.id)).toBe(armed);
+  }, 20_000);
+});
+
+// Counting the drivers answers "is a lease open, or coming from this burst?", and a queued row
+// whose push_after is still in the future answers no to both without opening anything: no driver
+// holds it, so driver-counting alone would end the burst and ring. It must not ring. The marker's
+// promise is about what a poll WILL find, not what one would have found at the instant it was
+// written, and the next heartbeat claims that row the moment it comes due -- so a row this host
+// has not claimed yet, but will, already counts as a lease. That is the shape the startup
+// reconcile withholds for, and it reaches the live path by the same road. The last test here pins
+// where that reasoning runs out: a push that fails to land IS claimed, every attempt, and released
+// again each time. It is forever about to be claimed and never leaves the queue, so the guard it
+// holds shut never opens (issue #70).
+describe("a ring waits for a push that is coming later, not just one already in flight", () => {
+  const PORT_HOLD = 17947;
+  const DB_PATH_HOLD = join(work, "hold.db");
+  const CONFIG_PATH_HOLD = join(work, "hold-config.json");
+
+  it("stays silent while a push that will block the poll is still queued", async () => {
+    writeFileSync(CONFIG_PATH_HOLD, JSON.stringify({
+      machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_HOLD,
+      id_prefix: "dbh", siblings: [], allowed_ips: ["127.0.0.1"], db_path: DB_PATH_HOLD,
+      push_delay_ms: 600_000,
+    }));
+    const held = Bun.spawn(["bun", "broker.ts"], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH_HOLD, PATH: `${work}:${process.env.PATH}` },
+      stdout: "ignore", stderr: "ignore",
+    });
+    try {
+      expect(await waitForHealth(PORT_HOLD)).toBe(true);
+      const rcpt = await regRcpt({ cwd: "/tmp/hold", tmux_pane: SLOW_PANE }, PORT_HOLD);
+      const sender = await regSender({ cwd: "/tmp/hold-s" }, PORT_HOLD);
+      await okAt(PORT_HOLD, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "not due for ten minutes", urgency: "normal" }, sender.token);
+      await okAt(PORT_HOLD, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "poll only", urgency: "fyi" }, sender.token);
+      const peek = await okAt(PORT_HOLD, "/peek", { id: rcpt.id }, rcpt.token);
+      expect(peek.count).toBe(2);
+
+      // Both rows are queued, so a poll at this instant would release them and the marker would
+      // read true. The next instant is what breaks it: the push comes due, a heartbeat claims it,
+      // and the poll this very bell triggered stops at the now-delivering head and returns
+      // nothing. The woken session re-arms at this same marker, the settle rewrites the same max
+      // id, writeDoorbell clamps the repeat, and the fyi row strands until unrelated mail rings.
+      expect(existsSync(doorbellPath(DB_PATH_HOLD, rcpt.id) as string)).toBe(false);
+
+      // Silence is only correct because the bell arrives by the other road once the push lands,
+      // rather than whenever someone happens to write next. This pane accepts the send, so the row
+      // leaves the queue and the guard opens; the test below covers the pane that never does.
+      const rw = new Database(DB_PATH_HOLD);
+      rw.run("UPDATE messages SET push_after = ? WHERE to_id = ? AND push_after IS NOT NULL",
+        [Date.now() - 1000, rcpt.id]);
+      rw.close();
+      await okAt(PORT_HOLD, "/heartbeat", { id: rcpt.id }, rcpt.token);
+      expect(readDoorbell(DB_PATH_HOLD, rcpt.id)).toBe(peek.max_id);
+    } finally {
+      held.kill();
+      await held.exited;
+    }
+  }, 20_000);
+
+  const PORT_FAIL = 17948;
+  const DB_PATH_FAIL = join(work, "fail.db");
+  const CONFIG_PATH_FAIL = join(work, "fail-config.json");
+
+  // Pins the known gap in issue #70 rather than the behaviour we want: poll-only mail behind a
+  // push that keeps failing is readable but never announced. The withhold below is still the right
+  // call at this layer -- ringing anyway strands the row, for the reason the previous test pins --
+  // so closing #70 means changing what a failed push IS, not what the bell asks. When it closes,
+  // this test flips to expect(readDoorbell(...)).toBe(peek.max_id) and this comment goes.
+  it("does not ring poll-only mail behind a push that keeps failing (gap, issue #70)", async () => {
+    writeFileSync(CONFIG_PATH_FAIL, JSON.stringify({
+      machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_FAIL,
+      id_prefix: "dbf", siblings: [], allowed_ips: ["127.0.0.1"], db_path: DB_PATH_FAIL,
+      push_delay_ms: 0,
+    }));
+    const failing = Bun.spawn(["bun", "broker.ts"], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH_FAIL, PATH: `${work}:${process.env.PATH}` },
+      stdout: "ignore", stderr: "ignore",
+    });
+    try {
+      expect(await waitForHealth(PORT_FAIL)).toBe(true);
+      const rcpt = await regRcpt({ cwd: "/tmp/fail", tmux_pane: FAIL_PANE }, PORT_FAIL);
+      const sender = await regSender({ cwd: "/tmp/fail-s" }, PORT_FAIL);
+
+      // Due immediately (push_delay_ms 0), so the send's own deliverNext attempts the push now.
+      // send-keys exits 1, so deliverViaTmux returns false and the row goes back to 'queued' with
+      // push_after untouched: pushable forever, delivered never.
+      await okAt(PORT_FAIL, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "push that cannot land", urgency: "normal" }, sender.token);
+      await okAt(PORT_FAIL, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "poll only", urgency: "fyi" }, sender.token);
+
+      const peek = await okAt(PORT_FAIL, "/peek", { id: rcpt.id }, rcpt.token);
+      expect(peek.count).toBe(2);
+      const probe = new Database(DB_PATH_FAIL);
+      const states = probe.query(
+        "SELECT delivery_state, push_after FROM messages WHERE to_id = ? ORDER BY id",
+      ).all(rcpt.id) as { delivery_state: string; push_after: number | null }[];
+      probe.close();
+      // Both rows sit queued between attempts, so a poll right now would release the pair.
+      expect(states.map((s) => s.delivery_state)).toEqual(["queued", "queued"]);
+      expect(states[0]?.push_after).not.toBeNull();  // the failed push is still pushable
+
+      // Retrying changes nothing: every heartbeat re-attempts, re-fails, and re-queues.
+      await okAt(PORT_FAIL, "/heartbeat", { id: rcpt.id }, rcpt.token);
+      await okAt(PORT_FAIL, "/heartbeat", { id: rcpt.id }, rcpt.token);
+
+      // No marker at all, though a poll right now would hand over both rows. The push delay has
+      // long since lapsed, so there is no wait left to bound: the silence rests on the push
+      // leaving the queue, and a send-keys that always fails never lets it. The fyi still reaches
+      // the recipient through its own check_messages; the near-real-time wake is what is lost.
+      expect(readDoorbell(DB_PATH_FAIL, rcpt.id, -1)).toBe(-1);
+    } finally {
+      failing.kill();
+      await failing.exited;
+    }
+  }, 20_000);
+});
+
+// The reconcile runs at startup, so everything it reaches must already be initialized. It calls
+// ringDoorbellAfterSettle -> isPushableTarget -> tmuxAvailable, and tmuxAvailable closes over a
+// `let` declared further down the module: reading it from a startup statement is a temporal dead
+// zone throw, and the broker dies before it ever listens. Only a tmux recipient reaches it —
+// isPushableTarget short-circuits on kind !== 'tmux' — which is exactly the backlog shape this
+// reconcile exists to repair.
+describe("startup reconcile over a persisted poll-only backlog", () => {
+  it("starts, and rings, when a tmux recipient already holds a queued poll-only row", async () => {
+    const PORT_BOOT = 17942;
+    const DB_PATH_BOOT = join(work, "boot.db");
+    const CONFIG_PATH_BOOT = join(work, "boot-config.json");
+    writeFileSync(CONFIG_PATH_BOOT, JSON.stringify({
+      machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_BOOT,
+      id_prefix: "dbb", siblings: [], allowed_ips: ["127.0.0.1"], db_path: DB_PATH_BOOT,
+    }));
+    const spawnBroker = () => Bun.spawn(["bun", "broker.ts"], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH_BOOT, PATH: `${work}:${process.env.PATH}` },
+      stdout: "ignore", stderr: "ignore",
+    });
+
+    let boot = spawnBroker();
+    try {
+      expect(await waitForHealth(PORT_BOOT)).toBe(true);
+      const rcpt = await regRcpt({ cwd: "/tmp/boot-tmux", tmux_pane: "%30" }, PORT_BOOT);
+      const sender = await regSender({ cwd: "/tmp/boot-tmux-s" }, PORT_BOOT);
+      await okAt(PORT_BOOT, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "fyi", urgency: "fyi" }, sender.token);
+      const peek = await okAt(PORT_BOOT, "/peek", { id: rcpt.id }, rcpt.token);
+      expect(peek.count).toBe(1);
+
+      boot.kill();
+      await boot.exited;
+      // Drop the marker the live broker wrote, so what the restart reports is the reconcile's own
+      // work and not a leftover file.
+      rmSync(doorbellPath(DB_PATH_BOOT, rcpt.id) as string, { force: true });
+
+      boot = spawnBroker();
+      expect(await waitForHealth(PORT_BOOT)).toBe(true);
+      expect(readDoorbell(DB_PATH_BOOT, rcpt.id)).toBe(peek.max_id);
+    } finally {
+      boot.kill();
+      await boot.exited; // same fixed-port handover as afterAll: drain before the next run binds
+    }
+  }, 30_000);
+
+  // push_after is computed from urgency alone at insert and never from the target, so a peer
+  // this host cannot push to still gets a push_after on a normal or interrupt row. Nothing will
+  // ever push it: isPollOnly reads (push_after === null) OR (target not pushable), and only the
+  // second disjunct is true here. A reconcile keyed on "push_after IS NULL" asks the first and
+  // so cannot see this backlog at all.
+  it("rings for a none recipient whose queued row carries a push_after", async () => {
+    const PORT_NONE = 17944;
+    const DB_PATH_NONE = join(work, "none-boot.db");
+    const CONFIG_PATH_NONE = join(work, "none-boot-config.json");
+    writeFileSync(CONFIG_PATH_NONE, JSON.stringify({
+      machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_NONE,
+      id_prefix: "dbn", siblings: [], allowed_ips: ["127.0.0.1"], db_path: DB_PATH_NONE,
+    }));
+    const spawnBroker = () => Bun.spawn(["bun", "broker.ts"], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH_NONE, PATH: `${work}:${process.env.PATH}` },
+      stdout: "ignore", stderr: "ignore",
+    });
+
+    let boot = spawnBroker();
+    try {
+      expect(await waitForHealth(PORT_NONE)).toBe(true);
+      // No pane: delivery_kind 'none', so isPushableTarget is false for every row it holds.
+      const rcpt = await regRcpt({ cwd: "/tmp/boot-none", tmux_pane: null }, PORT_NONE);
+      const sender = await regSender({ cwd: "/tmp/boot-none-s" }, PORT_NONE);
+      await okAt(PORT_NONE, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "normal", urgency: "normal" }, sender.token);
+      const peek = await okAt(PORT_NONE, "/peek", { id: rcpt.id }, rcpt.token);
+      expect(peek.count).toBe(1);
+
+      const probe = new Database(DB_PATH_NONE, { readonly: true });
+      const row = probe.query(
+        "SELECT push_after FROM messages WHERE to_id = ? ORDER BY id DESC LIMIT 1",
+      ).get(rcpt.id) as { push_after: number | null };
+      probe.close();
+      // The premise: poll-only by target, yet carrying a push_after. If this ever goes null the
+      // test below passes for a reason that has nothing to do with the reconcile.
+      expect(row.push_after).not.toBeNull();
+
+      boot.kill();
+      await boot.exited;
+      // writeDoorbell swallows its own IO errors and the marker lives outside the db, so a lost
+      // or unwritten marker is exactly the state the reconcile exists to repair.
+      rmSync(doorbellPath(DB_PATH_NONE, rcpt.id) as string, { force: true });
+
+      boot = spawnBroker();
+      expect(await waitForHealth(PORT_NONE)).toBe(true);
+      expect(readDoorbell(DB_PATH_NONE, rcpt.id)).toBe(peek.max_id);
+    } finally {
+      boot.kill();
+      await boot.exited;
+    }
+  }, 30_000);
+
+  // The other half: a recipient whose backlog still has a push coming must NOT be rung here.
+  // resetDeliveringOnStart requeues every lease before this runs, so ringDoorbellAfterSettle's
+  // own "is anything delivering?" guard sees zero and cannot see the push one heartbeat away.
+  it("stays silent when a push is still coming, and rings once it settles", async () => {
+    const PORT_MIX = 17945;
+    const DB_PATH_MIX = join(work, "mix-boot.db");
+    const CONFIG_PATH_MIX = join(work, "mix-boot-config.json");
+    writeFileSync(CONFIG_PATH_MIX, JSON.stringify({
+      machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_MIX,
+      id_prefix: "dbm", siblings: [], allowed_ips: ["127.0.0.1"], db_path: DB_PATH_MIX,
+      push_delay_ms: 600_000,
+    }));
+    const spawnBroker = () => Bun.spawn(["bun", "broker.ts"], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH_MIX, PATH: `${work}:${process.env.PATH}` },
+      stdout: "ignore", stderr: "ignore",
+    });
+
+    let boot = spawnBroker();
+    try {
+      expect(await waitForHealth(PORT_MIX)).toBe(true);
+      const rcpt = await regRcpt({ cwd: "/tmp/boot-mix", tmux_pane: SLOW_PANE }, PORT_MIX);
+      const sender = await regSender({ cwd: "/tmp/boot-mix-s" }, PORT_MIX);
+      // The long push_delay_ms keeps this queued rather than pushed while the broker is up.
+      await okAt(PORT_MIX, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "pushable", urgency: "normal" }, sender.token);
+      await okAt(PORT_MIX, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "poll only", urgency: "fyi" }, sender.token);
+      const peek = await okAt(PORT_MIX, "/peek", { id: rcpt.id }, rcpt.token);
+      expect(peek.count).toBe(2);
+
+      boot.kill();
+      await boot.exited;
+      rmSync(doorbellPath(DB_PATH_MIX, rcpt.id) as string, { force: true });
+      // A broker down long enough for its delayed rows to come due is the ordinary case; make
+      // the older row due so the restart's heartbeat claims it, without waiting out the delay.
+      const rw = new Database(DB_PATH_MIX);
+      rw.run("UPDATE messages SET push_after = ? WHERE to_id = ? AND push_after IS NOT NULL",
+        [Date.now() - 1000, rcpt.id]);
+      rw.close();
+
+      boot = spawnBroker();
+      // The reconcile is synchronous after the port bind, so a served /health proves it has
+      // already run: no handler, and no heartbeat, can interleave ahead of it.
+      expect(await waitForHealth(PORT_MIX)).toBe(true);
+      expect(existsSync(doorbellPath(DB_PATH_MIX, rcpt.id) as string)).toBe(false);
+
+      // Silence is only correct if the bell still arrives by the other road. The recipient's
+      // own heartbeat is what claims a due row -- there is no broker-side push timer -- and it
+      // awaits the whole burst, so the settle, and its ring, are done when this returns.
+      await okAt(PORT_MIX, "/heartbeat", { id: rcpt.id }, rcpt.token);
+
+      // Assert the push actually happened before reading the marker. The heartbeat's burst rings
+      // from its finally whatever the drain did, so the fyi row alone is enough to produce the
+      // expected marker -- this test would pass on a broker that never claimed the older row at
+      // all, and would then be asserting nothing about the skip it exists to justify.
+      const probe = new Database(DB_PATH_MIX, { readonly: true });
+      const states = probe.query(
+        "SELECT delivery_state, push_after FROM messages WHERE to_id = ? ORDER BY id",
+      ).all(rcpt.id) as { delivery_state: string; push_after: number | null }[];
+      probe.close();
+      expect(states.map((s) => s.delivery_state)).toEqual(["delivered", "queued"]);
+      // The survivor is the poll-only row, not a push. `?.` because noUncheckedIndexedAccess
+      // types an index read as possibly undefined, and the assertion above -- which already
+      // fixes the length at two -- proves nothing tsc can carry down here. A missing row still
+      // fails: toBeNull() rejects undefined.
+      expect(states[1]?.push_after).toBeNull();
+
+      expect(readDoorbell(DB_PATH_MIX, rcpt.id)).toBe(peek.max_id);
+    } finally {
+      boot.kill();
+      await boot.exited;
+    }
+  }, 30_000);
+
+  // The test above makes the pushable row due before restarting. This one leaves it ahead, which
+  // looks like the case the skip gets wrong: nothing claims a row that is not due, so the
+  // poll-only row behind it waits out the push_delay_ms (120s) for a delay it has no part in.
+  //
+  // Silence is still right, and the reason is worth keeping. Ringing here announces the max
+  // pending id, and the marker only grows. Let the older push come due between that ring and the
+  // woken session's poll -- 120s is long, and the ring is what starts the session looking -- and
+  // the poll stops at the now-delivering head, returns nothing, and re-arms at the id just rung.
+  // The settle rings that same id, the clamp refuses it, and the poll-only row is silent until
+  // unrelated mail happens past it. A bounded wait that ends in a correct ring is the better
+  // trade against a strand that does not end.
+  //
+  // This pins the silence so the "obvious" narrowing to push_after <= now cannot come back
+  // without this reasoning being re-read.
+  it("stays silent for a poll-only row behind a push that is not due yet", async () => {
+    const PORT_LATE = 17946;
+    const DB_PATH_LATE = join(work, "late-boot.db");
+    const CONFIG_PATH_LATE = join(work, "late-boot-config.json");
+    writeFileSync(CONFIG_PATH_LATE, JSON.stringify({
+      machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_LATE,
+      id_prefix: "dbl", siblings: [], allowed_ips: ["127.0.0.1"], db_path: DB_PATH_LATE,
+      push_delay_ms: 600_000,
+    }));
+    const spawnBroker = () => Bun.spawn(["bun", "broker.ts"], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH_LATE, PATH: `${work}:${process.env.PATH}` },
+      stdout: "ignore", stderr: "ignore",
+    });
+
+    let boot = spawnBroker();
+    try {
+      expect(await waitForHealth(PORT_LATE)).toBe(true);
+      const rcpt = await regRcpt({ cwd: "/tmp/boot-late", tmux_pane: SLOW_PANE }, PORT_LATE);
+      const sender = await regSender({ cwd: "/tmp/boot-late-s" }, PORT_LATE);
+      await okAt(PORT_LATE, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "not due for ten minutes", urgency: "normal" }, sender.token);
+      await okAt(PORT_LATE, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "poll only", urgency: "fyi" }, sender.token);
+      const peek = await okAt(PORT_LATE, "/peek", { id: rcpt.id }, rcpt.token);
+      expect(peek.count).toBe(2);
+
+      boot.kill();
+      await boot.exited;
+      // The lost marker the reconcile exists to repair. Unlike the test above, push_after is left
+      // where it was: ten minutes out, and the restart cannot claim it.
+      rmSync(doorbellPath(DB_PATH_LATE, rcpt.id) as string, { force: true });
+
+      boot = spawnBroker();
+      expect(await waitForHealth(PORT_LATE)).toBe(true);
+
+      // Prove the push really is still withheld, so this is testing the skip and not a broker
+      // that quietly delivered everything.
+      const probe = new Database(DB_PATH_LATE, { readonly: true });
+      const states = probe.query(
+        "SELECT delivery_state FROM messages WHERE to_id = ? ORDER BY id",
+      ).all(rcpt.id) as { delivery_state: string }[];
+      probe.close();
+      expect(states.map((s) => s.delivery_state)).toEqual(["queued", "queued"]);
+      expect(peek.count).toBe(2);
+
+      // No bell: the push ahead of the poll-only row can still be claimed, and a ring that
+      // cannot be read burns the only signal that would have carried the row.
+      expect(existsSync(doorbellPath(DB_PATH_LATE, rcpt.id) as string)).toBe(false);
+
+      // Silence is only correct if the bell arrives by the other road. Make the push due and
+      // let the recipient's own heartbeat claim it; the settle rings, and the poll-only row is
+      // readable by then because it is the head.
+      const rw = new Database(DB_PATH_LATE);
+      rw.run("UPDATE messages SET push_after = ? WHERE to_id = ? AND push_after IS NOT NULL",
+        [Date.now() - 1000, rcpt.id]);
+      rw.close();
+      await okAt(PORT_LATE, "/heartbeat", { id: rcpt.id }, rcpt.token);
+      expect(readDoorbell(DB_PATH_LATE, rcpt.id)).toBe(peek.max_id);
+    } finally {
+      boot.kill();
+      await boot.exited;
+    }
+  }, 30_000);
+
+  // The reconcile is the only doorbell write that runs without an HTTP request behind it, so it
+  // is the only one that can happen in a broker that never serves. ensureBroker() checks /health
+  // and then spawns, which is a check-then-act: two sessions racing that gap both spawn, and the
+  // loser of the port bind is still a live process with the db open until Bun.serve throws.
+  // writeDoorbell's clamp is a read-then-write, safe only for a single writer -- and two of these
+  // interleaving leave a torn count ("10" over "9" truncates at open, not at write, so the file
+  // reads "90"). Ringing only after the bind is what makes the winner the sole writer, so a
+  // second process cannot exist to interleave with. Verified against Bun: a taken port throws out
+  // of Bun.serve, and nothing catches it here.
+  it("writes no marker when it loses the port bind", async () => {
+    const PORT_LOSER = 17943;
+    const DB_PATH_LOSER = join(work, "loser.db");
+    const CONFIG_PATH_LOSER = join(work, "loser-config.json");
+    writeFileSync(CONFIG_PATH_LOSER, JSON.stringify({
+      machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_LOSER,
+      id_prefix: "dbl", siblings: [], allowed_ips: ["127.0.0.1"], db_path: DB_PATH_LOSER,
+    }));
+    const spawnBroker = () => Bun.spawn(["bun", "broker.ts"], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH_LOSER, PATH: `${work}:${process.env.PATH}` },
+      stdout: "ignore", stderr: "ignore",
+    });
+
+    // Leave a persisted poll-only backlog, which is the one shape the reconcile rings for.
+    const first = spawnBroker();
+    let marker: string;
+    try {
+      expect(await waitForHealth(PORT_LOSER)).toBe(true);
+      const rcpt = await regRcpt({ cwd: "/tmp/loser-tmux", tmux_pane: "%31" }, PORT_LOSER);
+      const sender = await regSender({ cwd: "/tmp/loser-tmux-s" }, PORT_LOSER);
+      await okAt(PORT_LOSER, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "fyi", urgency: "fyi" }, sender.token);
+      expect((await okAt(PORT_LOSER, "/peek", { id: rcpt.id }, rcpt.token)).count).toBe(1);
+      marker = doorbellPath(DB_PATH_LOSER, rcpt.id) as string;
+    } finally {
+      first.kill();
+      await first.exited;
+    }
+    // Drop the marker the live broker wrote. Anything here afterwards was written by the loser.
+    rmSync(marker, { force: true });
+    expect(existsSync(marker)).toBe(false);
+
+    // Hold the port with something that is not a broker, so the losing broker is provably the
+    // only process that could write the marker -- a real broker here could ring on its own.
+    const squatter = Bun.serve({ port: PORT_LOSER, hostname: "0.0.0.0", fetch: () => new Response("squat") });
+    try {
+      const loser = spawnBroker();
+      await loser.exited; // the bind throws, uncaught, so this must terminate on its own
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      squatter.stop(true);
+    }
+  }, 30_000);
 });
 
 describe("/peek (non-consuming read)", () => {

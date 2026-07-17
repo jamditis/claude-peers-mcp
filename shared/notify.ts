@@ -11,8 +11,11 @@
 // That collapses the whole class of "signal arrived while I was mid-consume" races and makes
 // the (coalescing, sometimes-double-firing) fs.watch semantics not matter — a missed event is
 // harmless as long as no state is missed. The counter is the recipient's max pending message
-// id, which is globally AUTOINCREMENT and so strictly increases per recipient over time; the
-// watcher fires whenever it advances past the baseline it armed with.
+// id, clamped by writeDoorbell so it only ever grows; the watcher fires whenever it advances
+// past the baseline it armed with. The clamp is what makes that true, and it is load-bearing:
+// message ids are AUTOINCREMENT, but a max over the PENDING rows is not monotonic on its own,
+// because a row leaving the pending set can lower it. Delivering a later pushable row while an
+// earlier poll-only row still waits does exactly that.
 //
 // Reading the marker is never a consume: check_messages (/poll-messages + markPolled) stays
 // the single path that flips a row to delivered, so the never-ack invariant is unchanged. A
@@ -56,14 +59,27 @@ export function doorbellPath(dbPath: string, id: string): string | null {
  * Broker side: record that recipient `id` has pending mail up to `seq` (its max pending row id).
  * Best-effort and in-place (truncate-write, never rename — a rename detaches an fs.watch from
  * the inode on macOS). Creates the doorbell dir on demand. Never throws: a failed doorbell must
- * not break the send path, and the watcher's poll fallback still catches the mail. Returns
- * whether the marker was written, for tests.
+ * not break the send path, and the watcher's poll fallback still catches the mail.
+ *
+ * A lower `seq` is dropped, and that clamp is the whole level-triggered contract rather than a
+ * tidiness rule. A watcher arms at the value it last read and fires only above it, so a marker
+ * that falls is invisible to every watcher already armed higher, and its mail strands until
+ * unrelated traffic climbs back past that baseline. Callers cannot be relied on to check: a ring
+ * fires whenever a delivery burst settles, and the max pending id at that moment is lower than
+ * the last one rung whenever the burst delivered a later row than one still waiting. Enforcing it
+ * here rather than at each ring site is what stops the next caller from reintroducing the fall.
+ * A garbage or absent marker reads as the missing sentinel and so never blocks a write — a
+ * damaged marker heals on the next ring instead of wedging the recipient forever.
+ *
+ * Returns whether the marker was written: false for an unsafe id, an IO failure, or a `seq` that
+ * would not advance the counter.
  */
 export function writeDoorbell(dbPath: string, id: string, seq: number): boolean {
   const path = doorbellPath(dbPath, id);
   if (path === null) return false;
   try {
     mkdirSync(doorbellDir(dbPath), { recursive: true });
+    if (readDoorbell(dbPath, id) >= seq) return false;
     writeFileSync(path, String(seq));
     return true;
   } catch {
@@ -75,13 +91,24 @@ export function writeDoorbell(dbPath: string, id: string, seq: number): boolean 
  * Watcher side: read a recipient's marker counter, or `missing` (default -1) when the marker
  * does not exist yet or is unreadable/garbage. The watcher compares this against the baseline
  * it armed with; a higher value means new mail.
+ *
+ * The whole file must be one run of digits. parseInt takes a numeric prefix and drops the rest,
+ * so "999999junk" read as 999999, and Number.isFinite could not tell: it was handed what parseInt
+ * had already salvaged, never the file. That was harmless while nothing compared against the
+ * value, and stopped being harmless when writeDoorbell's clamp started refusing any seq at or
+ * below it -- a damaged marker then suppressed every ring until the ids passed it, which is the
+ * one thing the clamp's contract above promises cannot happen. Deciding it here, on the bytes,
+ * is what makes a marker either a whole count or absent, with no third state for the clamp to
+ * lock in. Absent rings, so the failure that remains is a spare ring rather than silence.
  */
 export function readDoorbell(dbPath: string, id: string, missing = -1): number {
   const path = doorbellPath(dbPath, id);
   if (path === null) return missing;
   try {
-    const n = Number.parseInt(readFileSync(path, "utf8").trim(), 10);
-    return Number.isFinite(n) ? n : missing;
+    const raw = readFileSync(path, "utf8").trim();
+    if (!/^\d+$/.test(raw)) return missing;
+    const n = Number.parseInt(raw, 10);
+    return Number.isSafeInteger(n) ? n : missing;
   } catch {
     return missing;
   }
