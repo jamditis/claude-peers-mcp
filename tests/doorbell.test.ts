@@ -641,7 +641,11 @@ describe("startup reconcile over a persisted poll-only backlog", () => {
       ).all(rcpt.id) as { delivery_state: string; push_after: number | null }[];
       probe.close();
       expect(states.map((s) => s.delivery_state)).toEqual(["delivered", "queued"]);
-      expect(states[1].push_after).toBeNull(); // the survivor is the poll-only row, not a push
+      // The survivor is the poll-only row, not a push. `?.` because noUncheckedIndexedAccess
+      // types an index read as possibly undefined, and the assertion above -- which already
+      // fixes the length at two -- proves nothing tsc can carry down here. A missing row still
+      // fails: toBeNull() rejects undefined.
+      expect(states[1]?.push_after).toBeNull();
 
       expect(readDoorbell(DB_PATH_MIX, rcpt.id)).toBe(peek.max_id);
     } finally {
