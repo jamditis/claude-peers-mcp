@@ -8,6 +8,12 @@ alwaysApply: false
 
 Peer discovery and messaging MCP channel for Claude Code instances.
 
+## Product and deployment boundary
+
+This repository is the canonical source for the reusable product and the planned `claude-peers-mcp` npm package. A maintainer's personal deployment consumes the released package; machine-specific configuration, service overrides, local policy, version pins, and private automation stay outside this repository, and secret values stay in a credential vault. Do not create a second core repository or long-lived private fork for personal use.
+
+Before package or deployment work, read [Decision 0001](docs/decisions/0001-package-and-personal-deployment-boundary.md) and [roadmap #85](https://github.com/jamditis/claude-peers-mcp/issues/85). A private deployment repository is warranted only after executable deployment artifacts need their own version history, and it must consume the npm package rather than copy the broker.
+
 ## Architecture
 
 - `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server. Owns delivery: it routes each message to the recipient's backend (tmux pane via `send-keys`, or none → leave queued for `check_messages`) and runs the lease state machine. Push is gated on urgency: a row is pushed only once its `push_after` deadline is due (`interrupt` = now, `normal` = after `push_delay_ms`, `fyi`/floored forward = never — NULL, poll-only); when one row comes due the rest of the recipient's pushable backlog is promoted to ride the same flush. `PROTOCOL_VERSION = 6`; a newer MCP server retires an older broker via a version handshake on `/health`. Owns per-session capability-token auth: mints a 256-bit token at `/register` (stored on the `peers.token` column) and gates every mutating control-plane call on `Authorization: Bearer <token>` matching the call principal (`from_id` for `/send-message`, `id` otherwise), so a forged `from_id` 401s. `/register`, `/retire`, `/list-peers`, and the federation routes (`/gossip`, `/forward-message`) are token-exempt; `/list-peers` strips the token column via `stripToken` so the read route never leaks the secret. `CLAUDE_PEERS_ALLOW_UNSIGNED=1` is an upgrade-window grace that accepts only a missing token on a genuine pre-v3 NULL-token row (a wrong token always 401s).
