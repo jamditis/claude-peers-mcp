@@ -96,13 +96,17 @@ A **broker daemon** runs on port `7899` (set by the config file's `port` field) 
 
 Not every message interrupts the recipient. Each message carries an **urgency tier** that maps to a `push_after` deadline: `interrupt` is push-due immediately; `normal` waits `push_delay_ms` (default 2 minutes) so the recipient can drain it cheaply via `check_messages` at a task boundary first — if the deadline lapses, the recipient's next heartbeat pushes it; `fyi` never auto-pushes (`push_after` NULL) and is only ever returned by a poll. When one row comes due, the broker promotes the recipient's other pending pushable rows so they ride the same flush instead of interrupting again later. Never-push rows sit outside the push channel entirely, so an `fyi` can't jam pushable mail behind it (FIFO holds within each channel, push vs poll, not across them).
 
-### The doorbell: near-real-time wake for non-tmux sessions
+### The doorbell: near-real-time wake for mail nothing will push
 
-A session running outside tmux has no pane to push into, so it would normally see mail only when it next calls `check_messages` — minutes of lag during active coordination. The **doorbell** closes that gap without changing the consume path. Whenever mail is queued for a non-tmux recipient, the broker touches a tiny per-recipient marker file (a sibling of the database, `~/.claude-peers.db.doorbells/<id>.mark`) holding a counter. A background watcher — `bun cli.ts doorbell <id>` — waits on that file with `fs.watch` (near-zero idle CPU, a slow poll as a safety net) and exits the instant the counter advances, which wakes the session to call `check_messages`.
+A message nobody is going to push would otherwise be seen only at the recipient's next `check_messages` — minutes of lag during active coordination, or forever if the session stays idle. The **doorbell** closes that gap without changing the consume path. When mail is queued that nothing will push, the broker touches a tiny per-recipient marker file (a sibling of the database, `~/.claude-peers.db.doorbells/<id>.mark`) holding a counter. A background watcher — `bun cli.ts doorbell <id>` — waits on that file with `fs.watch` (near-zero idle CPU, a slow poll as a safety net) and exits the instant the counter advances, which wakes the session to call `check_messages`.
+
+**Arm it whether or not you are in a tmux pane.** The rule is about the *mail*, not the session: the bell rings for any pending row nothing will push, and a paned session has two of those every day — an `fyi` (never auto-pushes) and a remote forward floored by `floor_remote_forwards`, which is the default for cross-machine mail. Both are poll-only *to a session that has a pane*, so the bell is their only signal (issue #39; pinned by `tests/doorbell.test.ts`, "rings for a floored remote forward to a tmux recipient" and "rings for an fyi to a tmux recipient"). The doorbell began as the non-tmux wake (#49) and that is still its clearest case, but a paned session that skips it silently loses the near-real-time wake on exactly the cross-machine mail it is most likely to be waiting for.
+
+What the bell is *not* for is mail already destined for a push: a pushable row to a live pane is skipped, because the push is itself the wake and a bell would only duplicate it.
 
 The signal is **notify-only**: the marker carries no message content and the watcher never reads the database or marks anything delivered, so `check_messages` remains the single way to read and clear mail. A session that never arms a watcher is unaffected — the write lands in a file nobody is watching, and mail still waits for the next manual `check_messages`.
 
-To use it from a non-tmux session, **(re-)arm the watcher first, then call `check_messages`** — always in that order:
+To use it, **(re-)arm the watcher first, then call `check_messages`** — always in that order:
 
 ```bash
 # 1. Learn your peer ID with the peek_messages tool.
@@ -208,7 +212,7 @@ cd ~/claude-peers-mcp
 bun cli.ts status            # broker status + all peers (local and remote)
 bun cli.ts peers             # list peers
 bun cli.ts send <id> [--urgency interrupt|normal|fyi] <msg>   # send a message into a Claude session (default: interrupt)
-bun cli.ts doorbell <id> [--since <id>] [--timeout <sec>] [--watch]   # block until <id> has mail, then exit (non-tmux wake)
+bun cli.ts doorbell <id> [--since <id>] [--timeout <sec>] [--watch]   # block until <id> has unpushable mail, then exit
 bun cli.ts ping-siblings     # ping each configured sibling broker, report latency
 bun cli.ts kill-broker       # stop the broker
 ```
