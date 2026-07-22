@@ -15,6 +15,12 @@ Let your Claude Code instances find each other and talk. When you're running sev
   └───────────────────────┘          └──────────────────────┘
 ```
 
+## Project boundary and roadmap
+
+This repository is the source of truth for the reusable broker, protocol, MCP tools, tests, generic configuration, and the planned `claude-peers-mcp` npm package. Operator-specific machine configuration, service overrides, local policy, and version pins belong in a private deployment layer that consumes the package rather than forks the core. Secret values stay in a credential vault.
+
+The accepted ownership and package-consumer rules are recorded in [Decision 0001](docs/decisions/0001-package-and-personal-deployment-boundary.md). The research-backed release sequence and npm gates are tracked in [roadmap #85](https://github.com/jamditis/claude-peers-mcp/issues/85).
+
 ## Quick start
 
 ### 1. Install
