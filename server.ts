@@ -206,15 +206,17 @@ async function recoverBroker(): Promise<{ previousId: PeerId | null }> {
   await ensureBroker();
 
   // The normal restart keeps the same SQLite database, including this peer's
-  // capability and queued mail. Prove that registration with a non-consuming
-  // authenticated read before creating a replacement id: same-pid /register
-  // supersedes the old row and would otherwise delete its queued mail.
+  // capability and queued mail. Prove that registration with an authenticated
+  // heartbeat before creating a replacement id: it also refreshes last_seen so
+  // a peer whose broker was down past the TTL is immediately discoverable and
+  // addressable. Same-pid /register supersedes the old row and would otherwise
+  // delete its queued mail.
   const previousId = myId;
   if (myId && myAuthToken) {
     try {
-      await brokerFetch<PeekMessagesResponse>(
-        "/peek",
-        { id: myId },
+      await brokerFetch<{ ok: boolean }>(
+        "/heartbeat",
+        { id: myId, probe_only: true },
         { recover: false },
       );
       log(`Recovered broker connection for peer ${myId}`);

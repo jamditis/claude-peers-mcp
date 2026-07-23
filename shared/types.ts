@@ -44,9 +44,11 @@ export function parseListPeersScope(
 // gossip against a broker whose schema predates it); to 8 for send_message address-by-name
 // resolution (a server advertising name sends forces a pre-8 broker to retire, so a name send
 // never silently falls back to the old id-only path and fails as "not found" against a broker
-// that stores names but cannot resolve them).
+// that stores names but cannot resolve them); to 9 for liveness-only heartbeat probes (a server
+// that probes before list_peers must retire a broker that would ignore probe_only and drain
+// queued delivery as a side effect of the read).
 // server.ts requires at least this from a running broker.
-export const PROTOCOL_VERSION = 8;
+export const PROTOCOL_VERSION = 9;
 
 // Urgency tiers arrived in protocol 4 (see the history above). A broker older than
 // this ignores the urgency field and keeps the old push-on-send behavior, so a
@@ -118,6 +120,9 @@ export interface RegisterResponse {
 
 export interface HeartbeatRequest {
   id: PeerId;
+  // A liveness/auth proof used by recovery and token-exempt reads. It refreshes
+  // last_seen without starting the queued-delivery drain.
+  probe_only?: boolean;
 }
 
 export interface SetSummaryRequest {

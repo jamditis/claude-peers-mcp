@@ -123,6 +123,134 @@ describe("createRecoveringBrokerFetch", () => {
     expect(requests).toBe(2);
   });
 
+  it("uses a lightweight probe without full recovery on a healthy peer listing", async () => {
+    let recoveries = 0;
+    const observed: Array<{ path: string; body: unknown }> = [];
+    const brokerFetch = createRecoveringBrokerFetch({
+      brokerUrl: "http://broker.test",
+      getAuthToken: () => "token",
+      getPeerId: () => "peer",
+      recover: async () => {
+        recoveries++;
+        return { previousId: "peer" };
+      },
+      fetch: async (url, init) => {
+        const path = new URL(
+          url instanceof Request ? url.url : url,
+        ).pathname;
+        observed.push({
+          path,
+          body: JSON.parse(String(init?.body)),
+        });
+        return path === "/list-peers"
+          ? Response.json([])
+          : Response.json({ ok: true });
+      },
+    });
+
+    await expect(
+      brokerFetch("/list-peers", { exclude_id: "peer" }),
+    ).resolves.toEqual([]);
+    expect(recoveries).toBe(0);
+    expect(observed).toEqual([
+      {
+        path: "/heartbeat",
+        body: { id: "peer", probe_only: true },
+      },
+      {
+        path: "/list-peers",
+        body: { exclude_id: "peer" },
+      },
+    ]);
+  });
+
+  it("probes registration before a token-exempt peer listing", async () => {
+    let peerId = "old-id";
+    let token = "old-token";
+    let recoveries = 0;
+    const observed: Array<{ path: string; body: unknown; token: string }> = [];
+    const brokerFetch = createRecoveringBrokerFetch({
+      brokerUrl: "http://broker.test",
+      getAuthToken: () => token,
+      getPeerId: () => peerId,
+      recover: async () => {
+        recoveries++;
+        const previousId = peerId;
+        peerId = "new-id";
+        token = "new-token";
+        return { previousId };
+      },
+      fetch: async (url, init) => {
+        const path = new URL(
+          url instanceof Request ? url.url : url,
+        ).pathname;
+        const token = (init?.headers as Record<string, string>).Authorization ?? "";
+        observed.push({
+          path,
+          body: JSON.parse(String(init?.body)),
+          token,
+        });
+        if (path === "/heartbeat" && token === "Bearer old-token") {
+          return Response.json({ error: "unauthorized" }, { status: 401 });
+        }
+        return path === "/list-peers"
+          ? Response.json([])
+          : Response.json({ ok: true });
+      },
+    });
+
+    await expect(
+      brokerFetch("/list-peers", { exclude_id: "old-id" }),
+    ).resolves.toEqual([]);
+    expect(recoveries).toBe(1);
+    expect(observed).toEqual([
+      {
+        path: "/heartbeat",
+        body: { id: "old-id", probe_only: true },
+        token: "Bearer old-token",
+      },
+      {
+        path: "/heartbeat",
+        body: { id: "new-id", probe_only: true },
+        token: "Bearer new-token",
+      },
+      {
+        path: "/list-peers",
+        body: { exclude_id: "new-id" },
+        token: "Bearer new-token",
+      },
+    ]);
+  });
+
+  it("keeps peer listing readable while a broker rejects its retire-window probe", async () => {
+    let requests = 0;
+    let recoveries = 0;
+    const brokerFetch = createRecoveringBrokerFetch({
+      brokerUrl: "http://broker.test",
+      getAuthToken: () => "token",
+      getPeerId: () => "peer",
+      recover: async () => {
+        recoveries++;
+        return { previousId: "peer" };
+      },
+      fetch: async (url) => {
+        requests++;
+        const path = new URL(
+          url instanceof Request ? url.url : url,
+        ).pathname;
+        return path === "/heartbeat"
+          ? Response.json({ error: "broker retiring" }, { status: 503 })
+          : Response.json([]);
+      },
+    });
+
+    await expect(
+      brokerFetch("/list-peers", { exclude_id: "peer" }),
+    ).resolves.toEqual([]);
+    expect(requests).toBe(2);
+    expect(recoveries).toBe(0);
+  });
+
   it("shares one recovery across concurrent failed operations", async () => {
     let peerId = "old-id";
     let token = "old-token";

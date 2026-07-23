@@ -1297,6 +1297,7 @@ if (import.meta.main) {
             return Response.json(handleRegister(body));
           case "/heartbeat": {
             updateLastSeen.run(new Date().toISOString(), body.id);
+            if (body.probe_only) return Response.json({ ok: true });
             // Drain this recipient's queued backlog in id order (serial per recipient),
             // continuing only while each attempt delivers. A non-delivery (no backend,
             // or a failed/blocked head-of-line) stops the drain: under FIFO nothing

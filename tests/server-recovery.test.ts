@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -42,6 +43,18 @@ async function retireBroker(): Promise<void> {
 test("a live MCP server recovers after its broker exits", async () => {
   const workDir = mkdtempSync(join(tmpdir(), "claude-peers-recovery-"));
   const configPath = join(workDir, "config.json");
+  const initialDbPath = join(workDir, "broker.db");
+  const freshDbPath = join(workDir, "broker-fresh.db");
+  const brokerConfig = {
+    machine: "recovery-test",
+    tailscale_ip: "127.0.0.1",
+    port: PORT,
+    id_prefix: "rct",
+    siblings: [],
+    allowed_ips: ["127.0.0.1"],
+    db_path: initialDbPath,
+    auto_summary: false,
+  };
   const client = new Client({ name: "recovery-test", version: "1.0.0" });
   const transport = new StdioClientTransport({
     command: "bun",
@@ -56,16 +69,7 @@ test("a live MCP server recovers after its broker exits", async () => {
     stderr: "ignore",
   });
 
-  await Bun.write(configPath, JSON.stringify({
-    machine: "recovery-test",
-    tailscale_ip: "127.0.0.1",
-    port: PORT,
-    id_prefix: "rct",
-    siblings: [],
-    allowed_ips: ["127.0.0.1"],
-    db_path: join(workDir, "broker.db"),
-    auto_summary: false,
-  }));
+  await Bun.write(configPath, JSON.stringify(brokerConfig));
 
   try {
     await client.connect(transport);
@@ -82,6 +86,7 @@ test("a live MCP server recovers after its broker exits", async () => {
     expect(initialPeers).toHaveLength(1);
     const initialPeerId = initialPeers[0]?.id;
     expect(initialPeerId).toBeTruthy();
+    if (!initialPeerId) throw new Error("Initial peer did not register");
 
     const senderResponse = await fetch(`${BROKER_URL}/register`, {
       method: "POST",
@@ -127,6 +132,19 @@ test("a live MCP server recovers after its broker exits", async () => {
     });
     expect(unregisterSenderResponse.ok).toBe(true);
 
+    // Model a broker outage longer than the peer TTL without making the test
+    // sleep for 45 seconds. The restarted broker must refresh this row before
+    // list/send quarantine it as stale.
+    const staleDb = new Database(initialDbPath);
+    try {
+      staleDb.run("PRAGMA busy_timeout = 3000");
+      staleDb.prepare(
+        "UPDATE peers SET last_seen = ? WHERE id = ?",
+      ).run(new Date(0).toISOString(), initialPeerId);
+    } finally {
+      staleDb.close();
+    }
+
     await retireBroker();
 
     const result = await client.callTool({
@@ -165,13 +183,14 @@ test("a live MCP server recovers after its broker exits", async () => {
     expect(peers[0]?.name).toBe("recovery-test");
 
     // A broker replaced by another supervisor may already be alive but no
-    // longer know this server's capability. Reproduce that path with a fresh DB:
-    // the first authenticated call gets a side-effect-free 401, then the server
-    // must re-register and retry with its new id/token.
+    // longer know this server's capability. Use another DB path rather than
+    // unlinking SQLite files: Windows keeps the retired process's file handles
+    // locked for a short window after the HTTP listener has stopped.
     await retireBroker();
-    for (const suffix of ["", "-shm", "-wal"]) {
-      rmSync(join(workDir, `broker.db${suffix}`), { force: true });
-    }
+    await Bun.write(configPath, JSON.stringify({
+      ...brokerConfig,
+      db_path: freshDbPath,
+    }));
     Bun.spawn(["bun", "broker.ts"], {
       cwd: REPO_ROOT,
       env: {
@@ -184,6 +203,26 @@ test("a live MCP server recovers after its broker exits", async () => {
       stderr: "ignore",
     }).unref();
     await waitForBroker(true);
+
+    // The first call is deliberately token-exempt at the broker. Recovery must
+    // probe before the read so the fresh broker learns this session immediately
+    // instead of waiting for the next 15-second heartbeat.
+    const freshListResult = await client.callTool({
+      name: "list_peers",
+      arguments: { scope: "machine" },
+    });
+    expect(freshListResult.isError).not.toBe(true);
+
+    const freshPeersResponse = await fetch(`${BROKER_URL}/list-peers`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scope: "machine", cwd: "/", git_root: null }),
+    });
+    const freshPeers = await freshPeersResponse.json() as Array<{
+      id: string;
+    }>;
+    expect(freshPeers).toHaveLength(1);
+    expect(freshPeers[0]?.id).not.toBe(initialPeerId);
 
     const summaryResult = await client.callTool({
       name: "set_summary",
@@ -224,6 +263,11 @@ test("a live MCP server recovers after its broker exits", async () => {
   } finally {
     await client.close().catch(() => {});
     await retireBroker().catch(() => {});
-    rmSync(workDir, { recursive: true, force: true });
+    rmSync(workDir, {
+      recursive: true,
+      force: true,
+      maxRetries: 20,
+      retryDelay: 50,
+    });
   }
 }, 20_000);

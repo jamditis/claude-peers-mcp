@@ -166,9 +166,9 @@ export function createRecoveringBrokerFetch(
   ) => {
     const allowRecovery = options.recover !== false;
     let requestBody = body;
-    // A call arriving after another call started recovery must not race the
-    // registration with an old token or let a token-exempt read observe the
-    // replacement broker before this session exists there.
+    // A caller arriving during recovery must not race registration with an old
+    // token. Share the in-flight recovery and rewrite its principal fields
+    // before doing any new broker I/O.
     if (allowRecovery && recoveryInFlight) {
       const recovery = await recoveryInFlight;
       requestBody = rebindPeerIdentity(
@@ -176,6 +176,39 @@ export function createRecoveringBrokerFetch(
         recovery.previousId,
         dependencies.getPeerId(),
       );
+    }
+
+    // /list-peers is token-exempt at the broker, so a fresh empty-DB broker
+    // would answer it successfully without revealing that this session's old
+    // capability is unknown. Send one lightweight authenticated liveness probe
+    // first. A healthy broker answers directly; only a 401 or refused connection
+    // escalates through the full recovery path.
+    const probeId =
+      path === "/list-peers" ? dependencies.getPeerId() : null;
+    if (allowRecovery && probeId) {
+      try {
+        await request(
+          "/heartbeat",
+          { id: probeId, probe_only: true },
+          true,
+        );
+        requestBody = rebindPeerIdentity(
+          requestBody,
+          probeId,
+          dependencies.getPeerId(),
+        );
+      } catch (error) {
+        // A retiring broker rejects heartbeat probes with 503 but deliberately
+        // keeps /list-peers readable. Preserve that transient read behavior;
+        // authenticated operations still surface the 503, and a later listing
+        // probes the replacement broker again.
+        if (
+          !(error instanceof BrokerHttpError)
+          || error.status !== 503
+        ) {
+          throw error;
+        }
+      }
     }
     return request<T>(path, requestBody, allowRecovery);
   };
