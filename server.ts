@@ -20,6 +20,10 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { makeSpawnTmuxQuery, resolveSessionName, resolveTmuxTarget, SESSION_NAME_TIMEOUT_MS } from "./delivery.ts";
+import {
+  BrokerHttpError,
+  createRecoveringBrokerFetch,
+} from "./shared/broker-fetch.ts";
 import { loadConfig } from "./shared/config.ts";
 import { formatPeerList } from "./shared/format-peers.ts";
 import {
@@ -32,6 +36,7 @@ import type {
   PeerId,
   PeekMessagesResponse,
   PollMessagesResponse,
+  RegisterRequest,
   RegisterResponse,
 } from "./shared/types.ts";
 import {
@@ -53,23 +58,6 @@ const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = fileURLToPath(new URL("./broker.ts", import.meta.url));
 
 // --- Broker communication ---
-
-async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  // Present the session token once we hold one. /register (pre-token) and /health carry none;
-  // the broker exempts /register and validates the rest against the call's principal.
-  if (myAuthToken) headers.Authorization = `Bearer ${myAuthToken}`;
-  const res = await fetch(`${BROKER_URL}${path}`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Broker error (${path}): ${res.status} ${err}`);
-  }
-  return res.json() as Promise<T>;
-}
 
 async function isBrokerAlive(): Promise<boolean> {
   try {
@@ -193,6 +181,67 @@ let myId: PeerId | null = null;
 let myAuthToken: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+let myRegistration: RegisterRequest | null = null;
+
+async function registerWithBroker(): Promise<{ previousId: PeerId | null }> {
+  if (!myRegistration) {
+    throw new Error("Cannot register before session context is ready");
+  }
+
+  const previousId = myId;
+  // /register is token-exempt. Clear the old capability before asking a fresh
+  // broker to mint the replacement used by every later control-plane call.
+  myAuthToken = null;
+  const registration = await brokerFetch<RegisterResponse>(
+    "/register",
+    myRegistration,
+    { recover: false },
+  );
+  myId = registration.id;
+  myAuthToken = registration.token;
+  return { previousId };
+}
+
+async function recoverBroker(): Promise<{ previousId: PeerId | null }> {
+  await ensureBroker();
+
+  // The normal restart keeps the same SQLite database, including this peer's
+  // capability and queued mail. Prove that registration with an authenticated
+  // heartbeat before creating a replacement id: it also refreshes last_seen so
+  // a peer whose broker was down past the TTL is immediately discoverable and
+  // addressable. Same-pid /register supersedes the old row and would otherwise
+  // delete its queued mail.
+  const previousId = myId;
+  if (myId && myAuthToken) {
+    try {
+      await brokerFetch<{ ok: boolean }>(
+        "/heartbeat-probe",
+        { id: myId },
+        { recover: false },
+      );
+      log(`Recovered broker connection for peer ${myId}`);
+      return { previousId };
+    } catch (error) {
+      if (!(error instanceof BrokerHttpError) || error.status !== 401) {
+        throw error;
+      }
+    }
+  }
+
+  // A 401 proves this live replacement broker does not hold the old
+  // capability. Registration is safe here because there is no authenticated
+  // persisted row to preserve.
+  const recovery = await registerWithBroker();
+  log(`Recovered broker registration as peer ${myId}`);
+  return recovery;
+}
+
+const brokerFetch = createRecoveringBrokerFetch({
+  brokerUrl: BROKER_URL,
+  getAuthToken: () => myAuthToken,
+  getPeerId: () => myId,
+  recover: recoverBroker,
+});
 
 // --- MCP Server ---
 
@@ -346,6 +395,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       try {
         await brokerFetch("/set-summary", { id: myId, summary });
+        if (myRegistration) {
+          myRegistration = { ...myRegistration, summary };
+        }
         // No echo of the summary text: the caller just wrote it, so repeating it back
         // only adds tokens to their context.
         return {
@@ -469,7 +521,7 @@ async function main() {
   // find this session by the handle a human uses. Null for an unnamed (non-tmux) session.
   const sessionName = await resolveSessionName(process.env, makeSpawnTmuxQuery(SESSION_NAME_TIMEOUT_MS));
   log(`Session name: ${sessionName ?? "(none)"}`);
-  const reg = await brokerFetch<RegisterResponse>("/register", {
+  myRegistration = {
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
@@ -480,9 +532,8 @@ async function main() {
     name: sessionName,
     tmux_pane: tmuxTarget?.pane ?? null,
     tmux_socket: tmuxTarget?.socket ?? null,
-  });
-  myId = reg.id;
-  myAuthToken = reg.token; // capability for every subsequent control-plane call this session
+  };
+  await registerWithBroker();
   log(`Registered as peer ${myId}`);
 
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -494,7 +545,8 @@ async function main() {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (myId) {
       try {
-        await brokerFetch("/unregister", { id: myId });
+        // Cleanup must never launch a new daemon just to unregister from it.
+        await brokerFetch("/unregister", { id: myId }, { recover: false });
         log("Unregistered from broker");
       } catch {
         // Best effort

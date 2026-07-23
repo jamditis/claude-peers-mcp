@@ -126,7 +126,7 @@ The order matters. The watcher's baseline is sampled when it arms, so anything t
 
 `bun cli.ts doorbell` takes `--since <id>` (only wake strictly above a known message id — e.g. the highest id you just consumed), `--timeout <sec>` (give up after N seconds), and `--watch` (stay running and print each new ring instead of exiting on the first).
 
-Delivery is tracked per message with a short-lived lease (`queued` → `delivering` → `delivered`): the broker claims the head-of-line message (FIFO — newer mail never overtakes older), injects it, then re-probes the recipient's liveness before confirming, because a `0` exit from `send-keys` doesn't prove a live Claude consumed it. A failed or interrupted attempt releases the lease back to `queued` rather than dropping the message; expired leases and rows orphaned by a broker restart are reclaimed automatically. Before each inject the broker also probes the pane's foreground process: if it is a bare shell rather than a live Claude session, the message is held queued instead of pasted into the shell, and a pane that stays a shell across several consecutive attempts is escalated to a louder log so a wedged long-running session does not silently stop receiving mail. The broker and MCP server negotiate a protocol version (currently `4`); an MCP server that finds an older broker running asks it to retire and starts a current one.
+Delivery is tracked per message with a short-lived lease (`queued` → `delivering` → `delivered`): the broker claims the head-of-line message (FIFO — newer mail never overtakes older), injects it, then re-probes the recipient's liveness before confirming, because a `0` exit from `send-keys` doesn't prove a live Claude consumed it. A failed or interrupted attempt releases the lease back to `queued` rather than dropping the message; expired leases and rows orphaned by a broker restart are reclaimed automatically. Before each inject the broker also probes the pane's foreground process: if it is a bare shell rather than a live Claude session, the message is held queued instead of pasted into the shell, and a pane that stays a shell across several consecutive attempts is escalated to a louder log so a wedged long-running session does not silently stop receiving mail. The broker and MCP server negotiate a protocol version (currently `9`); an MCP server that finds an older broker running asks it to retire and starts a current one.
 
 ```
                     ┌───────────────────────────┐
@@ -140,7 +140,9 @@ Delivery is tracked per message with a short-lived lease (`queued` → `deliveri
                       Claude A         Claude B
 ```
 
-The broker auto-launches when the first session starts and cleans up dead peers automatically. The control plane is loopback-only: every route except the two federation routes (`/gossip`, `/forward-message`) rejects non-localhost callers. Same-machine delivery never leaves localhost. Cross-machine messaging is opt-in — see [Multi-machine setup](#multi-machine-setup).
+The broker auto-launches when the first session starts and cleans up dead peers automatically. If it exits while an MCP server stays connected, the next refused request starts a broker and verifies the session's persisted registration without consuming its mail. The session keeps the same peer ID and queue. A replacement broker that does not know the old capability returns `401`, so the server registers there before one retry. Other transport errors are left alone because the broker may already have committed the operation.
+
+The control plane is loopback-only: every route except the two federation routes (`/gossip`, `/forward-message`) rejects non-localhost callers. Same-machine delivery never leaves localhost. Cross-machine messaging is opt-in — see [Multi-machine setup](#multi-machine-setup).
 
 ## Security / authentication
 
