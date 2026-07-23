@@ -9,6 +9,7 @@ on:
 jobs:
   test:
     name: test (${{ matrix.os }})
+    timeout-minutes: 15
     # Run the platform-independent unit suites on Windows too. The point of the
     # tmpdir() fixtures is that these suites carry no POSIX-only filesystem
     # dependency; the only way to keep that true is to exercise them on native
