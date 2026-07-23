@@ -96,6 +96,28 @@ export function createRecoveringBrokerFetch(
     return tracked;
   }
 
+  async function recoverFailedRequest(
+    requestPeerId: PeerId | null,
+  ): Promise<BrokerRecovery> {
+    const currentPeerId = dependencies.getPeerId();
+    // Another request may have completed recovery after this request was sent
+    // but before its failure arrived. Reuse that old-to-new transition instead
+    // of recovering again against the already-current identity.
+    if (
+      requestPeerId
+      && currentPeerId
+      && requestPeerId !== currentPeerId
+    ) {
+      return { previousId: requestPeerId };
+    }
+
+    const recovery = await recoverSingleFlight();
+    // Bind rebasing to the identity this request actually carried. A concurrent
+    // recovery can finish and clear the single-flight promise just before the
+    // call above, making recovery.previousId already current.
+    return { previousId: requestPeerId ?? recovery.previousId };
+  }
+
   async function request<T>(
     path: string,
     body: unknown,
@@ -105,6 +127,7 @@ export function createRecoveringBrokerFetch(
       "Content-Type": "application/json",
     };
     const token = dependencies.getAuthToken();
+    const requestPeerId = dependencies.getPeerId();
     if (token) headers.Authorization = `Bearer ${token}`;
 
     let response: Response;
@@ -125,7 +148,7 @@ export function createRecoveringBrokerFetch(
       ) {
         throw error;
       }
-      const recovery = await recoverSingleFlight();
+      const recovery = await recoverFailedRequest(requestPeerId);
       return request<T>(
         path,
         rebindPeerIdentity(
@@ -140,7 +163,7 @@ export function createRecoveringBrokerFetch(
     // A fresh broker rejects the old capability before dispatching the request.
     // Re-registering and retrying once is therefore side-effect safe.
     if (allowRecovery && path !== "/register" && response.status === 401) {
-      const recovery = await recoverSingleFlight();
+      const recovery = await recoverFailedRequest(requestPeerId);
       return request<T>(
         path,
         rebindPeerIdentity(
@@ -181,15 +204,15 @@ export function createRecoveringBrokerFetch(
     // /list-peers is token-exempt at the broker, so a fresh empty-DB broker
     // would answer it successfully without revealing that this session's old
     // capability is unknown. Send one lightweight authenticated liveness probe
-    // first. A healthy broker answers directly; only a 401 or refused connection
-    // escalates through the full recovery path.
+    // first. The dedicated route is intentionally unknown to pre-9 brokers, so
+    // they return 404 instead of treating the probe as a delivery heartbeat.
     const probeId =
       path === "/list-peers" ? dependencies.getPeerId() : null;
     if (allowRecovery && probeId) {
       try {
         await request(
-          "/heartbeat",
-          { id: probeId, probe_only: true },
+          "/heartbeat-probe",
+          { id: probeId },
           true,
         );
         requestBody = rebindPeerIdentity(
@@ -198,15 +221,27 @@ export function createRecoveringBrokerFetch(
           dependencies.getPeerId(),
         );
       } catch (error) {
-        // A retiring broker rejects heartbeat probes with 503 but deliberately
-        // keeps /list-peers readable. Preserve that transient read behavior;
-        // authenticated operations still surface the 503, and a later listing
-        // probes the replacement broker again.
-        if (
-          !(error instanceof BrokerHttpError)
-          || error.status !== 503
-        ) {
-          throw error;
+        if (error instanceof BrokerHttpError && error.status === 404) {
+          // A token-authenticated 404 means this is a persisted registration on
+          // a pre-9 broker that does not implement the no-delivery probe. Full
+          // recovery runs the protocol handshake and retires it before listing.
+          const recovery = await recoverSingleFlight();
+          requestBody = rebindPeerIdentity(
+            requestBody,
+            recovery.previousId,
+            dependencies.getPeerId(),
+          );
+        } else {
+          // A retiring broker rejects liveness probes with 503 but deliberately
+          // keeps /list-peers readable. Preserve that transient read behavior;
+          // authenticated operations still surface the 503, and a later listing
+          // probes the replacement broker again.
+          if (
+            !(error instanceof BrokerHttpError)
+            || error.status !== 503
+          ) {
+            throw error;
+          }
         }
       }
     }

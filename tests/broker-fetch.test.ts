@@ -154,8 +154,8 @@ describe("createRecoveringBrokerFetch", () => {
     expect(recoveries).toBe(0);
     expect(observed).toEqual([
       {
-        path: "/heartbeat",
-        body: { id: "peer", probe_only: true },
+        path: "/heartbeat-probe",
+        body: { id: "peer" },
       },
       {
         path: "/list-peers",
@@ -190,7 +190,7 @@ describe("createRecoveringBrokerFetch", () => {
           body: JSON.parse(String(init?.body)),
           token,
         });
-        if (path === "/heartbeat" && token === "Bearer old-token") {
+        if (path === "/heartbeat-probe" && token === "Bearer old-token") {
           return Response.json({ error: "unauthorized" }, { status: 401 });
         }
         return path === "/list-peers"
@@ -205,13 +205,13 @@ describe("createRecoveringBrokerFetch", () => {
     expect(recoveries).toBe(1);
     expect(observed).toEqual([
       {
-        path: "/heartbeat",
-        body: { id: "old-id", probe_only: true },
+        path: "/heartbeat-probe",
+        body: { id: "old-id" },
         token: "Bearer old-token",
       },
       {
-        path: "/heartbeat",
-        body: { id: "new-id", probe_only: true },
+        path: "/heartbeat-probe",
+        body: { id: "new-id" },
         token: "Bearer new-token",
       },
       {
@@ -238,7 +238,7 @@ describe("createRecoveringBrokerFetch", () => {
         const path = new URL(
           url instanceof Request ? url.url : url,
         ).pathname;
-        return path === "/heartbeat"
+        return path === "/heartbeat-probe"
           ? Response.json({ error: "broker retiring" }, { status: 503 })
           : Response.json([]);
       },
@@ -249,6 +249,49 @@ describe("createRecoveringBrokerFetch", () => {
     ).resolves.toEqual([]);
     expect(requests).toBe(2);
     expect(recoveries).toBe(0);
+  });
+
+  it("retires a pre-9 broker before its delivery heartbeat can drain mail", async () => {
+    let currentBroker = false;
+    let recoveries = 0;
+    let deliveryDrains = 0;
+    const observedPaths: string[] = [];
+    const brokerFetch = createRecoveringBrokerFetch({
+      brokerUrl: "http://broker.test",
+      getAuthToken: () => "token",
+      getPeerId: () => "peer",
+      recover: async () => {
+        recoveries++;
+        currentBroker = true;
+        return { previousId: "peer" };
+      },
+      fetch: async (url) => {
+        const path = new URL(
+          url instanceof Request ? url.url : url,
+        ).pathname;
+        observedPaths.push(path);
+        if (path === "/heartbeat") {
+          deliveryDrains++;
+          return Response.json({ ok: true });
+        }
+        if (path === "/heartbeat-probe" && !currentBroker) {
+          return Response.json({ error: "not found" }, { status: 404 });
+        }
+        return path === "/list-peers"
+          ? Response.json([])
+          : Response.json({ ok: true });
+      },
+    });
+
+    await expect(
+      brokerFetch("/list-peers", { exclude_id: "peer" }),
+    ).resolves.toEqual([]);
+    expect(recoveries).toBe(1);
+    expect(deliveryDrains).toBe(0);
+    expect(observedPaths).toEqual([
+      "/heartbeat-probe",
+      "/list-peers",
+    ]);
   });
 
   it("shares one recovery across concurrent failed operations", async () => {
@@ -285,6 +328,57 @@ describe("createRecoveringBrokerFetch", () => {
 
     expect(recoveries).toBe(1);
     expect(results).toEqual([{ id: "new-id" }, { id: "new-id" }]);
+  });
+
+  it("rebinds a late 401 after another request already changed identity", async () => {
+    let peerId = "old-id";
+    let token = "old-token";
+    let recoveries = 0;
+    let oldRequests = 0;
+    const secondOldRequestStarted = deferred();
+    const releaseSecond401 = deferred();
+    const brokerFetch = createRecoveringBrokerFetch({
+      brokerUrl: "http://broker.test",
+      getAuthToken: () => token,
+      getPeerId: () => peerId,
+      recover: async () => {
+        recoveries++;
+        const previousId = peerId;
+        if (recoveries === 1) {
+          peerId = "new-id";
+          token = "new-token";
+        }
+        return { previousId };
+      },
+      fetch: async (_url, init) => {
+        const headers = init?.headers as Record<string, string>;
+        const body = JSON.parse(String(init?.body)) as { id: string };
+        if (headers.Authorization === "Bearer old-token") {
+          oldRequests++;
+          if (oldRequests === 2) {
+            secondOldRequestStarted.resolve();
+            await releaseSecond401.promise;
+          }
+          return Response.json({ error: "unauthorized" }, { status: 401 });
+        }
+        if (body.id !== peerId) {
+          return Response.json({ error: "wrong principal" }, { status: 401 });
+        }
+        return Response.json({ id: body.id });
+      },
+    });
+
+    const first = brokerFetch<{ id: string }>(
+      "/heartbeat",
+      { id: "old-id" },
+    );
+    const second = brokerFetch<{ id: string }>("/peek", { id: "old-id" });
+    await secondOldRequestStarted.promise;
+    await expect(first).resolves.toEqual({ id: "new-id" });
+
+    releaseSecond401.resolve();
+    await expect(second).resolves.toEqual({ id: "new-id" });
+    expect(recoveries).toBe(1);
   });
 
   it("holds a caller that arrives during recovery until registration settles", async () => {

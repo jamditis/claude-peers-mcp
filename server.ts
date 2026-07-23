@@ -215,8 +215,8 @@ async function recoverBroker(): Promise<{ previousId: PeerId | null }> {
   if (myId && myAuthToken) {
     try {
       await brokerFetch<{ ok: boolean }>(
-        "/heartbeat",
-        { id: myId, probe_only: true },
+        "/heartbeat-probe",
+        { id: myId },
         { recover: false },
       );
       log(`Recovered broker connection for peer ${myId}`);

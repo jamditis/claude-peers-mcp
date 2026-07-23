@@ -1288,16 +1288,19 @@ if (import.meta.main) {
         // While retiring, refuse every path that creates new persistent work or can
         // start a delivery — /heartbeat drives deliverNext, so it must be refused too,
         // or a heartbeat at a drain-loop yield could start a send the broker then exits under.
-        if (retiring && (path === "/register" || path === "/send-message" || path === "/forward-message" || path === "/heartbeat")) {
+        // /heartbeat-probe mutates liveness and must not extend a retiring broker's lifetime.
+        if (retiring && (path === "/register" || path === "/send-message" || path === "/forward-message" || path === "/heartbeat" || path === "/heartbeat-probe")) {
           return Response.json({ ok: false, error: "broker retiring" }, { status: 503 });
         }
         switch (path) {
           case "/register":
             // Loopback-only (gated above), so the pane/socket coordinates are trusted here.
             return Response.json(handleRegister(body));
+          case "/heartbeat-probe":
+            updateLastSeen.run(new Date().toISOString(), body.id);
+            return Response.json({ ok: true });
           case "/heartbeat": {
             updateLastSeen.run(new Date().toISOString(), body.id);
-            if (body.probe_only) return Response.json({ ok: true });
             // Drain this recipient's queued backlog in id order (serial per recipient),
             // continuing only while each attempt delivers. A non-delivery (no backend,
             // or a failed/blocked head-of-line) stops the drain: under FIFO nothing
