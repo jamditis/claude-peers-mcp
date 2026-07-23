@@ -140,7 +140,9 @@ Delivery is tracked per message with a short-lived lease (`queued` → `deliveri
                       Claude A         Claude B
 ```
 
-The broker auto-launches when the first session starts and cleans up dead peers automatically. The control plane is loopback-only: every route except the two federation routes (`/gossip`, `/forward-message`) rejects non-localhost callers. Same-machine delivery never leaves localhost. Cross-machine messaging is opt-in — see [Multi-machine setup](#multi-machine-setup).
+The broker auto-launches when the first session starts and cleans up dead peers automatically. If it exits while an MCP server stays connected, the next refused request starts a broker and verifies the session's persisted registration without consuming its mail. The session keeps the same peer ID and queue. A replacement broker that does not know the old capability returns `401`, so the server registers there before one retry. Other transport errors are left alone because the broker may already have committed the operation.
+
+The control plane is loopback-only: every route except the two federation routes (`/gossip`, `/forward-message`) rejects non-localhost callers. Same-machine delivery never leaves localhost. Cross-machine messaging is opt-in — see [Multi-machine setup](#multi-machine-setup).
 
 ## Security / authentication
 
