@@ -46,6 +46,21 @@ bun cli.ts doorbell <peer-id>   # block until <peer-id> has mail, then exit (non
 bun cli.ts kill-broker
 ```
 
+## Commits and attribution
+
+No AI attribution in commits, PR bodies, issues, docs, or code. `.claude/settings.json` sets `attribution.sessionUrl` to false and blanks `attribution.commit` and `attribution.pr`, which stops Claude Code from appending a `Claude-Session:` trailer to commits, adding the session link to PR bodies, and emitting the "Generated with Claude Code" strings. Web and Remote Control sessions both emit these by default. The setting lives in the repo rather than `~/.claude/settings.json` because cloud sessions clone the repo and never read user-level config. Don't reintroduce any of it by hand.
+
+No `Co-authored-by` trailers of any kind, including Joe's own aliases.
+
+Git identity — set before committing, in every worktree and every agent session:
+
+```sh
+git config user.name "Joe Amditis"
+git config user.email "6799804+jamditis@users.noreply.github.com"
+```
+
+Any other author email either trips GitHub's email-privacy push block (GH007) or makes a squash merge inject a `Co-authored-by` line into the merge body.
+
 ## Bun
 
 Default to using Bun instead of Node.js.
