@@ -285,7 +285,7 @@ switch (cmd) {
     const dbPath = resolveDoctorDbPath(config?.db_path, process.env.CLAUDE_PEERS_DB, `${homedir()}/.claude-peers.db`);
     let store: StoreFacts = {
       path: dbPath, integrity: "missing", integrity_detail: "no store file",
-      queues_read: false, queues: [], stalled_leases: [], push_capped: [],
+      queues_read: false, read_error: null, queues: [], stalled_leases: [], push_capped: [],
     };
     let peers: Awaited<ReturnType<typeof resolvePeerFacts>> = [];
     // An absent store has no peer table to read, and that is a reading, not a failure: it means

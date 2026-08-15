@@ -63,7 +63,7 @@ const okConfig: ConfigFacts = {
 };
 const emptyStore: StoreFacts = {
   path: "/tmp/peers.db", integrity: "ok", integrity_detail: "quick_check ok",
-  queues_read: true, queues: [], stalled_leases: [], push_capped: [],
+  queues_read: true, read_error: null, queues: [], stalled_leases: [], push_capped: [],
 };
 
 function facts(over: Partial<DoctorFacts> = {}): DoctorFacts {
@@ -665,11 +665,14 @@ describe("doctor: review round three", () => {
 
   it("judges a backlog by each row's stored push deadline, not the current setting", async () => {
     const db = makeDb();
-    addPeer(db);
+    // A pushable recipient: the stored deadline is what governs when its mail moves.
+    addPeer(db, { delivery_kind: "tmux", tmux_pane: "%3" });
     // Enqueued long ago under a much longer delay, so its stored deadline is still in the
     // future: hasDuePush would refuse to push it, and doctor must agree rather than cry stale.
     addMessage(db, { sent_at: new Date(NOW - 90 * 60_000).toISOString(), push_after: NOW + 60_000 });
-    const peers = await resolvePeerFacts(readStoredPeers(db), { nowMs: NOW, isPidAlive: () => true });
+    const peers = await resolvePeerFacts(readStoredPeers(db), {
+      nowMs: NOW, isPidAlive: () => true, probePane: async () => classifyPaneReadiness("node"),
+    });
     const store = readStoreFacts(db, "/tmp/peers.db", NOW, 3);
     expect(store.queues[0]?.oldest_due_ms).toBe(0);
     expect(codeFor(buildDoctorReport(facts({ peers, store })), "queue.abc-11111111")).toBe("QUEUE_OK");
@@ -709,6 +712,106 @@ describe("doctor: review round three", () => {
     expect(c?.code).toBe("CONFIG_DEFAULTED");
     expect(c?.severity).toBe("ok");
     expect(doctorExitCode(report)).toBe(0);
+  });
+});
+
+// Fourth review round (PR #95): four ways a partial failure produced a confident wrong answer.
+describe("doctor: review round four", () => {
+  it("reports a sibling that answers with an HTTP error as reachable but unhealthy", async () => {
+    const probes = await probeSiblings(
+      fakeFetch({ "/health": { ok: false, status: 503 } }),
+      [{ machine: "node-b", url: "http://b" }],
+      () => 0,
+    );
+    expect(probes[0]?.reachable).toBe(true);
+    const report = buildDoctorReport(facts({ siblings: probes }));
+    expect(codeFor(report, "sibling.node-b")).toBe("SIBLING_HEALTH_ERROR");
+    // Not a network problem, so the remediation must not send anyone to the tailnet.
+    expect(report.checks.find((c) => c.id === "sibling.node-b")?.remediation).not.toContain("tailnet");
+  });
+
+  it("still reports a sibling that answers nothing at all as unreachable", async () => {
+    const probes = await probeSiblings(fakeFetch({}), [{ machine: "node-b", url: "http://b" }], () => 0);
+    expect(probes[0]?.reachable).toBe(false);
+    expect(codeFor(buildDoctorReport(facts({ siblings: probes })), "sibling.node-b")).toBe("SIBLING_UNREACHABLE");
+  });
+
+  it("does not call live recipients' mail orphaned when the peer table was not read", () => {
+    const db = makeDb();
+    addPeer(db);
+    addMessage(db);
+    const store = readStoreFacts(db, "/tmp/peers.db", NOW, 3);
+    // Queue rows read fine; the peer read did not. The recipient is alive — calling its mail
+    // unreachable would invite an operator to delete it.
+    const report = buildDoctorReport(facts({ store, peers: [], peers_read: false }));
+    expect(codeFor(report, "queue.abc-11111111")).toBe("QUEUE_OK");
+    expect(report.checks.map((c) => c.code)).not.toContain("QUEUE_ORPHANED");
+    db.close();
+  });
+
+  it("still flags genuinely orphaned mail when the peer table was read", () => {
+    const db = makeDb();
+    addMessage(db, { to_id: "ghost-1" });
+    const store = readStoreFacts(db, "/tmp/peers.db", NOW, 3);
+    expect(codeFor(buildDoctorReport(facts({ store, peers: [], peers_read: true })), "queue.ghost-1")).toBe("QUEUE_ORPHANED");
+    db.close();
+  });
+
+  it("keeps a corrupt verdict when a later query trips over the same damage", () => {
+    // quick_check passes on an in-memory db, so simulate the ordering directly: a store already judged corrupt
+    // whose queue read then failed must not be downgraded to "unreadable".
+    const store: StoreFacts = {
+      ...emptyStore, integrity: "corrupt", integrity_detail: "page 4 is never used",
+      queues_read: false, read_error: "database disk image is malformed",
+    };
+    const report = buildDoctorReport(facts({ store }));
+    expect(codeFor(report, "store.integrity")).toBe("STORE_CORRUPT");
+    // The remediation must be the recovery one, not "check file permissions".
+    expect(report.checks.find((c) => c.id === "store.integrity")?.remediation).toContain("recover");
+    // And the queue section reports the read failure it actually hit.
+    const queue = report.checks.find((c) => c.id === "queue");
+    expect(queue?.code).toBe("QUEUE_UNAVAILABLE");
+    expect(queue?.detail).toContain("malformed");
+  });
+
+  it("reclassifies only a store that passed quick_check when its queue read fails", () => {
+    const db = makeDb();
+    db.run("DROP TABLE messages");
+    db.run("CREATE TABLE messages (id INTEGER PRIMARY KEY, to_id TEXT)"); // no sent_at: query throws
+    const store = readStoreFacts(db, "/tmp/peers.db", NOW, 3);
+    expect(store.integrity).toBe("unreadable");
+    expect(store.queues_read).toBe(false);
+    expect(store.read_error).not.toBeNull();
+    db.close();
+  });
+
+  it("flags an ancient poll-only row hiding behind a not-yet-due pushable one", async () => {
+    const db = makeDb();
+    addPeer(db, { delivery_kind: "tmux", tmux_pane: "%3" });
+    // An fyi from six hours ago that nothing will ever push...
+    addMessage(db, { sent_at: new Date(NOW - 6 * 3_600_000).toISOString(), push_after: null, urgency: "fyi" });
+    // ...alongside a fresh pushable row whose deadline has not arrived, which used to mask it.
+    addMessage(db, { sent_at: new Date(NOW - 1000).toISOString(), push_after: NOW + 60_000 });
+    const peers = await resolvePeerFacts(readStoredPeers(db), {
+      nowMs: NOW, isPidAlive: () => true, probePane: async () => classifyPaneReadiness("node"),
+    });
+    const store = readStoreFacts(db, "/tmp/peers.db", NOW, 3);
+    expect(store.queues[0]?.oldest_due_ms).toBe(0);                       // the pushable row is not due
+    expect(store.queues[0]?.oldest_poll_only_age_ms).toBe(6 * 3_600_000); // the fyi is ancient
+    expect(codeFor(buildDoctorReport(facts({ peers, store })), "queue.abc-11111111")).toBe("QUEUE_BACKLOG_STALE");
+    db.close();
+  });
+
+  it("leaves a fresh poll-only row alone", async () => {
+    const db = makeDb();
+    addPeer(db, { delivery_kind: "tmux", tmux_pane: "%3" });
+    addMessage(db, { sent_at: new Date(NOW - 5000).toISOString(), push_after: null, urgency: "fyi" });
+    const peers = await resolvePeerFacts(readStoredPeers(db), {
+      nowMs: NOW, isPidAlive: () => true, probePane: async () => classifyPaneReadiness("node"),
+    });
+    const store = readStoreFacts(db, "/tmp/peers.db", NOW, 3);
+    expect(codeFor(buildDoctorReport(facts({ peers, store })), "queue.abc-11111111")).toBe("QUEUE_OK");
+    db.close();
   });
 });
 

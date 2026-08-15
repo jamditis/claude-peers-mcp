@@ -171,6 +171,14 @@ export interface QueueFacts {
    * still refuses to push it.
    */
   oldest_due_ms: number | null;
+  /**
+   * Age of the oldest pending row that will never be pushed (`push_after IS NULL` — an fyi, a
+   * floored forward, or a row demoted after repeated push failures). Tracked separately because
+   * the two backlogs age independently: a recipient can have a pushable row whose deadline is
+   * comfortably in the future sitting alongside an fyi from six hours ago, and judging the queue
+   * by the push deadline alone would report that queue clean while the fyi never gets read.
+   */
+  oldest_poll_only_age_ms: number | null;
 }
 
 export interface StalledLeaseFacts {
@@ -196,6 +204,13 @@ export interface StoreFacts {
    * "nothing was read", which a queue check must never blur into a green result.
    */
   queues_read: boolean;
+  /**
+   * Why the queue reads failed, when they did. Kept apart from `integrity` so a definitive
+   * quick_check verdict is never overwritten by the query that then tripped over the same damage:
+   * "corrupt" and "unreadable" carry different remediations (recover the file vs check
+   * permissions), and the corrupt one is the true and more urgent diagnosis.
+   */
+  read_error: string | null;
   queues: QueueFacts[];
   stalled_leases: StalledLeaseFacts[];
   /** Recipients holding rows whose channel push attempts have stopped making progress. */
@@ -368,8 +383,11 @@ export async function probeSiblings(
       const res = await fetchFn(`${s.url}/health`);
       const latency_ms = nowMs() - started;
       if (!res.ok) {
+        // Reachable: an HTTP status came back, so a process is listening. Same rule as the local
+        // broker probe — "did not answer" would send an operator to check the network for a host
+        // that is up and answering, and hide the sibling-side fault that is the real problem.
         return {
-          machine: s.machine, url: s.url, reachable: false, reported_machine: null,
+          machine: s.machine, url: s.url, reachable: true, reported_machine: null,
           status: null, protocol_version: null, latency_ms, error: `health returned ${res.status}`,
         };
       }
@@ -442,7 +460,7 @@ export function readStoredPeers(db: Database): StoredPeer[] {
  */
 export function readStoreFacts(db: Database, path: string, nowMs: number, pushCap: number): StoreFacts {
   const facts: StoreFacts = {
-    path, integrity: "ok", integrity_detail: "", queues_read: false,
+    path, integrity: "ok", integrity_detail: "", queues_read: false, read_error: null,
     queues: [], stalled_leases: [], push_capped: [],
   };
   try {
@@ -457,6 +475,7 @@ export function readStoreFacts(db: Database, path: string, nowMs: number, pushCa
   } catch (e) {
     facts.integrity = "unreadable";
     facts.integrity_detail = redact(e instanceof Error ? e.message : String(e));
+    facts.read_error = facts.integrity_detail;
     return facts;
   }
 
@@ -493,16 +512,19 @@ export function readStoreFacts(db: Database, path: string, nowMs: number, pushCa
               SUM(CASE WHEN ${state}='delivering' THEN 1 ELSE 0 END) AS delivering,
               SUM(CASE WHEN ${pushAfter} IS NULL THEN 1 ELSE 0 END) AS never_push,
               MIN(sent_at) AS oldest_pending_at,
-              ${hasPushAfter ? "MIN(CASE WHEN push_after IS NOT NULL THEN push_after END)" : "NULL"} AS oldest_push_after
+              ${hasPushAfter ? "MIN(CASE WHEN push_after IS NOT NULL THEN push_after END)" : "NULL"} AS oldest_push_after,
+              ${hasPushAfter ? "MIN(CASE WHEN push_after IS NULL THEN sent_at END)" : "NULL"} AS oldest_poll_only_at
          FROM messages
         WHERE ${state} IN ('queued','delivering')
         GROUP BY to_id
         ORDER BY to_id`,
-    ).all() as Array<{ to_id: string; queued: number; delivering: number; never_push: number; oldest_pending_at: string | null; oldest_push_after: number | null }>;
-    facts.queues = queues.map(({ oldest_push_after, ...q }) => {
+    ).all() as Array<{ to_id: string; queued: number; delivering: number; never_push: number; oldest_pending_at: string | null; oldest_push_after: number | null; oldest_poll_only_at: string | null }>;
+    facts.queues = queues.map(({ oldest_push_after, oldest_poll_only_at, ...q }) => {
       const parsed = q.oldest_pending_at === null ? Number.NaN : Date.parse(q.oldest_pending_at);
+      const pollOnlyParsed = oldest_poll_only_at === null ? Number.NaN : Date.parse(oldest_poll_only_at);
       return {
         ...q,
+        oldest_poll_only_age_ms: Number.isFinite(pollOnlyParsed) ? Math.max(0, nowMs - pollOnlyParsed) : null,
         // Clamp at 0: a store written by a host whose clock is ahead must read as "just now",
         // never as negative age. A deadline still in the future clamps to 0 too — not yet due is
         // not overdue.
@@ -545,8 +567,16 @@ export function readStoreFacts(db: Database, path: string, nowMs: number, pushCa
     }
     facts.queues_read = true;
   } catch (e) {
-    facts.integrity = "unreadable";
-    facts.integrity_detail = redact(e instanceof Error ? e.message : String(e));
+    // The queue read failed AFTER quick_check already returned a verdict. If that verdict was
+    // "corrupt", this failure is almost certainly the same damaged page being hit again — a
+    // symptom, not a second, milder diagnosis. Overwriting it with "unreadable" would downgrade
+    // "recover or replace this database" to "check the file permissions". Only a store that
+    // passed quick_check gets reclassified here.
+    facts.read_error = redact(e instanceof Error ? e.message : String(e));
+    if (facts.integrity === "ok") {
+      facts.integrity = "unreadable";
+      facts.integrity_detail = facts.read_error;
+    }
   }
   return facts;
 }
@@ -763,6 +793,17 @@ export function checkSiblings(siblings: SiblingProbeFacts[], expectedProtocol: n
         `Check that ${s.machine} is up and its broker is running, and that the network path (e.g. the tailnet) is connected.`,
       );
     }
+    if (s.error !== null) {
+      // Answered, but not with health: the host and the network are fine and the broker there is
+      // not. Distinct remediation from an unreachable host, which is the whole point of splitting
+      // it out — telling someone to check their tailnet when the tailnet is working wastes the
+      // one thing a diagnostic is for.
+      return check(
+        `sibling.${s.machine}`, `Sibling ${s.machine}`, "SIBLING_HEALTH_ERROR", "warn",
+        `${s.url} is answering but its /health did not: ${s.error}. The host is reachable; its broker is not serving.`,
+        `Check the broker process and log on ${s.machine} — the network path to it is fine.`,
+      );
+    }
     // The host answered, but is it the host we think? /health names the machine it runs on, so a
     // config pointing two entries at one URL (a copy-paste, a stale IP another node has taken
     // over) is visible here and nowhere else: gossip would keep filing that host's peers under
@@ -881,9 +922,15 @@ export function checkPeers(
  * settled, and rows whose push attempts have hit their cap. Counts and ages only — no bodies.
  */
 export function checkQueues(
-  s: StoreFacts, peers: PeerFacts[], staleMs = DOCTOR_QUEUE_STALE_MS,
+  s: StoreFacts, peers: PeerFacts[], staleMs = DOCTOR_QUEUE_STALE_MS, peersRead = true,
 ): DoctorCheck[] {
   const checks: DoctorCheck[] = [];
+  // Every classification below that consults `peers` is only as good as the peer read. When that
+  // read failed, an empty list is not "no peers exist" — and the conclusion it would produce is
+  // the most destructive one doctor can print: QUEUE_ORPHANED on live recipients, telling an
+  // operator their sessions' mail is unreachable and inviting them to clear it. The queue facts
+  // themselves are still true and worth reporting, so the peer-DEPENDENT half is suppressed
+  // rather than the whole section.
   const known = new Set(peers.map((p) => p.id));
   const unreadyPeers = new Set(peers.filter((p) => p.backend === "unready" || p.backend === "absent").map((p) => p.id));
   // The recipient half of the broker's isPollOnly rule: a session with no push backend at all
@@ -904,7 +951,7 @@ export function checkQueues(
       "queue", "Queues", "QUEUE_UNAVAILABLE", missing ? "ok" : "warn",
       missing
         ? `No store at ${redact(s.path, 120)} yet, so there is no queue to read.`
-        : `Queue and lease state could not be read from ${redact(s.path, 120)}: ${s.integrity_detail}. No conclusion about pending mail or stalled leases is possible.`,
+        : `Queue and lease state could not be read from ${redact(s.path, 120)}: ${s.read_error ?? s.integrity_detail}. No conclusion about pending mail or stalled leases is possible.`,
       missing ? null : "Fix the store (see the message-store check above), then re-run doctor.",
     )];
   }
@@ -915,13 +962,14 @@ export function checkQueues(
   for (const q of s.queues) {
     const id = `queue.${q.to_id}`;
     const title = `Queue ${q.to_id}`;
-    // An unknown recipient is unpushable too: no peer row means no backend (QUEUE_ORPHANED below).
-    const pollOnly = unpushable.has(q.to_id) || !known.has(q.to_id)
-      ? q.queued + q.delivering
-      : q.never_push;
+    // An unknown recipient is unpushable too: no peer row means no backend (QUEUE_ORPHANED
+    // below) — but only when we actually know the peer list.
+    const unknownRecipient = peersRead && !known.has(q.to_id);
+    const noBackend = unpushable.has(q.to_id) || unknownRecipient;
+    const pollOnly = noBackend ? q.queued + q.delivering : q.never_push;
     const counts =
       `${q.queued} queued, ${q.delivering} delivering, ${pollOnly} poll-only; oldest ${formatMs(q.oldest_age_ms)} old`;
-    if (!known.has(q.to_id)) {
+    if (unknownRecipient) {
       checks.push(check(
         id, title, "QUEUE_ORPHANED", "warn",
         `${counts}. No peer with this id is registered here, so nothing will ever read it.`,
@@ -937,9 +985,17 @@ export function checkQueues(
       ));
       continue;
     }
-    // Overdue against the row's OWN stored deadline when it has one; a wholly poll-only backlog
-    // has no deadline to miss, so its age since sent_at is the only signal available.
-    const overdueMs = q.oldest_due_ms ?? q.oldest_age_ms;
+    // Two independent backlogs, so both are judged. The pushable one is overdue against its own
+    // stored deadline; the poll-only one has no deadline to miss, so its age since sent_at is the
+    // only signal there is. Taking just the push deadline would let an ancient fyi hide behind a
+    // freshly-enqueued pushable row; taking just the overall age would flag a queue whose only
+    // old row is not yet due. When the recipient has no push backend at all, every row is
+    // poll-only whatever push_after says, so the whole backlog's age applies.
+    const pollOnlyAgeMs = noBackend ? q.oldest_age_ms : q.oldest_poll_only_age_ms;
+    const signals = [q.oldest_due_ms, pollOnlyAgeMs].filter((v): v is number => v !== null);
+    // Neither signal exists only on a store with no push_after column at all, where message age
+    // is all there is.
+    const overdueMs = signals.length > 0 ? Math.max(...signals) : q.oldest_age_ms;
     if (overdueMs !== null && overdueMs > staleMs) {
       checks.push(check(
         id, title, "QUEUE_BACKLOG_STALE", "warn",
@@ -984,7 +1040,7 @@ export function buildDoctorReport(facts: DoctorFacts): DoctorReport {
     ...checkStore(facts.store),
     ...checkSiblings(facts.siblings, facts.expected_protocol),
     ...checkPeers(facts.peers, DOCTOR_PEER_STALE_MS, facts.peers_read),
-    ...checkQueues(facts.store, facts.peers, resolveQueueStaleMs(facts.push_delay_ms)),
+    ...checkQueues(facts.store, facts.peers, resolveQueueStaleMs(facts.push_delay_ms), facts.peers_read),
   ];
   const counts = { ok: 0, warn: 0, fail: 0 };
   for (const c of checks) counts[c.severity]++;
