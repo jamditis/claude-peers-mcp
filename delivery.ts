@@ -268,9 +268,13 @@ export const DEFAULT_PUSH_FAILURE_DEMOTION_CAP = 5;
  * disables demotion.
  *
  * Pure and storage-agnostic like its siblings: the caller owns where the count lives (a per-row
- * push_failures column, so a restart cannot reset it) and what a "failure" is (an acked send that
- * ran and missed — NOT a readiness deferral, which never sent anything and keeps its own #42
- * counter).
+ * push_failures column, so a restart cannot reset it) and what a "failure" is. Only one outcome
+ * qualifies: a send that RAN and missed (send-keys exited non-zero). A readiness deferral never
+ * sent anything and keeps its own #42 counter, and a spawn FAULT (deliverViaTmux's onFault: the
+ * process could not be created at all) is evidence about the host, not the pane — counting it
+ * would let a transient tmux outage demote a row, which is the failure mode the streak exists to
+ * prevent. A fault neither advances the streak nor clears it: the run of pane evidence is simply
+ * not extended by an attempt that never reached the pane.
  */
 export function decidePushDemotion(
   consecutiveFailures: number,
@@ -279,6 +283,27 @@ export function decidePushDemotion(
   if (cap <= 0) return { demote: false, reason: "demotion disabled (cap <= 0)" };
   if (consecutiveFailures < cap) return { demote: false, reason: `under cap (${consecutiveFailures}/${cap})` };
   return { demote: true, reason: `cap reached (${consecutiveFailures}/${cap})` };
+}
+
+/**
+ * Whether one finished tmux attempt is the kind of failure the #70 demotion streak counts: a send
+ * that RAN and missed. All three exclusions are attempts that also return false and also leave the
+ * row queued, so the boolean alone cannot separate them — the caller passes what deliverViaTmux's
+ * callbacks told it.
+ *
+ *  - `ok`: the send landed. Nothing to count (the caller resets the streak instead).
+ *  - `deferred`: the readiness probe positively identified a shell, so nothing was sent. It has
+ *    its own consecutive-deferral counter and escalation (#42).
+ *  - `faulted`: the spawn rejected, so the attempt never reached the pane. This is evidence about
+ *    the host — a momentarily unspawnable tmux, a process-creation failure — and counting it would
+ *    let a transient outage lasting `cap` heartbeats demote a healthy pane's mail, which is
+ *    precisely what requiring a streak was meant to prevent. It does not clear the streak either:
+ *    an attempt that never reached the pane neither confirms nor refutes the pane evidence so far.
+ */
+export function countsAsPushFailure(
+  outcome: { ok: boolean; deferred: boolean; faulted: boolean },
+): boolean {
+  return !outcome.ok && !outcome.deferred && !outcome.faulted;
 }
 
 /** The row's current consecutive-failed-push count; 0 for a row that is gone. */
@@ -704,10 +729,20 @@ export async function probePaneReadiness(
  * skipped — not on a probe fault (which fails open and injects) nor on a send failure. The
  * broker uses it to count consecutive not-ready deferrals per recipient and escalate a pane
  * that is stuck a shell (issue #42); callers that do not track this omit it.
+ *
+ * `onFault` fires only when the spawn itself REJECTED — process creation failed, the tmux binary
+ * was momentarily unavailable — as opposed to a send that ran and exited non-zero. Both return
+ * false and both leave the message queued, but they are evidence about different things, and a
+ * caller that penalizes a row for its failures must tell them apart: a fault says nothing about
+ * the pane, so counting it toward the #70 demotion streak would let a transient environment
+ * outage strip an interrupt of its push channel after `cap` heartbeats. The two callbacks are
+ * mutually exclusive and neither fires on the ordinary non-zero-exit miss, which is the only
+ * outcome the streak counts.
  */
 export async function deliverViaTmux(
   pane: string, socket: string | null, text: string, spawn: TmuxSpawn, query?: TmuxQuery,
   onDefer?: (reason: string) => void,
+  onFault?: (error: unknown) => void,
 ): Promise<boolean> {
   try {
     if (query) {
@@ -724,8 +759,11 @@ export async function deliverViaTmux(
     // A non-zero exit is handled above; reaching here means the spawn itself
     // rejected (a bug or environment fault, not a normal failed delivery). The
     // message still stays queued — never silently dropped — but the fault is
-    // logged so it does not vanish, unlike the ordinary non-zero-exit miss.
+    // logged so it does not vanish, unlike the ordinary non-zero-exit miss, and
+    // reported through onFault so a caller can hold it against the environment
+    // rather than against the pane.
     console.error(`[claude-peers broker] tmux delivery spawn error for pane ${pane}:`, e);
+    onFault?.(e);
     return false;
   }
 }

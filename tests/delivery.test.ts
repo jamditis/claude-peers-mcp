@@ -8,7 +8,7 @@ import {
   bumpChannelPushAttempts, getChannelPushAttempts, resolveChannelPushCap,
   confirmDelivered, DEFAULT_CHANNEL_PUSH_CAP,
   DEFAULT_DEFERRAL_ESCALATION_CAP, DEFAULT_PUSH_FAILURE_DEMOTION_CAP,
-  bumpPushFailures, decidePushDemotion, demoteToPollOnly, getPushFailures, resetPushFailures,
+  bumpPushFailures, countsAsPushFailure, decidePushDemotion, demoteToPollOnly, getPushFailures, resetPushFailures,
   decideChannelPush, decideDeferralEscalation, deliverViaTmux,
   ensureMessagesTable, findLeaklessDelivering, formatPeerMessage, hasDuePush,
   isFederationRoute, isLoopback, isMessageDelivered, isPidDead,
@@ -785,6 +785,40 @@ describe("deliverViaTmux", () => {
     await deliverViaTmux("%1", null, "hi", spawn, undefined, onDefer);
     expect(calls).toBe(0);
   });
+  it("calls onFault with the error when the spawn itself rejects (#70)", async () => {
+    // The spawn never ran, so nothing was learned about the pane. A caller that penalizes a row
+    // for its failures needs this told apart from an exit-1 miss, which looks identical in the
+    // return value.
+    const boom = new Error("spawn EAGAIN");
+    const spawn: TmuxSpawn = async () => { throw boom; };
+    const faults: unknown[] = [];
+    expect(await deliverViaTmux("%1", null, "hi", spawn, undefined, undefined, (e) => faults.push(e))).toBe(false);
+    expect(faults).toEqual([boom]);
+  });
+  it("does not call onFault on a non-zero exit, a shell defer, or a successful send (#70)", async () => {
+    let faults = 0;
+    const onFault = () => { faults++; };
+    const readyProbe: TmuxQuery = async () => ({ exitCode: 0, stdout: "node\n" });
+    // ran and missed: the one outcome the #70 streak counts, and it is not a fault
+    await deliverViaTmux("%1", null, "hi", async () => ({ exitCode: 1 }), readyProbe, undefined, onFault);
+    // deferred on a shell pane: onDefer's case, not this one
+    await deliverViaTmux("%1", null, "hi", async () => ({ exitCode: 0 }),
+      async () => ({ exitCode: 0, stdout: "bash\n" }), undefined, onFault);
+    // delivered
+    await deliverViaTmux("%1", null, "hi", async () => ({ exitCode: 0 }), readyProbe, undefined, onFault);
+    expect(faults).toBe(0);
+  });
+  it("reports a defer and a fault as mutually exclusive outcomes (#70)", async () => {
+    // A deferred attempt returns before the spawn, so it can never also fault; a faulting spawn
+    // was only reached because the pane probed ready, so it can never also defer.
+    const seen: string[] = [];
+    await deliverViaTmux("%1", null, "hi", async () => { throw new Error("nope"); },
+      async () => ({ exitCode: 0, stdout: "bash\n" }), () => seen.push("defer"), () => seen.push("fault"));
+    expect(seen).toEqual(["defer"]); // the spawn was never reached
+    await deliverViaTmux("%1", null, "hi", async () => { throw new Error("nope"); },
+      async () => ({ exitCode: 0, stdout: "node\n" }), () => seen.push("defer"), () => seen.push("fault"));
+    expect(seen).toEqual(["defer", "fault"]);
+  });
 });
 
 describe("buildPaneCommandArgs", () => {
@@ -1181,6 +1215,20 @@ describe("decidePushDemotion (#70)", () => {
   });
 });
 
+describe("countsAsPushFailure (#70)", () => {
+  it("counts only a send that ran and missed", () => {
+    expect(countsAsPushFailure({ ok: false, deferred: false, faulted: false })).toBe(true);
+  });
+
+  it("excludes a delivery, a readiness deferral, and a spawn fault", () => {
+    // Each of the three returns false from deliverViaTmux and leaves the row queued, so the
+    // boolean cannot separate them — which is why the outcome is carried, not inferred.
+    expect(countsAsPushFailure({ ok: true, deferred: false, faulted: false })).toBe(false);
+    expect(countsAsPushFailure({ ok: false, deferred: true, faulted: false })).toBe(false);
+    expect(countsAsPushFailure({ ok: false, deferred: false, faulted: true })).toBe(false);
+  });
+});
+
 const FDB = join(tmpdir(), "test-delivery-push-failures.db");
 
 describe("push failure streak persistence and demotion (#70)", () => {
@@ -1245,6 +1293,81 @@ describe("push failure streak persistence and demotion (#70)", () => {
     db.run("UPDATE messages SET delivery_state='delivering', push_after=0, lease_expires_at=?, lease_token='t' WHERE id=?",
       [Date.now() + 5000, id]);
     expect(demoteToPollOnly(db, id)).toBe(false); // a live attempt still owns it
+    db.close();
+  });
+
+  // One attempt as the broker runs it: deliverViaTmux reports its outcome through the two
+  // callbacks, countsAsPushFailure decides whether that outcome is pane evidence, and only then
+  // does the row's streak advance and the cap get consulted. Driving the real functions (rather
+  // than asserting on a hand-written outcome record) is the point — the fault/miss split has to
+  // hold end to end, since both look identical in the boolean deliverViaTmux returns.
+  async function attempt(db: Database, id: number, spawn: TmuxSpawn, cap: number): Promise<void> {
+    let deferred = false;
+    let faulted = false;
+    const readyProbe: TmuxQuery = async () => ({ exitCode: 0, stdout: "node\n" });
+    const ok = await deliverViaTmux("%1", null, "hi", spawn, readyProbe,
+      () => { deferred = true; }, () => { faulted = true; });
+    if (ok) { resetPushFailures(db, id); return; }
+    if (!countsAsPushFailure({ ok, deferred, faulted })) return;
+    if (decidePushDemotion(bumpPushFailures(db, id), cap).demote) demoteToPollOnly(db, id);
+  }
+
+  const pushAfterOf = (db: Database, id: number) =>
+    (db.query("SELECT push_after AS p FROM messages WHERE id=?").get(id) as { p: number | null }).p;
+
+  it("does not demote a row whose spawns keep faulting, however long the outage lasts (#70)", async () => {
+    // A tmux that cannot be spawned says nothing about the pane. If the fault counted, an
+    // environment blip lasting `cap` heartbeats would permanently strip this row of its push
+    // channel -- worst for an interrupt, whose sender is blocked on the push.
+    const { db, id } = seeded("interrupt");
+    const rejecting: TmuxSpawn = async () => { throw new Error("spawn EAGAIN"); };
+    for (let i = 0; i < DEFAULT_PUSH_FAILURE_DEMOTION_CAP * 2; i++) {
+      await attempt(db, id, rejecting, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+    }
+    expect(getPushFailures(db, id)).toBe(0);      // the streak never advanced
+    expect(pushAfterOf(db, id)).not.toBeNull();   // still pushable, so the retry keeps its urgency
+    db.close();
+  });
+
+  it("still demotes a row whose sends run and exit non-zero (#70)", async () => {
+    // The companion half: the same driver, the same cap, a spawn that RUNS. This is pane
+    // evidence, so the streak advances and the row leaves the push channel at the cap.
+    const { db, id } = seeded();
+    const missing: TmuxSpawn = async () => ({ exitCode: 1 });
+    for (let i = 0; i < DEFAULT_PUSH_FAILURE_DEMOTION_CAP - 1; i++) {
+      await attempt(db, id, missing, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+    }
+    expect(pushAfterOf(db, id)).not.toBeNull();   // below the cap: still pushable
+    await attempt(db, id, missing, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+    expect(pushAfterOf(db, id)).toBeNull();       // at the cap: demoted
+    db.close();
+  });
+
+  it("does not let faults pad a run of real misses toward the cap (#70)", async () => {
+    // A fault neither counts nor clears: interleaving outages with genuine misses must leave the
+    // row exactly as many misses from demotion as the misses alone put it.
+    const { db, id } = seeded();
+    const missing: TmuxSpawn = async () => ({ exitCode: 1 });
+    const rejecting: TmuxSpawn = async () => { throw new Error("spawn EAGAIN"); };
+    for (let i = 0; i < DEFAULT_PUSH_FAILURE_DEMOTION_CAP - 1; i++) {
+      await attempt(db, id, missing, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+      await attempt(db, id, rejecting, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+    }
+    expect(getPushFailures(db, id)).toBe(DEFAULT_PUSH_FAILURE_DEMOTION_CAP - 1); // misses only
+    expect(pushAfterOf(db, id)).not.toBeNull();
+    db.close();
+  });
+
+  it("clears the streak once a send finally lands, so an old run cannot demote later (#70)", async () => {
+    const { db, id } = seeded();
+    const missing: TmuxSpawn = async () => ({ exitCode: 1 });
+    for (let i = 0; i < DEFAULT_PUSH_FAILURE_DEMOTION_CAP - 1; i++) {
+      await attempt(db, id, missing, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+    }
+    await attempt(db, id, async () => ({ exitCode: 0 }), DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+    expect(getPushFailures(db, id)).toBe(0);
+    await attempt(db, id, missing, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+    expect(pushAfterOf(db, id)).not.toBeNull(); // one fresh miss is nowhere near the cap
     db.close();
   });
 

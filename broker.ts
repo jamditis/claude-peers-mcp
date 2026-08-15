@@ -9,7 +9,7 @@
 
 import { Database } from "bun:sqlite";
 import {
-  bumpPushFailures, claimForDelivery, confirmDelivered, DEFAULT_DEFERRAL_ESCALATION_CAP,
+  bumpPushFailures, claimForDelivery, confirmDelivered, countsAsPushFailure, DEFAULT_DEFERRAL_ESCALATION_CAP,
   DEFAULT_PUSH_FAILURE_DEMOTION_CAP, decideDeferralEscalation, decidePushDemotion,
   demoteToPollOnly, deliverViaTmux, ensureMessagesTable,
   formatPeerMessage, generateAuthToken, generateLeaseToken, hasDuePush,
@@ -819,6 +819,7 @@ if (import.meta.main) {
     activeRowIds.add(row.id);
     inFlightDeliveries++;
     let deferredThisAttempt = false;
+    let faultedThisAttempt = false;
     try {
       const text = formatPeerMessage(row);
       // The query arg enables a pre-send readiness probe: if the pane's foreground process is
@@ -838,7 +839,11 @@ if (import.meta.main) {
           if (decideDeferralEscalation(streak, DEFERRAL_ESCALATION_CAP).escalate) {
             console.error(`[claude-peers broker] escalation: pane ${target.pane} (peer ${toId}) deferred ${streak}x in a row (${reason}); no live Claude foreground seen, so its peer mail is not being delivered — if the session exited to a shell under a still-live pid the dead-pid sweep will not reap it`);
           }
-        });
+        },
+        // onFault: the spawn never ran, so this attempt is evidence about the host, not the pane.
+        // It must not accrue toward the #70 demotion streak — an environment outage lasting a few
+        // heartbeats would otherwise strip a row (worst, an interrupt) of its push channel.
+        () => { faultedThisAttempt = true; });
       // A 0 exit from send-keys is not proof a live peer consumed the text: the recipient can
       // die after the lease is claimed (before or during the await), leaving a pane that
       // outlived the Claude process — now a bare shell — that still accepts keystrokes and exits
@@ -860,9 +865,15 @@ if (import.meta.main) {
       // A send that RAN and missed (send-keys exited non-zero) is the #70 case: the row returns to
       // queued still pushable, so the next heartbeat retries it and the doorbell's withhold stays
       // shut on the poll-only mail behind it. Count it, and once the run reaches the cap demote the
-      // row out of the push channel. A readiness deferral never sent anything (it has its own #42
-      // counter above), and a peer that died mid-send is handled by the dead-pid sweep, not here.
-      if (!ok && !deferredThisAttempt) notePushFailure(row);
+      // row out of the push channel. The three other ways to reach this line are excluded on
+      // purpose: a readiness deferral never sent anything (it has its own #42 counter above), a
+      // spawn fault never reached the pane at all (faultedThisAttempt — a tmux that is briefly
+      // unspawnable is not a broken pane, and penalizing the row for it is the exact transient
+      // this streak exists to survive), and a peer that died mid-send is handled by the dead-pid
+      // sweep, not here.
+      if (countsAsPushFailure({ ok, deferred: deferredThisAttempt, faulted: faultedThisAttempt })) {
+        notePushFailure(row);
+      }
       return "queued";
     } catch {
       deferralStreaks.delete(toId);   // a spawn fault is not a readiness deferral
