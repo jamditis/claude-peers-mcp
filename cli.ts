@@ -243,8 +243,13 @@ switch (cmd) {
   // as a check, not treated as fatal.
   case "doctor": {
     const asJson = process.argv.slice(3).includes("--json");
-    const nowMs = Date.now();
     const configPath = process.env.CLAUDE_PEERS_CONFIG || `${homedir()}/.claude-peers.json`;
+    // loadConfig validates that the required keys are PRESENT, not that they hold the right
+    // shape, so a config with `"siblings": {}` loads and then throws in the first loop that
+    // iterates it. Doctor must survive a broken config — reporting one is half its job — so the
+    // shape is checked here and a bad one degrades to a check instead of an unhandled throw that
+    // would leave --json emitting nothing at all.
+    const siblings = Array.isArray(config?.siblings) ? config.siblings : [];
     const configFacts: ConfigFacts = {
       path: configPath,
       loaded: config !== null,
@@ -252,6 +257,7 @@ switch (cmd) {
       // explicitly requested AND the default file is absent — reproduce that test here so the
       // report says which of the two states this host is in.
       defaulted: config !== null && process.env.CLAUDE_PEERS_CONFIG === undefined && !existsSync(configPath),
+      siblings_invalid: config !== null && !Array.isArray(config.siblings),
       error: config === null ? "config could not be loaded (missing, unreadable, or invalid JSON)" : null,
     };
 
@@ -264,22 +270,29 @@ switch (cmd) {
       });
       return { ok: res.ok, status: res.status, json: () => res.json() as Promise<unknown> };
     };
-    const broker = await probeBroker(doctorFetch, BROKER_URL);
-    const siblings = await probeSiblings(doctorFetch, config?.siblings ?? [], () => Date.now());
+    // The network probes come first and can take seconds (a sibling on a dead tailnet burns the
+    // full timeout), so the store is read against a clock sampled AFTER them, not before. With a
+    // stale timestamp a lease that expired during those seconds still reads as live, and doctor
+    // would report QUEUE_LEASE_OK over a jam that was already stuck by the time it looked.
+    const [broker, siblingProbes] = await Promise.all([
+      probeBroker(doctorFetch, BROKER_URL),
+      probeSiblings(doctorFetch, siblings, () => Date.now()),
+    ]);
 
+    const observedMs = Date.now();
     // SQLite is read directly, and on purpose: it is the one source that still answers when the
     // broker is down, which is exactly when an operator wants to know what is stuck in the queue.
     const dbPath = resolveDoctorDbPath(config?.db_path, process.env.CLAUDE_PEERS_DB, `${homedir()}/.claude-peers.db`);
     let store: StoreFacts = {
-      path: dbPath, integrity: "missing", integrity_detail: "no store file", queues: [],
-      stalled_leases: [], push_capped: [],
+      path: dbPath, integrity: "missing", integrity_detail: "no store file",
+      queues_read: false, queues: [], stalled_leases: [], push_capped: [],
     };
     let peers: Awaited<ReturnType<typeof resolvePeerFacts>> = [];
     if (existsSync(dbPath)) {
       let db: Database | null = null;
       try {
         db = new Database(dbPath, { readonly: true });
-        store = readStoreFacts(db, dbPath, nowMs, resolveChannelPushCap(process.env.CLAUDE_PEERS_CHANNEL_PUSH_CAP));
+        store = readStoreFacts(db, dbPath, observedMs, resolveChannelPushCap(process.env.CLAUDE_PEERS_CHANNEL_PUSH_CAP));
         const stored = readStoredPeers(db);
         // The readiness classifier the broker itself uses (classifyPaneReadiness), so doctor
         // reports exactly the state that would gate a real push. Unlike probePaneReadiness,
@@ -287,7 +300,7 @@ switch (cmd) {
         // diagnostic must say "unknown" rather than claim a pane it never read is ready.
         const query = makeSpawnTmuxQuery(2000);
         peers = await resolvePeerFacts(stored, {
-          nowMs,
+          nowMs: observedMs,
           isPidAlive: (pid) => !isPidDead(pidProbe(pid)),
           probePane: async (pane, socket) => {
             const { exitCode, stdout } = await query(buildPaneCommandArgs(pane, socket));
@@ -306,12 +319,12 @@ switch (cmd) {
     }
 
     const report = buildDoctorReport({
-      now_ms: nowMs,
+      now_ms: observedMs,
       expected_protocol: PROTOCOL_VERSION,
       push_delay_ms: config?.push_delay_ms ?? DEFAULT_PUSH_DELAY_MS,
       config: configFacts,
       broker,
-      siblings,
+      siblings: siblingProbes,
       peers,
       store,
     });

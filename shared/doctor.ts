@@ -76,6 +76,14 @@ export interface ConfigFacts {
   loaded: boolean;
   /** True when no config file existed and the zero-config single-host default is in force. */
   defaulted: boolean;
+  /**
+   * The config parsed but `siblings` is not an array. loadConfig checks that required keys are
+   * PRESENT, not that they are well-typed, so `"siblings": {}` loads happily and then explodes in
+   * the first federation loop that iterates it. Doctor reports it as a config fault instead of
+   * dying, and this flag is what keeps that fault a structured check (with valid --json) rather
+   * than a stack trace.
+   */
+  siblings_invalid: boolean;
   error: string | null;
 }
 
@@ -170,6 +178,12 @@ export interface StoreFacts {
   path: string;
   integrity: "ok" | "corrupt" | "missing" | "unreadable";
   integrity_detail: string;
+  /**
+   * Whether the queue and lease reads actually completed. False means the arrays below are
+   * absence of data, not absence of mail — the difference between "nothing is stuck" and
+   * "nothing was read", which a queue check must never blur into a green result.
+   */
+  queues_read: boolean;
   queues: QueueFacts[];
   stalled_leases: StalledLeaseFacts[];
   /** Recipients holding rows whose channel push attempts have stopped making progress. */
@@ -248,17 +262,26 @@ export async function probeBroker(fetchFn: DoctorFetch, url: string): Promise<Br
   };
   try {
     const res = await fetchFn(`${url}/health`);
+    // ANY HTTP response proves a process is listening and answering, so reachability is settled
+    // here — before the body is judged. A 500 from /health is a broker that is up and broken,
+    // which is precisely the state this command exists to name; reporting it as "no broker
+    // answered" would send the operator off to start a broker that is already running.
+    base.reachable = true;
     if (!res.ok) return { ...base, error: `health returned ${res.status}` };
     const h = (await res.json()) as Record<string, unknown>;
-    base.reachable = true;
-    base.status = typeof h.status === "string" ? h.status : null;
+    // /health is the local broker's own output, but it is still a foreign string by the time it
+    // reaches a line-per-check renderer, and it is echoed verbatim into a check detail. Same
+    // treatment as every other value we did not author.
+    base.status = typeof h.status === "string" ? redact(h.status, 40) : null;
     // A reachable broker with no protocol_version predates the field entirely (protocol 1),
     // the same resolution `send` uses — not "unknown".
     base.protocol_version = typeof h.protocol_version === "number" ? h.protocol_version : 1;
-    base.machine = typeof h.machine === "string" ? h.machine : null;
+    base.machine = typeof h.machine === "string" ? redact(h.machine, 60) : null;
     base.local_peer_count = typeof h.peers === "number" ? h.peers : null;
     base.remote_peer_count = typeof h.remote_peer_count === "number" ? h.remote_peer_count : null;
   } catch (e) {
+    // A transport fault leaves reachable as set above: false if the connection never landed,
+    // true if we had already taken a response and only the body was unreadable.
     return { ...base, error: redact(e instanceof Error ? e.message : String(e)) };
   }
   try {
@@ -367,7 +390,8 @@ export function readStoredPeers(db: Database): StoredPeer[] {
  */
 export function readStoreFacts(db: Database, path: string, nowMs: number, pushCap: number): StoreFacts {
   const facts: StoreFacts = {
-    path, integrity: "ok", integrity_detail: "", queues: [], stalled_leases: [], push_capped: [],
+    path, integrity: "ok", integrity_detail: "", queues_read: false,
+    queues: [], stalled_leases: [], push_capped: [],
   };
   try {
     const rows = db.query("PRAGMA quick_check").all() as Array<Record<string, string>>;
@@ -384,17 +408,40 @@ export function readStoreFacts(db: Database, path: string, nowMs: number, pushCa
     return facts;
   }
 
-  if (!hasTable(db, "messages")) return facts;
+  // A store the broker has not opened yet has no messages table. That is an empty queue, and a
+  // real reading of it — not a failure to read.
+  if (!hasTable(db, "messages")) {
+    facts.queues_read = true;
+    return facts;
+  }
+
+  // Same reasoning as readStoredPeers, and more load-bearing here: a protocol-1 store keeps a
+  // boolean `delivered` column and has no delivery_state, no push_after, and no lease columns at
+  // all, so the modern queries do not merely lose a field — they throw, and the whole store gets
+  // reported unreadable at exit 2 while nothing is actually wrong with it. Doctor is read-only
+  // and cannot migrate, so it reads the old shape on the old shape's terms: `delivered` maps to
+  // the two states it encoded, and an absent push_after reads as 0 (due now), which is exactly
+  // what migrateMessagesSchema backfills.
+  const modernState = hasColumn(db, "messages", "delivery_state");
+  const state = modernState
+    ? "delivery_state"
+    : "(CASE WHEN delivered=1 THEN 'delivered' ELSE 'queued' END)";
+  const pushAfter = hasColumn(db, "messages", "push_after") ? "push_after" : "0";
+  // Leases arrived with delivery_state; without both columns no row can be 'delivering', so
+  // there is no lease to stall and the query is skipped rather than guessed at.
+  const hasLeases = modernState
+    && hasColumn(db, "messages", "lease_expires_at")
+    && hasColumn(db, "messages", "lease_token");
 
   try {
     const queues = db.query(
       `SELECT to_id,
-              SUM(CASE WHEN delivery_state='queued' THEN 1 ELSE 0 END) AS queued,
-              SUM(CASE WHEN delivery_state='delivering' THEN 1 ELSE 0 END) AS delivering,
-              SUM(CASE WHEN push_after IS NULL THEN 1 ELSE 0 END) AS never_push,
+              SUM(CASE WHEN ${state}='queued' THEN 1 ELSE 0 END) AS queued,
+              SUM(CASE WHEN ${state}='delivering' THEN 1 ELSE 0 END) AS delivering,
+              SUM(CASE WHEN ${pushAfter} IS NULL THEN 1 ELSE 0 END) AS never_push,
               MIN(sent_at) AS oldest_pending_at
          FROM messages
-        WHERE delivery_state IN ('queued','delivering')
+        WHERE ${state} IN ('queued','delivering')
         GROUP BY to_id
         ORDER BY to_id`,
     ).all() as Array<{ to_id: string; queued: number; delivering: number; never_push: number; oldest_pending_at: string | null }>;
@@ -415,29 +462,32 @@ export function readStoreFacts(db: Database, path: string, nowMs: number, pushCa
     // nextDeliverable nonetheless reads that future timestamp as a live attempt and blocks the
     // recipient head-of-line until it passes. Expiry alone would call that jam healthy.
     // `lease_token IS NULL` is selected as a boolean; the token value itself is never read.
-    const stalled = db.query(
-      `SELECT id, to_id, lease_expires_at, (lease_token IS NULL) AS no_token FROM messages
-        WHERE ${HOLDERLESS_DELIVERING}
-           OR (delivery_state='delivering' AND lease_expires_at < ?)
-        ORDER BY id`,
-    ).all(nowMs) as Array<{ id: number; to_id: string; lease_expires_at: number | null; no_token: number }>;
-    facts.stalled_leases = stalled.map((r) => ({
-      message_id: r.id,
-      to_id: r.to_id,
-      expired_ms: r.lease_expires_at === null ? null : Math.max(0, nowMs - r.lease_expires_at),
-      holderless: r.lease_expires_at === null || r.no_token === 1,
-    }));
+    if (hasLeases) {
+      const stalled = db.query(
+        `SELECT id, to_id, lease_expires_at, (lease_token IS NULL) AS no_token FROM messages
+          WHERE ${HOLDERLESS_DELIVERING}
+             OR (delivery_state='delivering' AND lease_expires_at < ?)
+          ORDER BY id`,
+      ).all(nowMs) as Array<{ id: number; to_id: string; lease_expires_at: number | null; no_token: number }>;
+      facts.stalled_leases = stalled.map((r) => ({
+        message_id: r.id,
+        to_id: r.to_id,
+        expired_ms: r.lease_expires_at === null ? null : Math.max(0, nowMs - r.lease_expires_at),
+        holderless: r.lease_expires_at === null || r.no_token === 1,
+      }));
+    }
 
     if (hasColumn(db, "messages", "channel_push_attempts") && pushCap > 0) {
       facts.push_capped = db.query(
         `SELECT to_id, COUNT(*) AS row_count FROM messages
-          WHERE delivery_state='queued' AND channel_push_attempts >= ?
+          WHERE ${state}='queued' AND channel_push_attempts >= ?
           GROUP BY to_id ORDER BY to_id`,
       ).all(pushCap).map((r) => {
         const row = r as { to_id: string; row_count: number };
         return { to_id: row.to_id, rows: row.row_count };
       });
     }
+    facts.queues_read = true;
   } catch (e) {
     facts.integrity = "unreadable";
     facts.integrity_detail = redact(e instanceof Error ? e.message : String(e));
@@ -459,8 +509,11 @@ export interface PeerProbeDeps {
  * probe is injected so tests exercise the real classification without a real tmux.
  */
 export async function resolvePeerFacts(peers: StoredPeer[], deps: PeerProbeDeps): Promise<PeerFacts[]> {
-  const out: PeerFacts[] = [];
-  for (const p of peers) {
+  // Concurrent, order-preserving. Each pane probe spawns tmux under a multi-second kill-timeout,
+  // and the fleet this is aimed at runs many panes: serially, one wedged tmux per peer turns a
+  // diagnostic into a minute-long hang precisely when the host is in trouble. Promise.all keeps
+  // the result in peer order regardless of which probe returns first.
+  return Promise.all(peers.map(async (p): Promise<PeerFacts> => {
     const seen = Date.parse(p.last_seen);
     let pid_alive: boolean | null = null;
     try {
@@ -488,16 +541,15 @@ export async function resolvePeerFacts(peers: StoredPeer[], deps: PeerProbeDeps)
         }
       }
     } else {
-      backend_reason = `delivery_kind=${p.delivery_kind}; messages wait for check_messages`;
+      backend_reason = `delivery_kind=${redact(p.delivery_kind, 20)}; messages wait for check_messages`;
     }
-    out.push({
+    return {
       id: p.id, name: p.name, machine: p.machine, pid: p.pid,
       delivery_kind: p.delivery_kind, last_seen: p.last_seen,
       age_ms: Number.isFinite(seen) ? Math.max(0, deps.nowMs - seen) : null,
       pid_alive, backend, backend_reason,
-    });
-  }
-  return out;
+    };
+  }));
 }
 
 // --- Check construction (pure) ---
@@ -526,6 +578,13 @@ export function checkConfig(c: ConfigFacts): DoctorCheck[] {
       "Fix or recreate the config file (see deploy/configs/ for per-host samples), or point CLAUDE_PEERS_CONFIG at a valid one.",
     )];
   }
+  if (c.siblings_invalid) {
+    return [check(
+      "config.source", "Config", "CONFIG_SIBLINGS_INVALID", "fail",
+      `${c.path} has a "siblings" field that is not an array, so federation cannot be set up from it and no sibling was probed.`,
+      'Set "siblings" to an array of {"machine","url"} entries (an empty array [] for a single-host node).',
+    )];
+  }
   if (c.defaulted) {
     return [check(
       "config.source", "Config", "CONFIG_DEFAULTED", "warn",
@@ -546,7 +605,16 @@ export function checkBroker(b: BrokerProbeFacts, expectedProtocol: number): Doct
   }
   const checks: DoctorCheck[] = [];
   const counts = `${b.local_peer_count ?? "?"} local peer(s), ${b.remote_peer_count ?? "?"} remote`;
-  if (b.status !== "ok") {
+  if (b.error !== null) {
+    // A process answered but its health endpoint did not: an HTTP error, or a body we could not
+    // read. Distinct from BROKER_UNREACHABLE, and distinct from a broker that reports its own
+    // unhealthy status — here even the report failed.
+    checks.push(check(
+      "broker.process", "Broker process", "BROKER_HEALTH_ERROR", "fail",
+      `A process is answering at ${b.url} but /health did not: ${b.error}.`,
+      "The port is taken by a broken or foreign process. Check the broker log; if the port belongs to something else, free it, otherwise `bun cli.ts kill-broker` and let the next session relaunch.",
+    ));
+  } else if (b.status !== "ok") {
     checks.push(check(
       "broker.process", "Broker process", "BROKER_UNHEALTHY", "warn",
       `Broker answered ${b.url} with status "${b.status ?? "none"}" (${counts}).`,
@@ -736,6 +804,21 @@ export function checkQueues(
   const unpushable = new Set(
     peers.filter((p) => p.backend === "none" || p.backend === "absent").map((p) => p.id),
   );
+
+  // Nothing below was read, so nothing below may be reported as clear. An empty array here means
+  // the reads never ran, and answering "no pending messages / no stalled leases" would be the
+  // worst possible failure mode for a diagnostic: an all-green queue section printed underneath
+  // an unreadable store, which is exactly when the operator most needs to be told to look.
+  if (!s.queues_read) {
+    const missing = s.integrity === "missing";
+    return [check(
+      "queue", "Queues", "QUEUE_UNAVAILABLE", missing ? "ok" : "warn",
+      missing
+        ? `No store at ${s.path} yet, so there is no queue to read.`
+        : `Queue and lease state could not be read from ${s.path}: ${s.integrity_detail}. No conclusion about pending mail or stalled leases is possible.`,
+      missing ? null : "Fix the store (see the message-store check above), then re-run doctor.",
+    )];
+  }
 
   if (s.queues.length === 0) {
     checks.push(check("queue", "Queues", "QUEUE_EMPTY", "ok", "No pending messages."));

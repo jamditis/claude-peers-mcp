@@ -58,10 +58,12 @@ function addMessage(db: Database, over: Partial<Record<string, unknown>> = {}): 
   );
 }
 
-const okConfig: ConfigFacts = { path: "/etc/claude-peers.json", loaded: true, defaulted: false, error: null };
+const okConfig: ConfigFacts = {
+  path: "/etc/claude-peers.json", loaded: true, defaulted: false, siblings_invalid: false, error: null,
+};
 const emptyStore: StoreFacts = {
   path: "/tmp/peers.db", integrity: "ok", integrity_detail: "quick_check ok",
-  queues: [], stalled_leases: [], push_capped: [],
+  queues_read: true, queues: [], stalled_leases: [], push_capped: [],
 };
 
 function facts(over: Partial<DoctorFacts> = {}): DoctorFacts {
@@ -468,6 +470,145 @@ describe("doctor: review follow-ups", () => {
   });
 });
 
+// Second review round (PR #95). Each case is a state the first round reported as green, as a
+// crash, or as the wrong kind of failure.
+describe("doctor: review round two", () => {
+  /** A protocol-1 messages table: a boolean `delivered` column, no delivery_state and no leases. */
+  function protocolOneDb(): Database {
+    const db = new Database(":memory:");
+    db.run(`CREATE TABLE messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT NOT NULL, to_id TEXT NOT NULL,
+      text TEXT NOT NULL, sent_at TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0
+    )`);
+    const add = (to: string, delivered: number, sentAt: string) =>
+      db.run("INSERT INTO messages (from_id, to_id, text, sent_at, delivered) VALUES ('z',?,'body',?,?)",
+        [to, sentAt, delivered] as never[]);
+    add("abc-11111111", 0, new Date(NOW - 4000).toISOString());
+    add("abc-11111111", 0, new Date(NOW - 2000).toISOString());
+    add("abc-11111111", 1, new Date(NOW - 1000).toISOString());
+    return db;
+  }
+
+  it("reads a protocol-1 messages table instead of calling the store unreadable", () => {
+    const db = protocolOneDb();
+    const store = readStoreFacts(db, "/tmp/legacy.db", NOW, 3);
+    expect(store.integrity).toBe("ok");
+    expect(store.queues_read).toBe(true);
+    // The delivered row is excluded; the two undelivered ones read as queued, and with no
+    // push_after column they read as due-now (never_push 0), which is what the migration backfills.
+    expect(store.queues[0]).toMatchObject({ to_id: "abc-11111111", queued: 2, delivering: 0, never_push: 0 });
+    expect(store.queues[0]?.oldest_age_ms).toBe(4000);
+    // No lease columns means no row can be delivering, so there is no lease to stall.
+    expect(store.stalled_leases).toEqual([]);
+    const report = buildDoctorReport(facts({ store }));
+    expect(codeFor(report, "queue.abc-11111111")).toBe("QUEUE_ORPHANED"); // no peer rows in this db
+    expect(doctorExitCode(report)).not.toBe(2);
+    db.close();
+  });
+
+  it("does not claim an empty queue when the store could not be read", () => {
+    const report = buildDoctorReport(facts({
+      store: {
+        ...emptyStore, integrity: "unreadable", integrity_detail: "disk I/O error", queues_read: false,
+      },
+    }));
+    expect(codeFor(report, "queue")).toBe("QUEUE_UNAVAILABLE");
+    // The success codes the old version emitted over unread data must not appear at all.
+    expect(report.checks.map((c) => c.code)).not.toContain("QUEUE_EMPTY");
+    expect(report.checks.map((c) => c.code)).not.toContain("QUEUE_LEASE_OK");
+  });
+
+  it("treats an absent store as an absent queue rather than a failure", () => {
+    const report = buildDoctorReport(facts({
+      store: { ...emptyStore, integrity: "missing", integrity_detail: "no store file", queues_read: false },
+    }));
+    const c = report.checks.find((x) => x.id === "queue");
+    expect(c?.code).toBe("QUEUE_UNAVAILABLE");
+    expect(c?.severity).toBe("ok");
+  });
+
+  it("probes panes concurrently, preserving peer order", async () => {
+    const db = makeDb();
+    for (const id of ["p-1", "p-2", "p-3"]) {
+      addPeer(db, { id, delivery_kind: "tmux", tmux_pane: `%${id}` });
+    }
+    let inFlight = 0;
+    let peak = 0;
+    const peers = await resolvePeerFacts(readStoredPeers(db), {
+      nowMs: NOW,
+      isPidAlive: () => true,
+      probePane: async () => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        await new Promise((r) => setTimeout(r, 20));
+        inFlight--;
+        return classifyPaneReadiness("node");
+      },
+    });
+    expect(peak).toBe(3);
+    expect(peers.map((p) => p.id)).toEqual(["p-1", "p-2", "p-3"]);
+    db.close();
+  });
+
+  it("reports a process that answers with an HTTP error as alive-but-broken, not unreachable", async () => {
+    const broker = await probeBroker(
+      fakeFetch({ "/health": { ok: false, status: 500 }, "/list-peers": { ok: false, status: 500 } }),
+      "http://127.0.0.1:7899",
+    );
+    expect(broker.reachable).toBe(true);
+    const report = buildDoctorReport(facts({ broker }));
+    expect(codeFor(report, "broker.process")).toBe("BROKER_HEALTH_ERROR");
+    // The remediation must not be "start the broker" — one is already running on that port.
+    expect(report.checks.find((c) => c.id === "broker.process")?.remediation).not.toContain("auto-launches");
+  });
+
+  it("still reports unreachable when nothing answers at all", async () => {
+    const broker = await probeBroker(fakeFetch({}), "http://127.0.0.1:7899");
+    expect(broker.reachable).toBe(false);
+    expect(codeFor(buildDoctorReport(facts({ broker })), "broker.process")).toBe("BROKER_UNREACHABLE");
+  });
+
+  it("redacts the status and machine strings the local broker reports", async () => {
+    const broker = await probeBroker(
+      fakeFetch({
+        "/health": { body: { status: "ok\n[ok  ] Broker process: BROKER_OK", peers: 0, machine: "a\nb", protocol_version: PROTOCOL_VERSION } },
+        "/list-peers": { body: [] },
+      }),
+      "http://127.0.0.1:7899",
+    );
+    expect(broker.status).not.toContain("\n");
+    expect(broker.machine).not.toContain("\n");
+    const report = buildDoctorReport(facts({ broker }));
+    // The doctored status does not equal "ok", so it reads as unhealthy — and the forged line it
+    // tried to smuggle in is now inside that check's own detail line, not a line of its own.
+    expect(codeFor(report, "broker.process")).toBe("BROKER_UNHEALTHY");
+    const text = formatDoctorReport(report);
+    expect(text.split("\n").filter((l) => l.startsWith("[ok  ] Broker process")).length).toBe(0);
+  });
+
+  it("reports a non-array siblings field as a config failure instead of throwing", () => {
+    const report = buildDoctorReport(facts({
+      config: { path: "/etc/claude-peers.json", loaded: true, defaulted: false, siblings_invalid: true, error: null },
+      siblings: [],
+    }));
+    expect(codeFor(report, "config.source")).toBe("CONFIG_SIBLINGS_INVALID");
+    expect(doctorExitCode(report)).toBe(2);
+    // Still a complete, serializable report — the point of degrading rather than throwing.
+    expect(() => JSON.stringify(report)).not.toThrow();
+  });
+
+  it("judges lease expiry against the observation time, not a pre-probe clock", () => {
+    const db = makeDb();
+    // A lease that is live at NOW and expired 3s later, the span a slow network probe burns.
+    addMessage(db, { delivery_state: "delivering", lease_expires_at: NOW + 2000, lease_token: "live" });
+    expect(readStoreFacts(db, "/tmp/peers.db", NOW, 3).stalled_leases).toEqual([]);
+    const later = readStoreFacts(db, "/tmp/peers.db", NOW + 3000, 3);
+    expect(later.stalled_leases).toHaveLength(1);
+    expect(codeFor(buildDoctorReport(facts({ store: later })), "queue.leases")).toBe("QUEUE_LEASE_STALLED");
+    db.close();
+  });
+});
+
 describe("doctor: healthy state", () => {
   it("passes every check on a healthy node and exits 0", async () => {
     const db = makeDb();
@@ -488,7 +629,7 @@ describe("doctor: healthy state", () => {
 
   it("gives every non-ok check a stable code and a remediation", () => {
     const report = buildDoctorReport(facts({
-      config: { path: "/nope.json", loaded: false, defaulted: false, error: "boom" },
+      config: { path: "/nope.json", loaded: false, defaulted: false, siblings_invalid: false, error: "boom" },
       broker: {
         url: "http://127.0.0.1:7899", reachable: false, error: "refused", status: null,
         protocol_version: null, machine: null, local_peer_count: null, remote_peer_count: null,
