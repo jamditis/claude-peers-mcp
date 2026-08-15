@@ -9,13 +9,15 @@
 
 import { Database } from "bun:sqlite";
 import {
-  bumpsIdleWindow, claimForDelivery, confirmDelivered, DEFAULT_DEFERRAL_ESCALATION_CAP,
-  decideDeferralEscalation, deliverViaTmux, ensureMessagesTable,
+  bumpPushFailures, bumpsIdleWindow, claimForDelivery, confirmDelivered, countsAsPushFailure, DEFAULT_DEFERRAL_ESCALATION_CAP,
+  DEFAULT_PUSH_FAILURE_DEMOTION_CAP, decideDeferralEscalation, decidePushDemotion,
+  demoteQueuedPushable, deliverViaTmux, ensureMessagesTable,
   formatPeerMessage, generateAuthToken, generateLeaseToken, hasDuePush,
-  isFederationRoute, isLoopback, isMessageDelivered, isPidDead, makeSpawnTmuxQuery,
+  isFederationRoute, isLoopback, isMessageDelivered, isPidDead, makeSpawnTmuxQuery, makeSpawnTmuxSend,
   migrateMessagesSchema, nextDeliverable, pidProbe, promoteQueuedForFlush,
-  pruneMessages, pushAfterFor, reclaimIfExpired, reclaimLeaklessDelivering,
-  releasableQueuedPrefix, releaseToQueued, resetDeliveringOnStart, type TmuxQuery, type TmuxSpawn,
+  pruneMessages, pushAfterFor, readPushAfter, reclaimIfExpired, reclaimLeaklessDelivering, reportedPollOnly,
+  releasableQueuedPrefix, releaseToQueued, resetDeliveringOnStart, resetPushFailures,
+  type TmuxQuery, type TmuxSpawn,
 } from "./delivery.ts";
 import { loadConfig, type SiblingConfig } from "./shared/config.ts";
 import { displaySessionName } from "./shared/format-peers.ts";
@@ -510,13 +512,12 @@ if (import.meta.main) {
     //
     // What bounds the silence is the push LEAVING the queue, which is not the same as the push
     // delay lapsing: releaseToQueued requeues a failed attempt with its push_after intact, so a
-    // pane whose send-keys keeps failing holds this guard closed on every heartbeat and the
-    // poll-only mail behind it is never announced (issue #70, pinned by a test). That mail is
-    // still readable and its check_messages still drains it; the near-real-time wake is the loss.
-    // Ringing anyway is no fix for a max-pending-id marker: it strands the row, per the reason
-    // above. That reason is the clamp refusing a repeat, though, not the push failing, and only a
-    // marker whose value can revisit a number produces a repeat to refuse. Whether #70 is fixed in
-    // the push path or in what the marker counts is open (#70).
+    // pane whose send-keys keeps failing would hold this guard closed on every heartbeat and the
+    // poll-only mail behind it would never be announced (issue #70). Ringing anyway is no fix at
+    // this layer — for the reason above, the marker would be spent on mail the poll cannot reach —
+    // so the bound comes from the push path instead: after PUSH_FAILURE_DEMOTION_CAP consecutive
+    // failed sends notePushFailure clears the row's push_after, the row leaves the pushable
+    // channel, and this guard opens on that same burst's settle.
     //
     // Past this test, every pending row is one a poll releases now and nothing will intervene:
     // no lease is open, and none is coming. That is the marker's whole promise, so asking
@@ -623,6 +624,7 @@ if (import.meta.main) {
   const FORWARD_TIMEOUT_MS = 5_000; // abort bound on an outbound cross-machine forward fetch
   const MAX_HEARTBEAT_DRAIN = 50; // upper bound on pushes drained per heartbeat
   const DEFERRAL_ESCALATION_CAP = DEFAULT_DEFERRAL_ESCALATION_CAP; // not-ready deferrals before a stuck pane escalates (#42)
+  const PUSH_FAILURE_DEMOTION_CAP = DEFAULT_PUSH_FAILURE_DEMOTION_CAP; // failed pushes of one row before it goes poll-only (#70)
   // Deliveries currently being attempted. Read by the retire-drain (Task 9) and the
   // empty-broker self-exit (Task 14) so the broker never exits mid-delivery.
   let inFlightDeliveries = 0;
@@ -682,12 +684,10 @@ if (import.meta.main) {
     process.exit(0);
   }
 
-  const realTmuxSpawn: TmuxSpawn = async (args) => {
-    const proc = Bun.spawn(args, { stdout: "ignore", stderr: "ignore" });
-    const timer = setTimeout(() => { try { proc.kill(); } catch {} }, TMUX_TIMEOUT_MS);
-    try { const exitCode = await proc.exited; return { exitCode }; }
-    finally { clearTimeout(timer); }
-  };
+  // Kills a send that outlives TMUX_TIMEOUT_MS and reports that it did so: a killed process
+  // resolves 128+signal, which the delivery path would otherwise read as the pane refusing the
+  // keystrokes and hold against the row's #70 streak (see makeSpawnTmuxSend).
+  const realTmuxSpawn: TmuxSpawn = makeSpawnTmuxSend(TMUX_TIMEOUT_MS);
 
   // Same shape as realTmuxSpawn but pipes stdout so a readiness probe can read the pane's
   // foreground command. Used only for the pre-send pane check (display-message), never for
@@ -771,6 +771,41 @@ if (import.meta.main) {
     return withDeliveryBurst(toId, () => attemptDeliverNext(toId));
   }
 
+  // Record one failed push of a row and, once its run of consecutive failures reaches the cap,
+  // take this recipient's whole queued pushable backlog out of the push channel (#70). Demotion is
+  // not a drop: every row keeps its text and its place in the queue, check_messages still drains
+  // them, and — the point — clearing push_after opens ringDoorbellAfterSettle's withhold, so the
+  // demoted rows and the poll-only mail stuck behind them are announced by the doorbell on this
+  // very burst's settle instead of never.
+  //
+  // The streak is counted per row (the row is what kept failing) but spent per recipient, because
+  // what it proves is about the PANE: a session that refused `cap` sends in a row will refuse the
+  // next row just as surely. Demoting only the failing row leaves the one behind it pushable, so
+  // the withhold stays shut and every younger row has to earn its own full run — the backlog case
+  // the guard was supposed to open for. Mail arriving after this starts pushable again, so a
+  // recovered pane is retried and the cost of a still-broken one is one cap-run per recovery
+  // attempt (see demoteQueuedPushable).
+  //
+  // Losing push urgency is a real demotion, so it is logged rather than done quietly, and an
+  // interrupt row (a sender blocked on this recipient) says so in the same line: the send-keys
+  // path is what failed, and a message that was meant to type itself into the pane now waits for
+  // a poll. Accepted, because the alternative is retrying a pane that has failed `cap` times in a
+  // row while its recipient hears nothing at all.
+  function notePushFailure(row: { id: number; to_id: string; urgency: string }): void {
+    const failures = bumpPushFailures(db, row.id);
+    const decision = decidePushDemotion(failures, PUSH_FAILURE_DEMOTION_CAP);
+    if (!decision.demote) return;
+    const { demoted, interrupts } = demoteQueuedPushable(db, row.to_id);
+    if (demoted === 0) return;
+    // The interrupt count is over the whole demoted set, not the row that tripped the cap: a
+    // `normal` head can have interrupts queued behind it, and those senders are the ones blocked
+    // on this recipient. Reporting only the head's urgency lost them silently.
+    const lost = interrupts > 0
+      ? ` ${interrupts} of them ${interrupts === 1 ? "was an interrupt, whose sender is blocked on this peer; it loses" : "were interrupts, whose senders are blocked on this peer; they lose"} push urgency and now wait for check_messages/the doorbell`
+      : " they stay queued for check_messages and the doorbell now announces them";
+    console.error(`[claude-peers broker] demoting ${demoted} queued message(s) for peer ${row.to_id} to poll-only: message #${row.id} hit ${decision.reason} consecutive failed pushes (send-keys ran and missed), so this pane is not accepting keystrokes;${lost}`);
+  }
+
   async function attemptDeliverNext(toId: string): Promise<"accepted" | "queued" | null> {
     if (recipientsInFlight.has(toId)) return null;
     const now = Date.now();
@@ -796,6 +831,7 @@ if (import.meta.main) {
     activeRowIds.add(row.id);
     inFlightDeliveries++;
     let deferredThisAttempt = false;
+    let faultedThisAttempt = false;
     try {
       const text = formatPeerMessage(row);
       // The query arg enables a pre-send readiness probe: if the pane's foreground process is
@@ -815,7 +851,11 @@ if (import.meta.main) {
           if (decideDeferralEscalation(streak, DEFERRAL_ESCALATION_CAP).escalate) {
             console.error(`[claude-peers broker] escalation: pane ${target.pane} (peer ${toId}) deferred ${streak}x in a row (${reason}); no live Claude foreground seen, so its peer mail is not being delivered — if the session exited to a shell under a still-live pid the dead-pid sweep will not reap it`);
           }
-        });
+        },
+        // onFault: the spawn never ran, so this attempt is evidence about the host, not the pane.
+        // It must not accrue toward the #70 demotion streak — an environment outage lasting a few
+        // heartbeats would otherwise strip a row (worst, an interrupt) of its push channel.
+        () => { faultedThisAttempt = true; });
       // A 0 exit from send-keys is not proof a live peer consumed the text: the recipient can
       // die after the lease is claimed (before or during the await), leaving a pane that
       // outlived the Claude process — now a bare shell — that still accepts keystrokes and exits
@@ -827,12 +867,25 @@ if (import.meta.main) {
       // retention prune bounds an orphan.
       if (ok && peerConfirmable(toId) && confirmDelivered(db, row.id, token)) {
         deferralStreaks.delete(toId);   // delivered: the pane is healthy, clear any streak
+        resetPushFailures(db, row.id);  // and the row's failed-push run ends here (#70)
         return "accepted";
       }
       // Any non-deferred miss (send failed, peer died mid-send) also breaks the not-ready run:
       // only an unbroken streak of shell deferrals should accrue toward the stuck-pane escalation.
       if (!deferredThisAttempt) deferralStreaks.delete(toId);
       releaseToQueued(db, row.id, token);
+      // A send that RAN and missed (send-keys exited non-zero) is the #70 case: the row returns to
+      // queued still pushable, so the next heartbeat retries it and the doorbell's withhold stays
+      // shut on the poll-only mail behind it. Count it, and once the run reaches the cap demote the
+      // row out of the push channel. The three other ways to reach this line are excluded on
+      // purpose: a readiness deferral never sent anything (it has its own #42 counter above), a
+      // spawn fault never reached the pane at all (faultedThisAttempt — a tmux that is briefly
+      // unspawnable is not a broken pane, and penalizing the row for it is the exact transient
+      // this streak exists to survive), and a peer that died mid-send is handled by the dead-pid
+      // sweep, not here.
+      if (countsAsPushFailure({ ok, deferred: deferredThisAttempt, faulted: faultedThisAttempt })) {
+        notePushFailure(row);
+      }
       return "queued";
     } catch {
       deferralStreaks.delete(toId);   // a spawn fault is not a readiness deferral
@@ -1063,7 +1116,21 @@ if (import.meta.main) {
     // its sender an accurate queued-vs-poll-only signal (#39). The same union the burst's bell
     // asks over the pending set, and the one deliverNext gates delivery on, so the sender's
     // answer, the recipient's bell, and the actual push behavior cannot drift apart.
-    return { ok: true, delivery, poll_only: isPollOnly(body.to_id, pushAfter) };
+    //
+    // Read push_after back from the row rather than reusing the value inserted above: the burst
+    // just ran, and a push that hit the failure cap in it demotes this recipient's whole queued
+    // backlog — this row included (#70). The inserted value would then claim a push that has
+    // already been taken away, which is the one answer the sender must not be given.
+    //
+    // That read is only conclusive for attempts THIS request drove. If another request owns the
+    // recipient's attempt, our deliverNext returned at the recipientsInFlight guard without
+    // waiting, so the reading predates that attempt's outcome and a demotion may be moments away.
+    // recipientsInFlight can only name a foreign attempt here — our own burst has settled, and
+    // attemptDeliverNext clears the flag in its finally — so it is exactly the "cannot confirm"
+    // signal, and reportedPollOnly turns it into an absent field rather than a confident guess.
+    const contended = recipientsInFlight.has(body.to_id);
+    const pollOnly = isPollOnly(body.to_id, readPushAfter(db, forwardedRowId, pushAfter));
+    return { ok: true, delivery, poll_only: reportedPollOnly(pollOnly, contended) };
   }
 
   function handleGossip(body: GossipRequest): { ok: boolean } {
