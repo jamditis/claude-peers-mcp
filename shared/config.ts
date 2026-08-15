@@ -26,7 +26,9 @@ export interface PeersConfig {
   auto_summary: boolean;
 }
 
-const DEFAULT_PUSH_DELAY_MS = 120_000;
+// Exported so a caller that has no loaded config (cli.ts doctor, which must still run when the
+// config is broken) judges timing against the same default the broker would have used.
+export const DEFAULT_PUSH_DELAY_MS = 120_000;
 
 const REQUIRED_FIELDS = ["machine", "tailscale_ip", "port", "id_prefix", "siblings", "allowed_ips"] as const;
 

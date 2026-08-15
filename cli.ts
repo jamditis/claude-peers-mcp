@@ -9,14 +9,27 @@
  *   bun cli.ts status          — Show broker status and all peers
  *   bun cli.ts peers           — List all peers
  *   bun cli.ts send <id> [--urgency <tier>] <msg> — Send a message to a peer
+ *   bun cli.ts doctor [--json] — Diagnose broker, backend, and queue health
  *   bun cli.ts ping-siblings   — Ping all sibling brokers and report latency
  *   bun cli.ts kill-broker     — Stop the broker daemon
  */
 
-import { type FSWatcher, mkdirSync, watch, writeFileSync } from "node:fs";
+import { Database } from "bun:sqlite";
+import { existsSync, type FSWatcher, mkdirSync, watch, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import {
+  buildPaneCommandArgs, classifyPaneReadiness, 
+  isPidDead, makeSpawnTmuxQuery,pidProbe, resolveChannelPushCap,
+} from "./delivery.ts";
 import type { PeersConfig } from "./shared/config.ts";
-import { loadConfig } from "./shared/config.ts";
+import { DEFAULT_PUSH_DELAY_MS, loadConfig } from "./shared/config.ts";
+import {
+  buildDoctorReport, type ConfigFacts, doctorExitCode, formatDoctorReport,
+  partitionSiblings, probeBroker, probeSiblings, readStoredPeers, readStoreFacts, resolveDoctorDbPath, resolvePeerFacts,
+  type StoreFacts,
+} from "./shared/doctor.ts";
 import { doorbellDir, doorbellPath, readDoorbell } from "./shared/notify.ts";
+import { PROTOCOL_VERSION } from "./shared/types.ts";
 import { urgencyDegradesWarning } from "./shared/urgency.ts";
 
 // Load config once; CLI may run without it for basic commands
@@ -219,6 +232,112 @@ switch (cmd) {
       }
     }
     break;
+  }
+
+  // Operator diagnostics (issue #73). Strictly read-only: it probes /health and /list-peers,
+  // opens db_path readonly, and asks tmux what a pane is running. It registers nothing, marks
+  // nothing delivered, and reads no message text — every queue answer below is a count or an age.
+  //
+  // It also deliberately does NOT refuse an older broker the way server.ts does: a diagnostic
+  // that bails on the exact fault it is meant to explain is useless, so an old broker is reported
+  // as a check, not treated as fatal.
+  case "doctor": {
+    const asJson = process.argv.slice(3).includes("--json");
+    const configPath = process.env.CLAUDE_PEERS_CONFIG || `${homedir()}/.claude-peers.json`;
+    // loadConfig validates that the required keys are PRESENT, not that they hold the right
+    // shape, so `"siblings": {}`, `[null]`, and `[{"machine":"b"}]` all load and then throw in
+    // the first loop that iterates them. Doctor must survive a broken config — reporting one is
+    // half its job — so the entries are partitioned here: the probeable ones are probed, and the
+    // rest become a check instead of an unhandled throw that would leave --json emitting nothing.
+    const { valid: siblings, invalid: siblingsInvalid } = partitionSiblings(config?.siblings);
+    const configFacts: ConfigFacts = {
+      path: configPath,
+      loaded: config !== null,
+      // loadConfig falls back to the zero-config single-host default only when no path was
+      // explicitly requested AND the default file is absent — reproduce that test here so the
+      // report says which of the two states this host is in.
+      defaulted: config !== null && process.env.CLAUDE_PEERS_CONFIG === undefined && !existsSync(configPath),
+      siblings_invalid: config === null ? [] : siblingsInvalid,
+      error: config === null ? "config could not be loaded (missing, unreadable, or invalid JSON)" : null,
+    };
+
+    const doctorFetch = async (url: string, body?: unknown) => {
+      const res = await fetch(url, {
+        signal: AbortSignal.timeout(3000),
+        ...(body === undefined
+          ? {}
+          : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+      });
+      return { ok: res.ok, status: res.status, json: () => res.json() as Promise<unknown> };
+    };
+    // The network probes come first and can take seconds (a sibling on a dead tailnet burns the
+    // full timeout), so the store is read against a clock sampled AFTER them, not before. With a
+    // stale timestamp a lease that expired during those seconds still reads as live, and doctor
+    // would report QUEUE_LEASE_OK over a jam that was already stuck by the time it looked.
+    const [broker, siblingProbes] = await Promise.all([
+      probeBroker(doctorFetch, BROKER_URL),
+      probeSiblings(doctorFetch, siblings, () => Date.now()),
+    ]);
+
+    const observedMs = Date.now();
+    // SQLite is read directly, and on purpose: it is the one source that still answers when the
+    // broker is down, which is exactly when an operator wants to know what is stuck in the queue.
+    const dbPath = resolveDoctorDbPath(config?.db_path, process.env.CLAUDE_PEERS_DB, `${homedir()}/.claude-peers.db`);
+    let store: StoreFacts = {
+      path: dbPath, integrity: "missing", integrity_detail: "no store file",
+      queues_read: false, read_error: null, queues: [], stalled_leases: [], push_capped: [],
+    };
+    let peers: Awaited<ReturnType<typeof resolvePeerFacts>> = [];
+    // An absent store has no peer table to read, and that is a reading, not a failure: it means
+    // no session has ever registered here. Only a store that exists and could not be read leaves
+    // this false (see checkPeers).
+    let peersRead = !existsSync(dbPath);
+    if (existsSync(dbPath)) {
+      let db: Database | null = null;
+      try {
+        db = new Database(dbPath, { readonly: true });
+        store = readStoreFacts(db, dbPath, observedMs, resolveChannelPushCap(process.env.CLAUDE_PEERS_CHANNEL_PUSH_CAP));
+        const stored = readStoredPeers(db);
+        // The readiness classifier the broker itself uses (classifyPaneReadiness), so doctor
+        // reports exactly the state that would gate a real push. Unlike probePaneReadiness,
+        // a faulted probe throws here instead of failing open: delivery must fail open, but a
+        // diagnostic must say "unknown" rather than claim a pane it never read is ready.
+        const query = makeSpawnTmuxQuery(2000);
+        peers = await resolvePeerFacts(stored, {
+          nowMs: observedMs,
+          isPidAlive: (pid) => !isPidDead(pidProbe(pid)),
+          probePane: async (pane, socket) => {
+            const { exitCode, stdout } = await query(buildPaneCommandArgs(pane, socket));
+            if (exitCode !== 0) throw new Error(`tmux probe exited ${exitCode}`);
+            return classifyPaneReadiness(stdout);
+          },
+        });
+        peersRead = true;
+      } catch (e) {
+        store = {
+          ...store, integrity: "unreadable",
+          integrity_detail: e instanceof Error ? e.message : String(e),
+        };
+      } finally {
+        db?.close();
+      }
+    }
+
+    const report = buildDoctorReport({
+      now_ms: observedMs,
+      expected_protocol: PROTOCOL_VERSION,
+      push_delay_ms: config?.push_delay_ms ?? DEFAULT_PUSH_DELAY_MS,
+      config: configFacts,
+      broker,
+      siblings: siblingProbes,
+      peers,
+      peers_read: peersRead,
+      store,
+    });
+    console.log(asJson ? JSON.stringify(report, null, 2) : formatDoctorReport(report));
+    // 0 clean, 1 warnings only, 2 any failure — so a monitor can alert on 2 alone.
+    process.exit(doctorExitCode(report));
+    break; // unreachable past process.exit; kept so the case cannot fall through if that changes
   }
 
   case "ping-siblings": {
@@ -454,6 +573,7 @@ Usage:
   bun cli.ts peers           List all peers
   bun cli.ts send <id> [--urgency interrupt|normal|fyi] <msg> Send a message to a peer
   bun cli.ts doorbell <id> [--since <id>] [--timeout <sec>] [--watch] Wait until <id> has mail, then exit (near-real-time wake for non-tmux sessions)
+  bun cli.ts doctor [--json]  Diagnose broker, backend, and queue health (exit 0 ok, 1 warnings, 2 failures)
   bun cli.ts ping-siblings   Ping all sibling brokers and report latency
   bun cli.ts kill-broker     Stop the broker daemon`);
 }

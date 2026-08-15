@@ -518,7 +518,10 @@ export function isMessageDelivered(db: Database, id: number): boolean {
 // null-token row, which nextDeliverable treats as a live lease and would block until the arbitrary
 // timestamp. Migrated legacy tables carry no CHECK (SQLite can't add one via ALTER TABLE ADD
 // COLUMN), so this runtime predicate is their only enforcement — it must cover the whole invariant.
-const HOLDERLESS_DELIVERING = "delivery_state='delivering' AND (lease_expires_at IS NULL OR lease_token IS NULL)";
+// Exported so `bun cli.ts doctor` diagnoses the same orphan set the sweep repairs, rather than
+// hand-copying half of it: a doctor predicate that checked only lease expiry would call a
+// future-lease / null-token row healthy while reclaimLeaklessDelivering was reclaiming it.
+export const HOLDERLESS_DELIVERING = "delivery_state='delivering' AND (lease_expires_at IS NULL OR lease_token IS NULL)";
 
 /** Invariant: a 'delivering' row always holds a non-null lease AND token. Returns the count that violate it. */
 export function findLeaklessDelivering(db: Database): number {
@@ -1072,6 +1075,22 @@ export function isLoopback(ip: string): boolean {
  */
 export function isFederationRoute(path: string): boolean {
   return path === "/gossip" || path === "/forward-message";
+}
+
+/**
+ * Whether a control-plane POST counts as local work for the broker's idle self-exit window.
+ *
+ * Federation traffic never has (a chatty sibling must not keep a locally-idle broker alive), and
+ * /list-peers now joins it: listing is read-only browsing that creates no session and no mail, so
+ * it is the same class of traffic as the /health GET, which never counted either. Nothing changes
+ * for a real session — a registered peer blocks idle exit via hasRecoverableLocalPeer regardless
+ * of what it calls. What it fixes is a caller that lists WITHOUT registering: `bun cli.ts peers`,
+ * and above all `bun cli.ts doctor`, whose whole contract is to observe without perturbing. On a
+ * monitoring interval shorter than the idle window, a listing bump would hold an empty broker
+ * open forever, so the diagnostic would be the reason the thing it reports on never reaped itself.
+ */
+export function bumpsIdleWindow(path: string): boolean {
+  return !isFederationRoute(path) && path !== "/list-peers";
 }
 
 /**
