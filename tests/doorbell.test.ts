@@ -569,8 +569,9 @@ describe("a ring waits for a push that is coming later, not just one already in 
 
   // Demoting an interrupt row is the one case where the fix costs something a caller asked for:
   // the sender said it was blocked on this recipient, and the row now waits for a poll. That is
-  // accepted, but it must not happen silently, so the broker says so on stderr.
-  it("logs when the demoted row was an interrupt (issue #70)", async () => {
+  // accepted, but it must not happen silently, so the broker says so on stderr — and it must say
+  // so for the interrupts BEHIND the row that tripped the cap, which a head-only log lost.
+  it("names the interrupt count among the demoted rows, not just the head's urgency (issue #70)", async () => {
     writeFileSync(CONFIG_PATH_LOUD, JSON.stringify({
       machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_LOUD,
       id_prefix: "dbl", siblings: [], allowed_ips: ["127.0.0.1"], db_path: DB_PATH_LOUD,
@@ -584,18 +585,26 @@ describe("a ring waits for a push that is coming later, not just one already in 
       expect(await waitForHealth(PORT_LOUD)).toBe(true);
       const rcpt = await regRcpt({ cwd: "/tmp/loud", tmux_pane: FAIL_PANE }, PORT_LOUD);
       const sender = await regSender({ cwd: "/tmp/loud-s" }, PORT_LOUD);
-      // An interrupt is due on arrival whatever push_delay_ms is, so the send attempts at once.
+      // A `normal` head (not yet due, so this send attempts nothing) with an interrupt queued
+      // behind it. The interrupt is due on arrival, which promotes the head to ride the same
+      // flush, so every attempt from here lands on the normal row and the cap trips there —
+      // while the message whose sender is actually blocked sits behind it.
+      await okAt(PORT_LOUD, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "ordinary", urgency: "normal" }, sender.token);
+      const headId = (await okAt(PORT_LOUD, "/peek", { id: rcpt.id }, rcpt.token)).max_id;
       await okAt(PORT_LOUD, "/send-message",
         { from_id: sender.id, to_id: rcpt.id, text: "blocked on you", urgency: "interrupt" }, sender.token);
-      const id = (await okAt(PORT_LOUD, "/peek", { id: rcpt.id }, rcpt.token)).max_id;
+      const maxId = (await okAt(PORT_LOUD, "/peek", { id: rcpt.id }, rcpt.token)).max_id;
+      expect(maxId).toBeGreaterThan(headId);
       for (let i = 0; i < 4; i++) await okAt(PORT_LOUD, "/heartbeat", { id: rcpt.id }, rcpt.token);
 
-      expect(readDoorbell(DB_PATH_LOUD, rcpt.id, -1)).toBe(id); // demoted, so announced
+      expect(readDoorbell(DB_PATH_LOUD, rcpt.id, -1)).toBe(maxId); // demoted, so announced
       loud.kill();
       await loud.exited;
       const err = await new Response(loud.stderr).text();
-      expect(err).toContain(`message #${id} hit`);
-      expect(err).toContain("interrupt");
+      expect(err).toContain("demoting 2 queued message(s)");
+      expect(err).toContain(`message #${headId} hit`);   // the normal row tripped the cap
+      expect(err).toContain("1 of them was an interrupt"); // and the one behind it is not lost
     } finally {
       loud.kill();
       await loud.exited;
@@ -655,6 +664,58 @@ describe("a ring waits for a push that is coming later, not just one already in 
     } finally {
       bulk.kill();
       await bulk.exited;
+    }
+  }, 20_000);
+
+  const PORT_FWD = 17951;
+  const DB_PATH_FWD = join(work, "fwd70.db");
+  const CONFIG_PATH_FWD = join(work, "fwd70-config.json");
+
+  // The sender-facing half of bulk demotion. An unfloored forward inserts a pushable row and then
+  // runs a delivery burst; if that burst trips the cap, the row it just inserted is demoted with
+  // the rest of the backlog. The disposition returned to the originating broker is computed after
+  // that burst, so it must be read from the row -- the inserted value would promise the sender a
+  // push that has already been taken away (#39's signal, broken by #70's fix if reported stale).
+  it("reports poll_only truthfully when the forward's own burst demotes it (issue #70)", async () => {
+    writeFileSync(CONFIG_PATH_FWD, JSON.stringify({
+      machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_FWD,
+      id_prefix: "dbw", siblings: [], allowed_ips: ["127.0.0.1"], db_path: DB_PATH_FWD,
+      push_delay_ms: 0, floor_remote_forwards: false, // unfloored: a forward is pushable here
+    }));
+    const fwd = Bun.spawn(["bun", "broker.ts"], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH_FWD, PATH: `${work}:${process.env.PATH}` },
+      stdout: "ignore", stderr: "ignore",
+    });
+    try {
+      expect(await waitForHealth(PORT_FWD)).toBe(true);
+      const rcpt = await regRcpt({ cwd: "/tmp/fwd70", tmux_pane: FAIL_PANE }, PORT_FWD);
+      const sender = await regSender({ cwd: "/tmp/fwd70-s" }, PORT_FWD);
+
+      // Walk the head row to one failure below the cap: the send attempts once, then three
+      // heartbeats. The next attempt is the one that demotes, whoever triggers it.
+      await okAt(PORT_FWD, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "cannot land", urgency: "normal" }, sender.token);
+      for (let i = 0; i < 3; i++) await okAt(PORT_FWD, "/heartbeat", { id: rcpt.id }, rcpt.token);
+
+      // The forward inserts its own pushable row and drives the burst that trips the cap.
+      const res = await okAt(PORT_FWD, "/forward-message", {
+        protocol_version: PROTOCOL_VERSION, from_id: "remote-peer", to_id: rcpt.id,
+        text: "from another machine", from_machine: "db-b", urgency: "normal",
+      });
+      expect(res.ok).toBe(true);
+      expect(res.delivery).toBe("queued");
+      expect(res.poll_only).toBe(true); // demoted mid-burst, so nothing will push it
+
+      const probe = new Database(DB_PATH_FWD);
+      const forwarded = probe.query(
+        "SELECT push_after AS p FROM messages WHERE to_id = ? AND from_id = 'remote-peer'",
+      ).get(rcpt.id) as { p: number | null };
+      probe.close();
+      expect(forwarded.p).toBeNull(); // which is exactly what the row says
+    } finally {
+      fwd.kill();
+      await fwd.exited;
     }
   }, 20_000);
 });

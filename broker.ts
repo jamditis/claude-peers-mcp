@@ -15,7 +15,7 @@ import {
   formatPeerMessage, generateAuthToken, generateLeaseToken, hasDuePush,
   isFederationRoute, isLoopback, isMessageDelivered, isPidDead, makeSpawnTmuxQuery, makeSpawnTmuxSend,
   migrateMessagesSchema, nextDeliverable, pidProbe, promoteQueuedForFlush,
-  pruneMessages, pushAfterFor, reclaimIfExpired, reclaimLeaklessDelivering,
+  pruneMessages, pushAfterFor, readPushAfter, reclaimIfExpired, reclaimLeaklessDelivering,
   releasableQueuedPrefix, releaseToQueued, resetDeliveringOnStart, resetPushFailures,
   type TmuxQuery, type TmuxSpawn,
 } from "./delivery.ts";
@@ -795,12 +795,15 @@ if (import.meta.main) {
     const failures = bumpPushFailures(db, row.id);
     const decision = decidePushDemotion(failures, PUSH_FAILURE_DEMOTION_CAP);
     if (!decision.demote) return;
-    const demoted = demoteQueuedPushable(db, row.to_id);
+    const { demoted, interrupts } = demoteQueuedPushable(db, row.to_id);
     if (demoted === 0) return;
-    const lost = row.urgency === "interrupt"
-      ? ` message #${row.id} was an interrupt, so it loses its push urgency and now waits for check_messages/the doorbell`
-      : "";
-    console.error(`[claude-peers broker] demoting ${demoted} queued message(s) for peer ${row.to_id} to poll-only: message #${row.id} hit ${decision.reason} consecutive failed pushes (send-keys ran and missed), so this pane is not accepting keystrokes;${lost || " they stay queued for check_messages and the doorbell now announces them"}`);
+    // The interrupt count is over the whole demoted set, not the row that tripped the cap: a
+    // `normal` head can have interrupts queued behind it, and those senders are the ones blocked
+    // on this recipient. Reporting only the head's urgency lost them silently.
+    const lost = interrupts > 0
+      ? ` ${interrupts} of them ${interrupts === 1 ? "was an interrupt, whose sender is blocked on this peer; it loses" : "were interrupts, whose senders are blocked on this peer; they lose"} push urgency and now wait for check_messages/the doorbell`
+      : " they stay queued for check_messages and the doorbell now announces them";
+    console.error(`[claude-peers broker] demoting ${demoted} queued message(s) for peer ${row.to_id} to poll-only: message #${row.id} hit ${decision.reason} consecutive failed pushes (send-keys ran and missed), so this pane is not accepting keystrokes;${lost}`);
   }
 
   async function attemptDeliverNext(toId: string): Promise<"accepted" | "queued" | null> {
@@ -1113,7 +1116,12 @@ if (import.meta.main) {
     // its sender an accurate queued-vs-poll-only signal (#39). The same union the burst's bell
     // asks over the pending set, and the one deliverNext gates delivery on, so the sender's
     // answer, the recipient's bell, and the actual push behavior cannot drift apart.
-    return { ok: true, delivery, poll_only: isPollOnly(body.to_id, pushAfter) };
+    //
+    // Read push_after back from the row rather than reusing the value inserted above: the burst
+    // just ran, and a push that hit the failure cap in it demotes this recipient's whole queued
+    // backlog — this row included (#70). The inserted value would then claim a push that has
+    // already been taken away, which is the one answer the sender must not be given.
+    return { ok: true, delivery, poll_only: isPollOnly(body.to_id, readPushAfter(db, forwardedRowId, pushAfter)) };
   }
 
   function handleGossip(body: GossipRequest): { ok: boolean } {

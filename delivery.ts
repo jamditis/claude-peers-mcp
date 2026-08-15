@@ -348,12 +348,35 @@ export function resetPushFailures(db: Database, id: number): void {
  *
  * Scoped to 'queued' + still-pushable rows, so it can never race a live lease (a 'delivering' row
  * belongs to an in-flight attempt) and never rewrites an already-demoted row.
+ *
+ * Reports how many of the demoted rows were `interrupt`, counted over the same predicate just
+ * before the UPDATE, because that is the part a human needs told: an interrupt says its sender is
+ * blocked on this recipient, and demotion takes away the push it asked for. The caller cannot
+ * recover the number afterwards (the rows are demoted by then) and cannot infer it from the row
+ * that tripped the cap — a `normal` head can carry a queue of interrupts behind it, which is
+ * exactly the case a head-only log misses.
  */
-export function demoteQueuedPushable(db: Database, toId: string): number {
-  return db.run(
-    "UPDATE messages SET push_after=NULL WHERE to_id=? AND delivery_state='queued' AND push_after IS NOT NULL",
-    [toId],
-  ).changes;
+export function demoteQueuedPushable(db: Database, toId: string): { demoted: number; interrupts: number } {
+  const scope = "to_id=? AND delivery_state='queued' AND push_after IS NOT NULL";
+  const interrupts = (db.query(
+    `SELECT COUNT(*) AS n FROM messages WHERE ${scope} AND urgency='interrupt'`,
+  ).get(toId) as { n: number }).n;
+  const demoted = db.run(`UPDATE messages SET push_after=NULL WHERE ${scope}`, [toId]).changes;
+  return { demoted, interrupts };
+}
+
+/**
+ * The row's current push_after, or `fallback` when the row is gone (delivered rows keep the column,
+ * so a missing row means deleted or pruned — nothing left to report on).
+ *
+ * Exists because a caller that reports a row's push-eligibility must read it AFTER the delivery
+ * attempt it triggered, not from the value it inserted: a failed push can demote the whole
+ * recipient backlog mid-burst (demoteQueuedPushable), including a row inserted moments earlier, so
+ * the inserted value is stale exactly when the answer matters most (#70).
+ */
+export function readPushAfter(db: Database, id: number, fallback: number | null): number | null {
+  const row = db.query("SELECT push_after AS p FROM messages WHERE id=?").get(id) as { p: number | null } | null;
+  return row === null ? fallback : row.p;
 }
 
 /**

@@ -9,7 +9,7 @@ import {
   confirmDelivered, DEFAULT_CHANNEL_PUSH_CAP,
   DEFAULT_DEFERRAL_ESCALATION_CAP, DEFAULT_PUSH_FAILURE_DEMOTION_CAP,
   bumpPushFailures, countsAsPushFailure, decidePushDemotion, demoteQueuedPushable, getPushFailures, resetPushFailures,
-  makeSpawnTmuxSend,
+  makeSpawnTmuxSend, readPushAfter,
   decideChannelPush, decideDeferralEscalation, deliverViaTmux,
   ensureMessagesTable, findLeaklessDelivering, formatPeerMessage, hasDuePush,
   isFederationRoute, isLoopback, isMessageDelivered, isPidDead,
@@ -1306,7 +1306,7 @@ describe("push failure streak persistence and demotion (#70)", () => {
 
   it("demotes a queued pushable row without touching its text or its state", () => {
     const { db, id } = seeded();
-    expect(demoteQueuedPushable(db, "b")).toBe(1);
+    expect(demoteQueuedPushable(db, "b").demoted).toBe(1);
     const row = db.query("SELECT delivery_state, push_after, text FROM messages WHERE id=?").get(id) as
       { delivery_state: string; push_after: number | null; text: string };
     expect(row.push_after).toBeNull();          // out of the push channel
@@ -1325,7 +1325,7 @@ describe("push failure streak persistence and demotion (#70)", () => {
     db.run("INSERT INTO messages (from_id,to_id,text,sent_at,urgency,push_after) VALUES ('a','b','fyi',?,'fyi',NULL)", [new Date().toISOString()]);
     db.run("INSERT INTO messages (from_id,to_id,text,sent_at,urgency,push_after) VALUES ('a','other','theirs',?,'normal',0)", [new Date().toISOString()]);
 
-    expect(demoteQueuedPushable(db, "b")).toBe(2); // both pushable rows, and only b's
+    expect(demoteQueuedPushable(db, "b").demoted).toBe(2); // both pushable rows, and only b's
 
     const pushables = db.query(
       "SELECT COUNT(*) AS n FROM messages WHERE to_id='b' AND delivery_state='queued' AND push_after IS NOT NULL",
@@ -1340,13 +1340,41 @@ describe("push failure streak persistence and demotion (#70)", () => {
     db.close();
   });
 
+  it("counts the interrupts among the demoted rows, not just the head's urgency (#70)", () => {
+    // The caller logs this, and it cannot recover the number afterwards (the rows are demoted by
+    // then) or infer it from the row that tripped the cap: a `normal` head can have interrupts
+    // queued behind it, whose senders are the ones actually blocked on this recipient.
+    const { db } = seeded("normal");   // head is normal
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,urgency,push_after) VALUES ('a','b','blocked',?,'interrupt',0)", [new Date().toISOString()]);
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,urgency,push_after) VALUES ('a','b','also blocked',?,'interrupt',0)", [new Date().toISOString()]);
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,urgency,push_after) VALUES ('a','b','fyi',?,'fyi',NULL)", [new Date().toISOString()]);
+
+    expect(demoteQueuedPushable(db, "b")).toEqual({ demoted: 3, interrupts: 2 });
+    // The fyi was never pushable, so it is not part of what was demoted or counted.
+    expect(demoteQueuedPushable(db, "b")).toEqual({ demoted: 0, interrupts: 0 });
+    db.close();
+  });
+
   it("is a no-op once demoted, and skips a row a live lease owns", () => {
     const { db, id } = seeded();
-    expect(demoteQueuedPushable(db, "b")).toBe(1);
-    expect(demoteQueuedPushable(db, "b")).toBe(0); // already poll-only
+    expect(demoteQueuedPushable(db, "b").demoted).toBe(1);
+    expect(demoteQueuedPushable(db, "b").demoted).toBe(0); // already poll-only
     db.run("UPDATE messages SET delivery_state='delivering', push_after=0, lease_expires_at=?, lease_token='t' WHERE id=?",
       [Date.now() + 5000, id]);
-    expect(demoteQueuedPushable(db, "b")).toBe(0); // a live attempt still owns it
+    expect(demoteQueuedPushable(db, "b").demoted).toBe(0); // a live attempt still owns it
+    db.close();
+  });
+
+  it("reads back a row's push_after so a caller reports what the burst left, not what it inserted (#70)", () => {
+    // A sender-facing "will this still be pushed?" answer computed from the inserted value goes
+    // stale the moment a failing push demotes the recipient's backlog — including the row just
+    // inserted. Reading it back is what keeps the reported disposition true.
+    const { db, id } = seeded("interrupt");
+    expect(readPushAfter(db, id, 12345)).toBe(0);       // the stored value, not the fallback
+    demoteQueuedPushable(db, "b");
+    expect(readPushAfter(db, id, 0)).toBeNull();        // demoted mid-burst: the honest answer
+    expect(readPushAfter(db, 99999, null)).toBeNull();  // gone: nothing to report on
+    expect(readPushAfter(db, 99999, 7)).toBe(7);        // gone: fall back to what the caller knew
     db.close();
   });
 
@@ -1357,7 +1385,7 @@ describe("push failure streak persistence and demotion (#70)", () => {
     demoteQueuedPushable(db, "b");
     db.run("INSERT INTO messages (from_id,to_id,text,sent_at,urgency,push_after) VALUES ('a','b','later',?,'normal',0)", [new Date().toISOString()]);
     expect(hasDuePush(db, "b", Date.now())).toBe(true);
-    expect(demoteQueuedPushable(db, "b")).toBe(1); // and it can be demoted again on a fresh run
+    expect(demoteQueuedPushable(db, "b").demoted).toBe(1); // and it can be demoted again on a fresh run
     db.close();
   });
 
