@@ -22,6 +22,9 @@ export function ensureMessagesTable(db: Database): void {
   // this row. NOT NULL DEFAULT 0 so every row carries a real count; the cap in
   // decideChannelPush reads it, and persisting it in the row (not an in-memory map) keeps
   // the cap honest across a broker restart. Never touched by the acked backends.
+  // push_failures: consecutive FAILED acked pushes of this row (the tmux send ran and missed).
+  // Per-row and persisted for the same reason: a restart must not hand a pane that cannot
+  // accept keystrokes a fresh run of attempts. decidePushDemotion reads it (issue #70).
   db.run(`CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT NOT NULL, to_id TEXT NOT NULL,
     text TEXT NOT NULL, sent_at TEXT NOT NULL,
@@ -30,6 +33,7 @@ export function ensureMessagesTable(db: Database): void {
     urgency TEXT NOT NULL DEFAULT 'interrupt',
     push_after INTEGER DEFAULT 0,
     channel_push_attempts INTEGER NOT NULL DEFAULT 0,
+    push_failures INTEGER NOT NULL DEFAULT 0,
     CHECK (delivery_state <> 'delivering' OR (lease_expires_at IS NOT NULL AND lease_token IS NOT NULL))
   )`);
 }
@@ -47,7 +51,8 @@ export function migrateMessagesSchema(db: Database): void {
   const has = (c: string) => names.includes(c);
   // Include channel_push_attempts in the fast-path guard so a deployment already on the
   // delivery_state schema but predating the #6 column still falls through to add it.
-  if (!has("delivered") && has("delivery_state") && has("urgency") && has("push_after") && has("channel_push_attempts")) return; // already migrated
+  if (!has("delivered") && has("delivery_state") && has("urgency") && has("push_after")
+    && has("channel_push_attempts") && has("push_failures")) return; // already migrated
 
   db.run("BEGIN IMMEDIATE");
   try {
@@ -63,6 +68,9 @@ export function migrateMessagesSchema(db: Database): void {
     // Additive, non-behavior-changing: existing rows backfill to 0 attempts. NOT NULL is
     // safe with a DEFAULT at ADD COLUMN time; no acked backend reads or writes it.
     if (!has("channel_push_attempts")) db.run("ALTER TABLE messages ADD COLUMN channel_push_attempts INTEGER NOT NULL DEFAULT 0");
+    // Same additive shape (#70). A row written before the column existed backfills to 0, i.e.
+    // "no failures seen yet" — the honest reading, since the broker that wrote it never counted.
+    if (!has("push_failures")) db.run("ALTER TABLE messages ADD COLUMN push_failures INTEGER NOT NULL DEFAULT 0");
     if (has("delivered")) {
       db.run("UPDATE messages SET delivery_state = CASE WHEN delivered = 1 THEN 'delivered' ELSE 'queued' END");
       db.run("ALTER TABLE messages DROP COLUMN delivered");
@@ -227,6 +235,85 @@ export function decideDeferralEscalation(
   if (consecutiveDeferrals < cap) return { escalate: false, reason: `under cap (${consecutiveDeferrals}/${cap})` };
   if (consecutiveDeferrals === cap) return { escalate: true, reason: `cap reached (${consecutiveDeferrals}/${cap})` };
   return { escalate: false, reason: `already escalated (${consecutiveDeferrals}/${cap})` };
+}
+
+export type PushDemotionDecision = { demote: boolean; reason: string };
+
+/** Default consecutive failed pushes of one row before it is demoted to poll-only (issue #70). */
+export const DEFAULT_PUSH_FAILURE_DEMOTION_CAP = 5;
+
+/**
+ * Decide whether a row whose pushes keep failing should leave the push channel (issue #70).
+ *
+ * A failed push is not a lost message — releaseToQueued puts the row back with its push_after
+ * intact, so the next heartbeat retries it and check_messages can always drain it. What it does
+ * cost is the doorbell: ringDoorbellAfterSettle withholds a ring while the recipient still holds
+ * a queued pushable row, because such a row is one the next heartbeat claims, and a ring spent on
+ * mail a poll then cannot release strands it. That withhold is bounded by the push LEAVING the
+ * queue — which a pane whose send-keys always exits non-zero never lets happen. So the poll-only
+ * mail behind it (an fyi, a floored forward) is readable but never announced, forever.
+ *
+ * Demotion closes that by making a permanently failing push stop being a push: clearing the row's
+ * push_after moves it into the same poll-only channel as the mail behind it, the withhold opens,
+ * and one ring announces the whole readable backlog. Nothing is dropped — the row keeps its text
+ * and its place in the queue, it just stops claiming an interruption this host cannot deliver.
+ *
+ * This owns the STREAK rule, and the streak is the load-bearing part: a single failure is
+ * routinely transient (a pane redrawing, a momentary tmux fault), and demoting on it would strip
+ * the push channel from healthy sessions. Only an unbroken run of `cap` failed sends on the same
+ * row is evidence the pane cannot take keystrokes at all. Idempotent at and above the cap, unlike
+ * decideDeferralEscalation's fires-once rule: escalation emits a log (so a repeat is noise), while
+ * this drives a state change that is already a no-op once applied, and answering "no" above the
+ * cap would leave a row that somehow re-entered the channel stuck there. A cap of 0 or less
+ * disables demotion.
+ *
+ * Pure and storage-agnostic like its siblings: the caller owns where the count lives (a per-row
+ * push_failures column, so a restart cannot reset it) and what a "failure" is (an acked send that
+ * ran and missed — NOT a readiness deferral, which never sent anything and keeps its own #42
+ * counter).
+ */
+export function decidePushDemotion(
+  consecutiveFailures: number,
+  cap: number,
+): PushDemotionDecision {
+  if (cap <= 0) return { demote: false, reason: "demotion disabled (cap <= 0)" };
+  if (consecutiveFailures < cap) return { demote: false, reason: `under cap (${consecutiveFailures}/${cap})` };
+  return { demote: true, reason: `cap reached (${consecutiveFailures}/${cap})` };
+}
+
+/** The row's current consecutive-failed-push count; 0 for a row that is gone. */
+export function getPushFailures(db: Database, id: number): number {
+  const row = db.query("SELECT push_failures AS n FROM messages WHERE id=?").get(id) as { n: number } | null;
+  return row?.n ?? 0;
+}
+
+/**
+ * Record one failed push of a row and return the new count. Call after releaseToQueued, so the
+ * row is back in 'queued' and the count describes mail still waiting. Unscoped by state on
+ * purpose: the failure already happened, and refusing to record it on a row that raced into
+ * another state would silently reset the streak.
+ */
+export function bumpPushFailures(db: Database, id: number): number {
+  db.run("UPDATE messages SET push_failures=push_failures+1 WHERE id=?", [id]);
+  return getPushFailures(db, id);
+}
+
+/** A push landed: the pane works, so the row's failure run ends. */
+export function resetPushFailures(db: Database, id: number): void {
+  db.run("UPDATE messages SET push_failures=0 WHERE id=?", [id]);
+}
+
+/**
+ * Move a queued row out of the push channel by clearing its push_after, so nothing auto-pushes it
+ * again and it is drained by check_messages (announced by the doorbell) like any other poll-only
+ * row. Scoped to 'queued' rows that are still pushable, so it can never race a live lease or
+ * re-clear an already-demoted row. Returns whether this call is the one that demoted it.
+ */
+export function demoteToPollOnly(db: Database, id: number): boolean {
+  return db.run(
+    "UPDATE messages SET push_after=NULL WHERE id=? AND delivery_state='queued' AND push_after IS NOT NULL",
+    [id],
+  ).changes === 1;
 }
 
 /**

@@ -9,13 +9,15 @@
 
 import { Database } from "bun:sqlite";
 import {
-  claimForDelivery, confirmDelivered, DEFAULT_DEFERRAL_ESCALATION_CAP,
-  decideDeferralEscalation, deliverViaTmux, ensureMessagesTable,
+  bumpPushFailures, claimForDelivery, confirmDelivered, DEFAULT_DEFERRAL_ESCALATION_CAP,
+  DEFAULT_PUSH_FAILURE_DEMOTION_CAP, decideDeferralEscalation, decidePushDemotion,
+  demoteToPollOnly, deliverViaTmux, ensureMessagesTable,
   formatPeerMessage, generateAuthToken, generateLeaseToken, hasDuePush,
   isFederationRoute, isLoopback, isMessageDelivered, isPidDead, makeSpawnTmuxQuery,
   migrateMessagesSchema, nextDeliverable, pidProbe, promoteQueuedForFlush,
   pruneMessages, pushAfterFor, reclaimIfExpired, reclaimLeaklessDelivering,
-  releasableQueuedPrefix, releaseToQueued, resetDeliveringOnStart, type TmuxQuery, type TmuxSpawn,
+  releasableQueuedPrefix, releaseToQueued, resetDeliveringOnStart, resetPushFailures,
+  type TmuxQuery, type TmuxSpawn,
 } from "./delivery.ts";
 import { loadConfig, type SiblingConfig } from "./shared/config.ts";
 import { displaySessionName } from "./shared/format-peers.ts";
@@ -510,13 +512,12 @@ if (import.meta.main) {
     //
     // What bounds the silence is the push LEAVING the queue, which is not the same as the push
     // delay lapsing: releaseToQueued requeues a failed attempt with its push_after intact, so a
-    // pane whose send-keys keeps failing holds this guard closed on every heartbeat and the
-    // poll-only mail behind it is never announced (issue #70, pinned by a test). That mail is
-    // still readable and its check_messages still drains it; the near-real-time wake is the loss.
-    // Ringing anyway is no fix for a max-pending-id marker: it strands the row, per the reason
-    // above. That reason is the clamp refusing a repeat, though, not the push failing, and only a
-    // marker whose value can revisit a number produces a repeat to refuse. Whether #70 is fixed in
-    // the push path or in what the marker counts is open (#70).
+    // pane whose send-keys keeps failing would hold this guard closed on every heartbeat and the
+    // poll-only mail behind it would never be announced (issue #70). Ringing anyway is no fix at
+    // this layer — for the reason above, the marker would be spent on mail the poll cannot reach —
+    // so the bound comes from the push path instead: after PUSH_FAILURE_DEMOTION_CAP consecutive
+    // failed sends notePushFailure clears the row's push_after, the row leaves the pushable
+    // channel, and this guard opens on that same burst's settle.
     //
     // Past this test, every pending row is one a poll releases now and nothing will intervene:
     // no lease is open, and none is coming. That is the marker's whole promise, so asking
@@ -623,6 +624,7 @@ if (import.meta.main) {
   const FORWARD_TIMEOUT_MS = 5_000; // abort bound on an outbound cross-machine forward fetch
   const MAX_HEARTBEAT_DRAIN = 50; // upper bound on pushes drained per heartbeat
   const DEFERRAL_ESCALATION_CAP = DEFAULT_DEFERRAL_ESCALATION_CAP; // not-ready deferrals before a stuck pane escalates (#42)
+  const PUSH_FAILURE_DEMOTION_CAP = DEFAULT_PUSH_FAILURE_DEMOTION_CAP; // failed pushes of one row before it goes poll-only (#70)
   // Deliveries currently being attempted. Read by the retire-drain (Task 9) and the
   // empty-broker self-exit (Task 14) so the broker never exits mid-delivery.
   let inFlightDeliveries = 0;
@@ -771,6 +773,27 @@ if (import.meta.main) {
     return withDeliveryBurst(toId, () => attemptDeliverNext(toId));
   }
 
+  // Record one failed push of a row and, once its run of consecutive failures reaches the cap,
+  // take it out of the push channel (#70). The demotion is not a drop: the row keeps its text and
+  // its place in the queue, check_messages still drains it, and — the point — clearing push_after
+  // opens ringDoorbellAfterSettle's withhold, so this row and the poll-only mail stuck behind it
+  // are announced by the doorbell on this very burst's settle instead of never.
+  //
+  // Losing push urgency is a real demotion, so it is logged rather than done quietly, and an
+  // interrupt row (a sender blocked on this recipient) says so in the same line: the send-keys
+  // path is what failed, and a message that was meant to type itself into the pane now waits for
+  // a poll. Accepted, because the alternative is retrying a pane that has failed `cap` times in a
+  // row while its recipient hears nothing at all.
+  function notePushFailure(row: { id: number; to_id: string; urgency: string }): void {
+    const failures = bumpPushFailures(db, row.id);
+    const decision = decidePushDemotion(failures, PUSH_FAILURE_DEMOTION_CAP);
+    if (!decision.demote || !demoteToPollOnly(db, row.id)) return;
+    const lost = row.urgency === "interrupt"
+      ? " it was an interrupt, so it loses its push urgency and now waits for check_messages/the doorbell"
+      : "";
+    console.error(`[claude-peers broker] demoting message #${row.id} to peer ${row.to_id} to poll-only: ${decision.reason} consecutive failed pushes (send-keys ran and missed);${lost || " the row stays queued for check_messages and the doorbell now announces it"}`);
+  }
+
   async function attemptDeliverNext(toId: string): Promise<"accepted" | "queued" | null> {
     if (recipientsInFlight.has(toId)) return null;
     const now = Date.now();
@@ -827,12 +850,19 @@ if (import.meta.main) {
       // retention prune bounds an orphan.
       if (ok && peerConfirmable(toId) && confirmDelivered(db, row.id, token)) {
         deferralStreaks.delete(toId);   // delivered: the pane is healthy, clear any streak
+        resetPushFailures(db, row.id);  // and the row's failed-push run ends here (#70)
         return "accepted";
       }
       // Any non-deferred miss (send failed, peer died mid-send) also breaks the not-ready run:
       // only an unbroken streak of shell deferrals should accrue toward the stuck-pane escalation.
       if (!deferredThisAttempt) deferralStreaks.delete(toId);
       releaseToQueued(db, row.id, token);
+      // A send that RAN and missed (send-keys exited non-zero) is the #70 case: the row returns to
+      // queued still pushable, so the next heartbeat retries it and the doorbell's withhold stays
+      // shut on the poll-only mail behind it. Count it, and once the run reaches the cap demote the
+      // row out of the push channel. A readiness deferral never sent anything (it has its own #42
+      // counter above), and a peer that died mid-send is handled by the dead-pid sweep, not here.
+      if (!ok && !deferredThisAttempt) notePushFailure(row);
       return "queued";
     } catch {
       deferralStreaks.delete(toId);   // a spawn fault is not a readiness deferral

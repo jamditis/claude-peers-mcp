@@ -7,7 +7,9 @@ import {
   buildPaneCommandArgs, buildPaneReadyFormat, buildSessionNameArgs, buildTmuxArgs, claimForDelivery, classifyPaneReadiness, SHELL_COMMANDS,
   bumpChannelPushAttempts, getChannelPushAttempts, resolveChannelPushCap,
   confirmDelivered, DEFAULT_CHANNEL_PUSH_CAP,
-  DEFAULT_DEFERRAL_ESCALATION_CAP, decideChannelPush, decideDeferralEscalation, deliverViaTmux,
+  DEFAULT_DEFERRAL_ESCALATION_CAP, DEFAULT_PUSH_FAILURE_DEMOTION_CAP,
+  bumpPushFailures, decidePushDemotion, demoteToPollOnly, getPushFailures, resetPushFailures,
+  decideChannelPush, decideDeferralEscalation, deliverViaTmux,
   ensureMessagesTable, findLeaklessDelivering, formatPeerMessage, hasDuePush,
   isFederationRoute, isLoopback, isMessageDelivered, isPidDead,
   migrateMessagesSchema, nextDeliverable, PASTE_END, PASTE_START,
@@ -123,6 +125,28 @@ describe("migrateMessagesSchema", () => {
     expect(cols(db)).toContain("channel_push_attempts");
     const id = (db.query("SELECT id FROM messages").get() as { id: number }).id;
     expect(getChannelPushAttempts(db, id)).toBe(0);
+    db.close();
+  });
+
+  it("adds push_failures to a pre-#70 table, backfilling existing rows to 0", () => {
+    // A table on the #6 schema but predating the demotion counter. The fast-path guard must fall
+    // through and add it, and a row written by a broker that never counted failures must read 0 —
+    // "no failures seen yet" — so decidePushDemotion cannot demote it on the strength of a NULL.
+    const db = new Database(DB);
+    db.run(`CREATE TABLE messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT NOT NULL, to_id TEXT NOT NULL,
+      text TEXT NOT NULL, sent_at TEXT NOT NULL,
+      delivery_state TEXT NOT NULL DEFAULT 'queued', lease_expires_at INTEGER, lease_token TEXT,
+      urgency TEXT NOT NULL DEFAULT 'interrupt', push_after INTEGER DEFAULT 0,
+      channel_push_attempts INTEGER NOT NULL DEFAULT 0
+    )`);
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at) VALUES ('a','b','hi',?)", [new Date().toISOString()]);
+
+    migrateMessagesSchema(db);
+
+    expect(cols(db)).toContain("push_failures");
+    const id = (db.query("SELECT id FROM messages").get() as { id: number }).id;
+    expect(getPushFailures(db, id)).toBe(0);
     db.close();
   });
 
@@ -1121,5 +1145,119 @@ describe("decideDeferralEscalation", () => {
     expect(DEFAULT_DEFERRAL_ESCALATION_CAP).toBeGreaterThan(0);
     expect(decideDeferralEscalation(DEFAULT_DEFERRAL_ESCALATION_CAP - 1, DEFAULT_DEFERRAL_ESCALATION_CAP).escalate).toBe(false);
     expect(decideDeferralEscalation(DEFAULT_DEFERRAL_ESCALATION_CAP, DEFAULT_DEFERRAL_ESCALATION_CAP).escalate).toBe(true);
+  });
+});
+
+describe("decidePushDemotion (#70)", () => {
+  const CAP = 5;
+
+  it("does not demote on a transient failure below the cap", () => {
+    // The streak is the whole safety of this rule: a pane redrawing, or one momentary tmux
+    // fault, must not cost a healthy session its push channel.
+    expect(decidePushDemotion(0, CAP).demote).toBe(false);
+    expect(decidePushDemotion(1, CAP).demote).toBe(false);
+    expect(decidePushDemotion(CAP - 1, CAP).demote).toBe(false);
+  });
+
+  it("demotes at the cap and keeps demoting above it", () => {
+    // Unlike the fires-once escalation log, this drives a state change that is already a no-op
+    // once applied, so answering yes above the cap costs nothing, while answering no would leave
+    // a row that somehow re-entered the push channel stuck there.
+    expect(decidePushDemotion(CAP, CAP).demote).toBe(true);
+    expect(decidePushDemotion(CAP, CAP).reason).toContain("cap");
+    expect(decidePushDemotion(CAP + 1, CAP).demote).toBe(true);
+    expect(decidePushDemotion(CAP + 99, CAP).demote).toBe(true);
+  });
+
+  it("treats a cap of 0 or less as demotion disabled", () => {
+    expect(decidePushDemotion(99, 0).demote).toBe(false);
+    expect(decidePushDemotion(99, -1).demote).toBe(false);
+  });
+
+  it("ships a positive default cap, so a permanently failing pane is demoted by default", () => {
+    expect(DEFAULT_PUSH_FAILURE_DEMOTION_CAP).toBeGreaterThan(1); // >1: one failure is never enough
+    expect(decidePushDemotion(DEFAULT_PUSH_FAILURE_DEMOTION_CAP - 1, DEFAULT_PUSH_FAILURE_DEMOTION_CAP).demote).toBe(false);
+    expect(decidePushDemotion(DEFAULT_PUSH_FAILURE_DEMOTION_CAP, DEFAULT_PUSH_FAILURE_DEMOTION_CAP).demote).toBe(true);
+  });
+});
+
+const FDB = join(tmpdir(), "test-delivery-push-failures.db");
+
+describe("push failure streak persistence and demotion (#70)", () => {
+  beforeEach(() => { try { unlinkSync(FDB); } catch {} });
+  afterEach(() => { try { unlinkSync(FDB); } catch {} });
+
+  function seeded(urgency = "normal", pushAfter: number | null = 0): { db: Database; id: number } {
+    const db = new Database(FDB);
+    ensureMessagesTable(db);
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,urgency,push_after) VALUES ('a','b','m',?,?,?)",
+      [new Date().toISOString(), urgency, pushAfter]);
+    const id = (db.query("SELECT last_insert_rowid() AS id").get() as { id: number }).id;
+    return { db, id };
+  }
+
+  it("reads 0 for a fresh row and counts each failed push", () => {
+    const { db, id } = seeded();
+    expect(getPushFailures(db, id)).toBe(0);
+    expect(bumpPushFailures(db, id)).toBe(1);
+    expect(bumpPushFailures(db, id)).toBe(2);
+    expect(getPushFailures(db, id)).toBe(2);
+    db.close();
+  });
+
+  it("resets the streak when a push finally lands", () => {
+    // Consecutive is the claim, so a delivery in the middle of a run must clear it rather than
+    // let unrelated old failures accumulate toward a demotion.
+    const { db, id } = seeded();
+    bumpPushFailures(db, id);
+    bumpPushFailures(db, id);
+    resetPushFailures(db, id);
+    expect(getPushFailures(db, id)).toBe(0);
+    expect(decidePushDemotion(getPushFailures(db, id), 2).demote).toBe(false);
+    db.close();
+  });
+
+  it("survives a reopen, so a restart does not hand a broken pane a fresh run", () => {
+    const { db, id } = seeded();
+    bumpPushFailures(db, id);
+    bumpPushFailures(db, id);
+    db.close();
+    const reopened = new Database(FDB);
+    expect(getPushFailures(reopened, id)).toBe(2);
+    reopened.close();
+  });
+
+  it("demotes a queued pushable row without touching its text or its state", () => {
+    const { db, id } = seeded();
+    expect(demoteToPollOnly(db, id)).toBe(true);
+    const row = db.query("SELECT delivery_state, push_after, text FROM messages WHERE id=?").get(id) as
+      { delivery_state: string; push_after: number | null; text: string };
+    expect(row.push_after).toBeNull();          // out of the push channel
+    expect(row.delivery_state).toBe("queued");  // still readable by check_messages
+    expect(row.text).toBe("m");                 // demoted, never dropped
+    db.close();
+  });
+
+  it("is a no-op on an already-demoted row and on a row a live lease owns", () => {
+    const { db, id } = seeded();
+    expect(demoteToPollOnly(db, id)).toBe(true);
+    expect(demoteToPollOnly(db, id)).toBe(false); // already poll-only
+    db.run("UPDATE messages SET delivery_state='delivering', push_after=0, lease_expires_at=?, lease_token='t' WHERE id=?",
+      [Date.now() + 5000, id]);
+    expect(demoteToPollOnly(db, id)).toBe(false); // a live attempt still owns it
+    db.close();
+  });
+
+  it("takes the demoted row out of what nextDeliverable and hasDuePush can see", () => {
+    // The consequence that closes #70: once demoted, nothing counts the row as a pending push,
+    // so the doorbell's withhold has nothing left to hold shut.
+    const { db, id } = seeded();
+    const now = Date.now();
+    expect(hasDuePush(db, "b", now)).toBe(true);
+    expect(nextDeliverable(db, "b", now, new Set())?.id).toBe(id);
+    demoteToPollOnly(db, id);
+    expect(hasDuePush(db, "b", now)).toBe(false);
+    expect(nextDeliverable(db, "b", now, new Set())).toBeNull();
+    db.close();
   });
 });

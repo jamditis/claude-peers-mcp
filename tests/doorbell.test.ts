@@ -435,10 +435,11 @@ describe("a ring waits for the recipient's whole delivery burst, not just one le
 // promise is about what a poll WILL find, not what one would have found at the instant it was
 // written, and the next heartbeat claims that row the moment it comes due -- so a row this host
 // has not claimed yet, but will, already counts as a lease. That is the shape the startup
-// reconcile withholds for, and it reaches the live path by the same road. The last test here pins
-// where that reasoning runs out: a push that fails to land IS claimed, every attempt, and released
-// again each time. It is forever about to be claimed and never leaves the queue, so the guard it
-// holds shut never opens (issue #70).
+// reconcile withholds for, and it reaches the live path by the same road. The last tests here
+// cover where that reasoning would otherwise run out: a push that fails to land IS claimed, every
+// attempt, and released again each time, so it is forever about to be claimed and never leaves the
+// queue. What reopens the guard is demotion — a bounded run of failed sends clears the row's
+// push_after, and it stops being a push at all (issue #70).
 describe("a ring waits for a push that is coming later, not just one already in flight", () => {
   const PORT_HOLD = 17947;
   const DB_PATH_HOLD = join(work, "hold.db");
@@ -492,12 +493,12 @@ describe("a ring waits for a push that is coming later, not just one already in 
   const DB_PATH_FAIL = join(work, "fail.db");
   const CONFIG_PATH_FAIL = join(work, "fail-config.json");
 
-  // Pins the known gap in issue #70 rather than the behaviour we want: poll-only mail behind a
-  // push that keeps failing is readable but never announced. The withhold below is still the right
-  // call at this layer -- ringing anyway strands the row, for the reason the previous test pins --
-  // so closing #70 means changing what a failed push IS, not what the bell asks. When it closes,
-  // this test flips to expect(readDoorbell(...)).toBe(peek.max_id) and this comment goes.
-  it("does not ring poll-only mail behind a push that keeps failing (gap, issue #70)", async () => {
+  // Issue #70, from the other end. The withhold is still the right call at this layer -- ringing
+  // anyway strands the row, for the reason the previous test pins -- so the fix changed what a
+  // failed push IS: after a bounded run of failed sends the row's push_after is cleared, it stops
+  // being a push, and the guard opens on that attempt's own settle. This test walks the failing
+  // pane past the cap and expects the whole readable backlog announced.
+  it("rings poll-only mail once a repeatedly-failing push is demoted (issue #70)", async () => {
     writeFileSync(CONFIG_PATH_FAIL, JSON.stringify({
       machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_FAIL,
       id_prefix: "dbf", siblings: [], allowed_ips: ["127.0.0.1"], db_path: DB_PATH_FAIL,
@@ -515,7 +516,7 @@ describe("a ring waits for a push that is coming later, not just one already in 
 
       // Due immediately (push_delay_ms 0), so the send's own deliverNext attempts the push now.
       // send-keys exits 1, so deliverViaTmux returns false and the row goes back to 'queued' with
-      // push_after untouched: pushable forever, delivered never.
+      // push_after untouched — still pushable, and retried on every heartbeat until the cap.
       await okAt(PORT_FAIL, "/send-message",
         { from_id: sender.id, to_id: rcpt.id, text: "push that cannot land", urgency: "normal" }, sender.token);
       await okAt(PORT_FAIL, "/send-message",
@@ -532,18 +533,72 @@ describe("a ring waits for a push that is coming later, not just one already in 
       expect(states.map((s) => s.delivery_state)).toEqual(["queued", "queued"]);
       expect(states[0]?.push_after).not.toBeNull();  // the failed push is still pushable
 
-      // Retrying changes nothing: every heartbeat re-attempts, re-fails, and re-queues.
-      await okAt(PORT_FAIL, "/heartbeat", { id: rcpt.id }, rcpt.token);
-      await okAt(PORT_FAIL, "/heartbeat", { id: rcpt.id }, rcpt.token);
-
-      // No marker at all, though a poll right now would hand over both rows. The push delay has
-      // long since lapsed, so there is no wait left to bound: the silence rests on the push
-      // leaving the queue, and a send-keys that always fails never lets it. The fyi still reaches
-      // the recipient through its own check_messages; the near-real-time wake is what is lost.
+      // Below the cap nothing changes: each heartbeat re-attempts, re-fails, and re-queues, and
+      // the bell stays silent because the row is still a push the next heartbeat will claim. A
+      // single transient failure must not cost a row its push channel, so this half matters as
+      // much as the demotion below.
+      await okAt(PORT_FAIL, "/heartbeat", { id: rcpt.id }, rcpt.token); // failures: 2
+      await okAt(PORT_FAIL, "/heartbeat", { id: rcpt.id }, rcpt.token); // failures: 3
       expect(readDoorbell(DB_PATH_FAIL, rcpt.id, -1)).toBe(-1);
+
+      // Past the cap (5 consecutive failed sends: the send itself plus four heartbeats) the row is
+      // demoted out of the push channel, so nothing is left that a poll could be beaten to, and
+      // this heartbeat's own settle announces the backlog -- the demoted row included.
+      await okAt(PORT_FAIL, "/heartbeat", { id: rcpt.id }, rcpt.token); // failures: 4
+      await okAt(PORT_FAIL, "/heartbeat", { id: rcpt.id }, rcpt.token); // failures: 5 -> demoted
+      expect(readDoorbell(DB_PATH_FAIL, rcpt.id, -1)).toBe(peek.max_id);
+
+      const after = new Database(DB_PATH_FAIL);
+      const rows = after.query(
+        "SELECT delivery_state, push_after FROM messages WHERE to_id = ? ORDER BY id",
+      ).all(rcpt.id) as { delivery_state: string; push_after: number | null }[];
+      after.close();
+      // Demoted, not dropped: both rows are still queued and still readable by check_messages;
+      // the failed push simply joined the fyi in the poll-only channel.
+      expect(rows.map((r) => r.delivery_state)).toEqual(["queued", "queued"]);
+      expect(rows[0]?.push_after).toBeNull();
     } finally {
       failing.kill();
       await failing.exited;
+    }
+  }, 20_000);
+
+  const PORT_LOUD = 17949;
+  const DB_PATH_LOUD = join(work, "loud.db");
+  const CONFIG_PATH_LOUD = join(work, "loud-config.json");
+
+  // Demoting an interrupt row is the one case where the fix costs something a caller asked for:
+  // the sender said it was blocked on this recipient, and the row now waits for a poll. That is
+  // accepted, but it must not happen silently, so the broker says so on stderr.
+  it("logs when the demoted row was an interrupt (issue #70)", async () => {
+    writeFileSync(CONFIG_PATH_LOUD, JSON.stringify({
+      machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_LOUD,
+      id_prefix: "dbl", siblings: [], allowed_ips: ["127.0.0.1"], db_path: DB_PATH_LOUD,
+    }));
+    const loud = Bun.spawn(["bun", "broker.ts"], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH_LOUD, PATH: `${work}:${process.env.PATH}` },
+      stdout: "ignore", stderr: "pipe",
+    });
+    try {
+      expect(await waitForHealth(PORT_LOUD)).toBe(true);
+      const rcpt = await regRcpt({ cwd: "/tmp/loud", tmux_pane: FAIL_PANE }, PORT_LOUD);
+      const sender = await regSender({ cwd: "/tmp/loud-s" }, PORT_LOUD);
+      // An interrupt is due on arrival whatever push_delay_ms is, so the send attempts at once.
+      await okAt(PORT_LOUD, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "blocked on you", urgency: "interrupt" }, sender.token);
+      const id = (await okAt(PORT_LOUD, "/peek", { id: rcpt.id }, rcpt.token)).max_id;
+      for (let i = 0; i < 4; i++) await okAt(PORT_LOUD, "/heartbeat", { id: rcpt.id }, rcpt.token);
+
+      expect(readDoorbell(DB_PATH_LOUD, rcpt.id, -1)).toBe(id); // demoted, so announced
+      loud.kill();
+      await loud.exited;
+      const err = await new Response(loud.stderr).text();
+      expect(err).toContain(`demoting message #${id}`);
+      expect(err).toContain("interrupt");
+    } finally {
+      loud.kill();
+      await loud.exited;
     }
   }, 20_000);
 });
