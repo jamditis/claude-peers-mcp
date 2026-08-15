@@ -785,7 +785,13 @@ export function checkSiblings(siblings: SiblingProbeFacts[], expectedProtocol: n
   if (siblings.length === 0) {
     return [check("siblings", "Siblings", "SIBLINGS_NONE", "ok", "No siblings configured (single-host node).")];
   }
-  return siblings.map((s) => {
+  return siblings.map((sibling) => {
+    // machine and url come from the config file — foreign input, exactly like db_path and the
+    // /health strings, and structurally valid is not the same as safe to print: partitionSiblings
+    // only checks that they are non-empty strings. The facts keep the raw values (they are the
+    // sibling's identity, and the url is what was actually fetched); only what is rendered is
+    // collapsed and capped, so a newline in a config entry cannot forge a check line.
+    const s = { ...sibling, machine: redact(sibling.machine, 60), url: redact(sibling.url, 120) };
     if (!s.reachable) {
       return check(
         `sibling.${s.machine}`, `Sibling ${s.machine}`, "SIBLING_UNREACHABLE", "warn",
@@ -977,10 +983,18 @@ export function checkQueues(
       ));
       continue;
     }
-    if (unreadyPeers.has(q.to_id)) {
+    // Only a queue that HAS a pushable row can be deferring: the broker never attempts a
+    // push_after-NULL row against any pane, ready or not, so blaming an unready pane for an
+    // all-fyi backlog names a mechanism that was never involved and hides the real question,
+    // which is whether that poll-only mail is being drained at all. Such a queue falls through
+    // to the backlog check below. `noBackend` recipients are excluded for the same reason: a
+    // pane-less registration is not a deferral, it is the absence of a push path (its own peer
+    // check, PEER_BACKEND_MISSING, already says so).
+    const pushableRows = q.queued + q.delivering - q.never_push;
+    if (!noBackend && unreadyPeers.has(q.to_id) && pushableRows > 0) {
       checks.push(check(
         id, title, "QUEUE_DELIVERY_DEFERRED", "warn",
-        `${counts}. The recipient's pane is not accepting pushes, so delivery attempts keep deferring.`,
+        `${counts}. ${pushableRows} pushable row(s) waiting on a pane that is not accepting pushes, so delivery attempts keep deferring.`,
         "Fix the recipient's pane (see its peer check above) or have that session run check_messages.",
       ));
       continue;

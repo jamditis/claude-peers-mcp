@@ -815,6 +815,54 @@ describe("doctor: review round four", () => {
   });
 });
 
+// Round four, second batch.
+describe("doctor: review round four (cont.)", () => {
+  it("does not blame an unready pane for a backlog it was never going to push", async () => {
+    const db = makeDb();
+    addPeer(db, { delivery_kind: "tmux", tmux_pane: "%3" });
+    // Only poll-only rows: the broker never attempts these against a pane, so nothing is being
+    // deferred. Old enough that the poll-only backlog check is the one that should speak.
+    addMessage(db, { sent_at: new Date(NOW - 6 * 3_600_000).toISOString(), push_after: null, urgency: "fyi" });
+    const peers = await resolvePeerFacts(readStoredPeers(db), {
+      nowMs: NOW, isPidAlive: () => true, probePane: async () => classifyPaneReadiness("bash"),
+    });
+    const store = readStoreFacts(db, "/tmp/peers.db", NOW, 3);
+    const report = buildDoctorReport(facts({ peers, store }));
+    expect(codeFor(report, "queue.abc-11111111")).toBe("QUEUE_BACKLOG_STALE");
+    expect(report.checks.map((c) => c.code)).not.toContain("QUEUE_DELIVERY_DEFERRED");
+    // The pane itself is still reported as unready — that fact did not go away.
+    expect(codeFor(report, "peer.abc-11111111")).toBe("PEER_BACKEND_UNREADY");
+    db.close();
+  });
+
+  it("still blames an unready pane when the queue holds a pushable row", async () => {
+    const db = makeDb();
+    addPeer(db, { delivery_kind: "tmux", tmux_pane: "%3" });
+    addMessage(db, { push_after: null, urgency: "fyi" });
+    addMessage(db, { push_after: NOW });
+    const peers = await resolvePeerFacts(readStoredPeers(db), {
+      nowMs: NOW, isPidAlive: () => true, probePane: async () => classifyPaneReadiness("bash"),
+    });
+    const store = readStoreFacts(db, "/tmp/peers.db", NOW, 3);
+    const report = buildDoctorReport(facts({ peers, store }));
+    expect(codeFor(report, "queue.abc-11111111")).toBe("QUEUE_DELIVERY_DEFERRED");
+    expect(report.checks.find((c) => c.id === "queue.abc-11111111")?.detail).toContain("1 pushable row(s)");
+    db.close();
+  });
+
+  it("collapses configured sibling machine and url strings before rendering them", async () => {
+    const forged = "node-b\n[ok  ] Broker process: BROKER_OK";
+    const probes = await probeSiblings(
+      fakeFetch({}),
+      [{ machine: forged, url: `http://b\n${"x".repeat(400)}` }],
+      () => 0,
+    );
+    const text = formatDoctorReport(buildDoctorReport(facts({ siblings: probes })));
+    expect(text.split("\n").filter((l) => l.startsWith("[ok  ] Broker process")).length).toBe(1);
+    for (const line of text.split("\n")) expect(line.length).toBeLessThan(300);
+  });
+});
+
 describe("doctor: healthy state", () => {
   it("passes every check on a healthy node and exits 0", async () => {
     const db = makeDb();
