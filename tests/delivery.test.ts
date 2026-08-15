@@ -7,7 +7,10 @@ import {
   buildPaneCommandArgs, buildPaneReadyFormat, buildSessionNameArgs, buildTmuxArgs, claimForDelivery, classifyPaneReadiness, SHELL_COMMANDS,
   bumpChannelPushAttempts, getChannelPushAttempts, resolveChannelPushCap,
   confirmDelivered, DEFAULT_CHANNEL_PUSH_CAP,
-  DEFAULT_DEFERRAL_ESCALATION_CAP, decideChannelPush, decideDeferralEscalation, deliverViaTmux,
+  DEFAULT_DEFERRAL_ESCALATION_CAP, DEFAULT_PUSH_FAILURE_DEMOTION_CAP,
+  bumpPushFailures, countsAsPushFailure, decidePushDemotion, demoteQueuedPushable, getPushFailures, resetPushFailures,
+  makeSpawnTmuxSend, readPushAfter, reportedPollOnly,
+  decideChannelPush, decideDeferralEscalation, deliverViaTmux,
   ensureMessagesTable, findLeaklessDelivering, formatPeerMessage, hasDuePush,
   isFederationRoute, isLoopback, isMessageDelivered, isPidDead,
   migrateMessagesSchema, nextDeliverable, PASTE_END, PASTE_START,
@@ -123,6 +126,28 @@ describe("migrateMessagesSchema", () => {
     expect(cols(db)).toContain("channel_push_attempts");
     const id = (db.query("SELECT id FROM messages").get() as { id: number }).id;
     expect(getChannelPushAttempts(db, id)).toBe(0);
+    db.close();
+  });
+
+  it("adds push_failures to a pre-#70 table, backfilling existing rows to 0", () => {
+    // A table on the #6 schema but predating the demotion counter. The fast-path guard must fall
+    // through and add it, and a row written by a broker that never counted failures must read 0 —
+    // "no failures seen yet" — so decidePushDemotion cannot demote it on the strength of a NULL.
+    const db = new Database(DB);
+    db.run(`CREATE TABLE messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT NOT NULL, to_id TEXT NOT NULL,
+      text TEXT NOT NULL, sent_at TEXT NOT NULL,
+      delivery_state TEXT NOT NULL DEFAULT 'queued', lease_expires_at INTEGER, lease_token TEXT,
+      urgency TEXT NOT NULL DEFAULT 'interrupt', push_after INTEGER DEFAULT 0,
+      channel_push_attempts INTEGER NOT NULL DEFAULT 0
+    )`);
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at) VALUES ('a','b','hi',?)", [new Date().toISOString()]);
+
+    migrateMessagesSchema(db);
+
+    expect(cols(db)).toContain("push_failures");
+    const id = (db.query("SELECT id FROM messages").get() as { id: number }).id;
+    expect(getPushFailures(db, id)).toBe(0);
     db.close();
   });
 
@@ -761,6 +786,68 @@ describe("deliverViaTmux", () => {
     await deliverViaTmux("%1", null, "hi", spawn, undefined, onDefer);
     expect(calls).toBe(0);
   });
+  it("calls onFault when the send outlived its deadline and was killed (#70)", async () => {
+    // The killed process reports a perfectly ordinary non-zero exit (128+signal), so without the
+    // spawner's own flag this is indistinguishable from the pane refusing the keystrokes.
+    const spawn: TmuxSpawn = async () => ({ exitCode: 143, timedOut: true });
+    const faults: unknown[] = [];
+    expect(await deliverViaTmux("%1", null, "hi", spawn, undefined, undefined, (e) => faults.push(e))).toBe(false);
+    expect(faults.length).toBe(1);
+    expect(String(faults[0])).toContain("timed out");
+  });
+  it("calls onFault with the error when the spawn itself rejects (#70)", async () => {
+    // The spawn never ran, so nothing was learned about the pane. A caller that penalizes a row
+    // for its failures needs this told apart from an exit-1 miss, which looks identical in the
+    // return value.
+    const boom = new Error("spawn EAGAIN");
+    const spawn: TmuxSpawn = async () => { throw boom; };
+    const faults: unknown[] = [];
+    expect(await deliverViaTmux("%1", null, "hi", spawn, undefined, undefined, (e) => faults.push(e))).toBe(false);
+    expect(faults).toEqual([boom]);
+  });
+  it("does not call onFault on a non-zero exit, a shell defer, or a successful send (#70)", async () => {
+    let faults = 0;
+    const onFault = () => { faults++; };
+    const readyProbe: TmuxQuery = async () => ({ exitCode: 0, stdout: "node\n" });
+    // ran and missed: the one outcome the #70 streak counts, and it is not a fault
+    await deliverViaTmux("%1", null, "hi", async () => ({ exitCode: 1 }), readyProbe, undefined, onFault);
+    // deferred on a shell pane: onDefer's case, not this one
+    await deliverViaTmux("%1", null, "hi", async () => ({ exitCode: 0 }),
+      async () => ({ exitCode: 0, stdout: "bash\n" }), undefined, onFault);
+    // delivered
+    await deliverViaTmux("%1", null, "hi", async () => ({ exitCode: 0 }), readyProbe, undefined, onFault);
+    expect(faults).toBe(0);
+  });
+  it("reports a defer and a fault as mutually exclusive outcomes (#70)", async () => {
+    // A deferred attempt returns before the spawn, so it can never also fault; a faulting spawn
+    // was only reached because the pane probed ready, so it can never also defer.
+    const seen: string[] = [];
+    await deliverViaTmux("%1", null, "hi", async () => { throw new Error("nope"); },
+      async () => ({ exitCode: 0, stdout: "bash\n" }), () => seen.push("defer"), () => seen.push("fault"));
+    expect(seen).toEqual(["defer"]); // the spawn was never reached
+    await deliverViaTmux("%1", null, "hi", async () => { throw new Error("nope"); },
+      async () => ({ exitCode: 0, stdout: "node\n" }), () => seen.push("defer"), () => seen.push("fault"));
+    expect(seen).toEqual(["defer", "fault"]);
+  });
+});
+
+describe("makeSpawnTmuxSend (#70)", () => {
+  it("flags a process it had to kill, and reports the killed exit as non-zero", async () => {
+    // Real processes, because the whole finding is about what Bun actually resolves for a killed
+    // child: 128+signal, a plain number no reader downstream could tell from a tmux failure.
+    const spawn = makeSpawnTmuxSend(100);
+    const res = await spawn(["sleep", "5"]);
+    expect(res.timedOut).toBe(true);
+    expect(res.exitCode).not.toBe(0); // which is exactly why the flag has to be carried
+  });
+
+  it("does not flag a process that exited on its own, zero or not", async () => {
+    const spawn = makeSpawnTmuxSend(5_000);
+    const missed = await spawn(["sh", "-c", "exit 1"]);
+    expect(missed).toEqual({ exitCode: 1, timedOut: false }); // ran and missed: real pane evidence
+    const landed = await spawn(["sh", "-c", "exit 0"]);
+    expect(landed).toEqual({ exitCode: 0, timedOut: false });
+  });
 });
 
 describe("buildPaneCommandArgs", () => {
@@ -1121,5 +1208,302 @@ describe("decideDeferralEscalation", () => {
     expect(DEFAULT_DEFERRAL_ESCALATION_CAP).toBeGreaterThan(0);
     expect(decideDeferralEscalation(DEFAULT_DEFERRAL_ESCALATION_CAP - 1, DEFAULT_DEFERRAL_ESCALATION_CAP).escalate).toBe(false);
     expect(decideDeferralEscalation(DEFAULT_DEFERRAL_ESCALATION_CAP, DEFAULT_DEFERRAL_ESCALATION_CAP).escalate).toBe(true);
+  });
+});
+
+describe("decidePushDemotion (#70)", () => {
+  const CAP = 5;
+
+  it("does not demote on a transient failure below the cap", () => {
+    // The streak is the whole safety of this rule: a pane redrawing, or one momentary tmux
+    // fault, must not cost a healthy session its push channel.
+    expect(decidePushDemotion(0, CAP).demote).toBe(false);
+    expect(decidePushDemotion(1, CAP).demote).toBe(false);
+    expect(decidePushDemotion(CAP - 1, CAP).demote).toBe(false);
+  });
+
+  it("demotes at the cap and keeps demoting above it", () => {
+    // Unlike the fires-once escalation log, this drives a state change that is already a no-op
+    // once applied, so answering yes above the cap costs nothing, while answering no would leave
+    // a row that somehow re-entered the push channel stuck there.
+    expect(decidePushDemotion(CAP, CAP).demote).toBe(true);
+    expect(decidePushDemotion(CAP, CAP).reason).toContain("cap");
+    expect(decidePushDemotion(CAP + 1, CAP).demote).toBe(true);
+    expect(decidePushDemotion(CAP + 99, CAP).demote).toBe(true);
+  });
+
+  it("treats a cap of 0 or less as demotion disabled", () => {
+    expect(decidePushDemotion(99, 0).demote).toBe(false);
+    expect(decidePushDemotion(99, -1).demote).toBe(false);
+  });
+
+  it("ships a positive default cap, so a permanently failing pane is demoted by default", () => {
+    expect(DEFAULT_PUSH_FAILURE_DEMOTION_CAP).toBeGreaterThan(1); // >1: one failure is never enough
+    expect(decidePushDemotion(DEFAULT_PUSH_FAILURE_DEMOTION_CAP - 1, DEFAULT_PUSH_FAILURE_DEMOTION_CAP).demote).toBe(false);
+    expect(decidePushDemotion(DEFAULT_PUSH_FAILURE_DEMOTION_CAP, DEFAULT_PUSH_FAILURE_DEMOTION_CAP).demote).toBe(true);
+  });
+});
+
+describe("countsAsPushFailure (#70)", () => {
+  it("counts only a send that ran and missed", () => {
+    expect(countsAsPushFailure({ ok: false, deferred: false, faulted: false })).toBe(true);
+  });
+
+  it("excludes a delivery, a readiness deferral, and a spawn fault", () => {
+    // Each of the three returns false from deliverViaTmux and leaves the row queued, so the
+    // boolean cannot separate them — which is why the outcome is carried, not inferred.
+    expect(countsAsPushFailure({ ok: true, deferred: false, faulted: false })).toBe(false);
+    expect(countsAsPushFailure({ ok: false, deferred: true, faulted: false })).toBe(false);
+    expect(countsAsPushFailure({ ok: false, deferred: false, faulted: true })).toBe(false);
+  });
+});
+
+describe("reportedPollOnly (#70)", () => {
+  it("passes the reading through when this request owned the attempt", () => {
+    expect(reportedPollOnly(true, false)).toBe(true);
+    expect(reportedPollOnly(false, false)).toBe(false);
+  });
+
+  it("reports nothing when a foreign attempt could still demote the row", () => {
+    // Absent is a real answer on this wire, not a missing one: describeSendOutcome words an
+    // undefined poll_only so it holds either way. Saying "still push-eligible" here would promise
+    // a push that a failing attempt is about to take away, and only that direction is possible —
+    // demotion clears push_after and nothing puts it back.
+    expect(reportedPollOnly(false, true)).toBeUndefined();
+    expect(reportedPollOnly(true, true)).toBeUndefined();
+  });
+});
+
+const FDB = join(tmpdir(), "test-delivery-push-failures.db");
+
+describe("push failure streak persistence and demotion (#70)", () => {
+  beforeEach(() => { try { unlinkSync(FDB); } catch {} });
+  afterEach(() => { try { unlinkSync(FDB); } catch {} });
+
+  function seeded(urgency = "normal", pushAfter: number | null = 0): { db: Database; id: number } {
+    const db = new Database(FDB);
+    ensureMessagesTable(db);
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,urgency,push_after) VALUES ('a','b','m',?,?,?)",
+      [new Date().toISOString(), urgency, pushAfter]);
+    const id = (db.query("SELECT last_insert_rowid() AS id").get() as { id: number }).id;
+    return { db, id };
+  }
+
+  it("reads 0 for a fresh row and counts each failed push", () => {
+    const { db, id } = seeded();
+    expect(getPushFailures(db, id)).toBe(0);
+    expect(bumpPushFailures(db, id)).toBe(1);
+    expect(bumpPushFailures(db, id)).toBe(2);
+    expect(getPushFailures(db, id)).toBe(2);
+    db.close();
+  });
+
+  it("resets the streak when a push finally lands", () => {
+    // Consecutive is the claim, so a delivery in the middle of a run must clear it rather than
+    // let unrelated old failures accumulate toward a demotion.
+    const { db, id } = seeded();
+    bumpPushFailures(db, id);
+    bumpPushFailures(db, id);
+    resetPushFailures(db, id);
+    expect(getPushFailures(db, id)).toBe(0);
+    expect(decidePushDemotion(getPushFailures(db, id), 2).demote).toBe(false);
+    db.close();
+  });
+
+  it("survives a reopen, so a restart does not hand a broken pane a fresh run", () => {
+    const { db, id } = seeded();
+    bumpPushFailures(db, id);
+    bumpPushFailures(db, id);
+    db.close();
+    const reopened = new Database(FDB);
+    expect(getPushFailures(reopened, id)).toBe(2);
+    reopened.close();
+  });
+
+  it("demotes a queued pushable row without touching its text or its state", () => {
+    const { db, id } = seeded();
+    expect(demoteQueuedPushable(db, "b").demoted).toBe(1);
+    const row = db.query("SELECT delivery_state, push_after, text FROM messages WHERE id=?").get(id) as
+      { delivery_state: string; push_after: number | null; text: string };
+    expect(row.push_after).toBeNull();          // out of the push channel
+    expect(row.delivery_state).toBe("queued");  // still readable by check_messages
+    expect(row.text).toBe("m");                 // demoted, never dropped
+    db.close();
+  });
+
+  it("demotes the recipient's whole queued pushable backlog, not just one row (#70)", () => {
+    // The streak proves the PANE will not take keystrokes, which is equally true of every row
+    // queued behind the one that proved it. Demoting only the head leaves the next row pushable,
+    // and the doorbell's withhold — which asks whether ANY queued pushable row remains — stays
+    // shut, so each younger row would have to earn its own full run of failures.
+    const { db } = seeded();
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,urgency,push_after) VALUES ('a','b','second',?,'normal',0)", [new Date().toISOString()]);
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,urgency,push_after) VALUES ('a','b','fyi',?,'fyi',NULL)", [new Date().toISOString()]);
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,urgency,push_after) VALUES ('a','other','theirs',?,'normal',0)", [new Date().toISOString()]);
+
+    expect(demoteQueuedPushable(db, "b").demoted).toBe(2); // both pushable rows, and only b's
+
+    const pushables = db.query(
+      "SELECT COUNT(*) AS n FROM messages WHERE to_id='b' AND delivery_state='queued' AND push_after IS NOT NULL",
+    ).get() as { n: number };
+    expect(pushables.n).toBe(0);
+    // Another recipient's mail is untouched: this pane's evidence says nothing about theirs.
+    const other = db.query("SELECT push_after AS p FROM messages WHERE to_id='other'").get() as { p: number | null };
+    expect(other.p).not.toBeNull();
+    // And every row is still queued and readable — demoted, never dropped.
+    const queued = db.query("SELECT COUNT(*) AS n FROM messages WHERE to_id='b' AND delivery_state='queued'").get() as { n: number };
+    expect(queued.n).toBe(3);
+    db.close();
+  });
+
+  it("counts the interrupts among the demoted rows, not just the head's urgency (#70)", () => {
+    // The caller logs this, and it cannot recover the number afterwards (the rows are demoted by
+    // then) or infer it from the row that tripped the cap: a `normal` head can have interrupts
+    // queued behind it, whose senders are the ones actually blocked on this recipient.
+    const { db } = seeded("normal");   // head is normal
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,urgency,push_after) VALUES ('a','b','blocked',?,'interrupt',0)", [new Date().toISOString()]);
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,urgency,push_after) VALUES ('a','b','also blocked',?,'interrupt',0)", [new Date().toISOString()]);
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,urgency,push_after) VALUES ('a','b','fyi',?,'fyi',NULL)", [new Date().toISOString()]);
+
+    expect(demoteQueuedPushable(db, "b")).toEqual({ demoted: 3, interrupts: 2 });
+    // The fyi was never pushable, so it is not part of what was demoted or counted.
+    expect(demoteQueuedPushable(db, "b")).toEqual({ demoted: 0, interrupts: 0 });
+    db.close();
+  });
+
+  it("is a no-op once demoted, and skips a row a live lease owns", () => {
+    const { db, id } = seeded();
+    expect(demoteQueuedPushable(db, "b").demoted).toBe(1);
+    expect(demoteQueuedPushable(db, "b").demoted).toBe(0); // already poll-only
+    db.run("UPDATE messages SET delivery_state='delivering', push_after=0, lease_expires_at=?, lease_token='t' WHERE id=?",
+      [Date.now() + 5000, id]);
+    expect(demoteQueuedPushable(db, "b").demoted).toBe(0); // a live attempt still owns it
+    db.close();
+  });
+
+  it("reads back a row's push_after so a caller reports what the burst left, not what it inserted (#70)", () => {
+    // A sender-facing "will this still be pushed?" answer computed from the inserted value goes
+    // stale the moment a failing push demotes the recipient's backlog — including the row just
+    // inserted. Reading it back is what keeps the reported disposition true.
+    const { db, id } = seeded("interrupt");
+    expect(readPushAfter(db, id, 12345)).toBe(0);       // the stored value, not the fallback
+    demoteQueuedPushable(db, "b");
+    expect(readPushAfter(db, id, 0)).toBeNull();        // demoted mid-burst: the honest answer
+    expect(readPushAfter(db, 99999, null)).toBeNull();  // gone: nothing to report on
+    expect(readPushAfter(db, 99999, 7)).toBe(7);        // gone: fall back to what the caller knew
+    db.close();
+  });
+
+  it("leaves mail that arrives after a demotion pushable, so a recovered pane is retried (#70)", () => {
+    // The bound is one cap-run per recovery attempt, not one demotion forever: the pane may come
+    // back, and a new message is the only way to find out.
+    const { db } = seeded();
+    demoteQueuedPushable(db, "b");
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,urgency,push_after) VALUES ('a','b','later',?,'normal',0)", [new Date().toISOString()]);
+    expect(hasDuePush(db, "b", Date.now())).toBe(true);
+    expect(demoteQueuedPushable(db, "b").demoted).toBe(1); // and it can be demoted again on a fresh run
+    db.close();
+  });
+
+  // One attempt as the broker runs it: deliverViaTmux reports its outcome through the two
+  // callbacks, countsAsPushFailure decides whether that outcome is pane evidence, and only then
+  // does the row's streak advance and the cap get consulted. Driving the real functions (rather
+  // than asserting on a hand-written outcome record) is the point — the fault/miss split has to
+  // hold end to end, since both look identical in the boolean deliverViaTmux returns.
+  async function attempt(db: Database, id: number, spawn: TmuxSpawn, cap: number): Promise<void> {
+    let deferred = false;
+    let faulted = false;
+    const readyProbe: TmuxQuery = async () => ({ exitCode: 0, stdout: "node\n" });
+    const ok = await deliverViaTmux("%1", null, "hi", spawn, readyProbe,
+      () => { deferred = true; }, () => { faulted = true; });
+    if (ok) { resetPushFailures(db, id); return; }
+    if (!countsAsPushFailure({ ok, deferred, faulted })) return;
+    if (decidePushDemotion(bumpPushFailures(db, id), cap).demote) demoteQueuedPushable(db, "b");
+  }
+
+  const pushAfterOf = (db: Database, id: number) =>
+    (db.query("SELECT push_after AS p FROM messages WHERE id=?").get(id) as { p: number | null }).p;
+
+  it("does not demote a row whose spawns keep faulting, however long the outage lasts (#70)", async () => {
+    // A tmux that cannot be spawned says nothing about the pane. If the fault counted, an
+    // environment blip lasting `cap` heartbeats would permanently strip this row of its push
+    // channel -- worst for an interrupt, whose sender is blocked on the push.
+    const { db, id } = seeded("interrupt");
+    const rejecting: TmuxSpawn = async () => { throw new Error("spawn EAGAIN"); };
+    for (let i = 0; i < DEFAULT_PUSH_FAILURE_DEMOTION_CAP * 2; i++) {
+      await attempt(db, id, rejecting, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+    }
+    expect(getPushFailures(db, id)).toBe(0);      // the streak never advanced
+    expect(pushAfterOf(db, id)).not.toBeNull();   // still pushable, so the retry keeps its urgency
+    db.close();
+  });
+
+  it("does not demote a row whose sends keep timing out (#70)", async () => {
+    // A stalled tmux server is killed by the send's own deadline, and the killed process exits
+    // 128+SIGTERM. Read as a miss, five such heartbeats would permanently demote a row whose pane
+    // never refused anything — the same transient-blip failure the fault exclusion exists for.
+    const { db, id } = seeded("interrupt");
+    const hanging: TmuxSpawn = async () => ({ exitCode: 143, timedOut: true });
+    for (let i = 0; i < DEFAULT_PUSH_FAILURE_DEMOTION_CAP * 2; i++) {
+      await attempt(db, id, hanging, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+    }
+    expect(getPushFailures(db, id)).toBe(0);
+    expect(pushAfterOf(db, id)).not.toBeNull();
+    db.close();
+  });
+
+  it("still demotes a row whose sends run and exit non-zero (#70)", async () => {
+    // The companion half: the same driver, the same cap, a spawn that RUNS. This is pane
+    // evidence, so the streak advances and the row leaves the push channel at the cap.
+    const { db, id } = seeded();
+    const missing: TmuxSpawn = async () => ({ exitCode: 1 });
+    for (let i = 0; i < DEFAULT_PUSH_FAILURE_DEMOTION_CAP - 1; i++) {
+      await attempt(db, id, missing, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+    }
+    expect(pushAfterOf(db, id)).not.toBeNull();   // below the cap: still pushable
+    await attempt(db, id, missing, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+    expect(pushAfterOf(db, id)).toBeNull();       // at the cap: demoted
+    db.close();
+  });
+
+  it("does not let faults pad a run of real misses toward the cap (#70)", async () => {
+    // A fault neither counts nor clears: interleaving outages with genuine misses must leave the
+    // row exactly as many misses from demotion as the misses alone put it.
+    const { db, id } = seeded();
+    const missing: TmuxSpawn = async () => ({ exitCode: 1 });
+    const rejecting: TmuxSpawn = async () => { throw new Error("spawn EAGAIN"); };
+    for (let i = 0; i < DEFAULT_PUSH_FAILURE_DEMOTION_CAP - 1; i++) {
+      await attempt(db, id, missing, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+      await attempt(db, id, rejecting, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+    }
+    expect(getPushFailures(db, id)).toBe(DEFAULT_PUSH_FAILURE_DEMOTION_CAP - 1); // misses only
+    expect(pushAfterOf(db, id)).not.toBeNull();
+    db.close();
+  });
+
+  it("clears the streak once a send finally lands, so an old run cannot demote later (#70)", async () => {
+    const { db, id } = seeded();
+    const missing: TmuxSpawn = async () => ({ exitCode: 1 });
+    for (let i = 0; i < DEFAULT_PUSH_FAILURE_DEMOTION_CAP - 1; i++) {
+      await attempt(db, id, missing, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+    }
+    await attempt(db, id, async () => ({ exitCode: 0 }), DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+    expect(getPushFailures(db, id)).toBe(0);
+    await attempt(db, id, missing, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+    expect(pushAfterOf(db, id)).not.toBeNull(); // one fresh miss is nowhere near the cap
+    db.close();
+  });
+
+  it("takes the demoted row out of what nextDeliverable and hasDuePush can see", () => {
+    // The consequence that closes #70: once demoted, nothing counts the row as a pending push,
+    // so the doorbell's withhold has nothing left to hold shut.
+    const { db, id } = seeded();
+    const now = Date.now();
+    expect(hasDuePush(db, "b", now)).toBe(true);
+    expect(nextDeliverable(db, "b", now, new Set())?.id).toBe(id);
+    demoteQueuedPushable(db, "b");
+    expect(hasDuePush(db, "b", now)).toBe(false);
+    expect(nextDeliverable(db, "b", now, new Set())).toBeNull();
+    db.close();
   });
 });

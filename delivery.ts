@@ -22,6 +22,9 @@ export function ensureMessagesTable(db: Database): void {
   // this row. NOT NULL DEFAULT 0 so every row carries a real count; the cap in
   // decideChannelPush reads it, and persisting it in the row (not an in-memory map) keeps
   // the cap honest across a broker restart. Never touched by the acked backends.
+  // push_failures: consecutive FAILED acked pushes of this row (the tmux send ran and missed).
+  // Per-row and persisted for the same reason: a restart must not hand a pane that cannot
+  // accept keystrokes a fresh run of attempts. decidePushDemotion reads it (issue #70).
   db.run(`CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT NOT NULL, to_id TEXT NOT NULL,
     text TEXT NOT NULL, sent_at TEXT NOT NULL,
@@ -30,6 +33,7 @@ export function ensureMessagesTable(db: Database): void {
     urgency TEXT NOT NULL DEFAULT 'interrupt',
     push_after INTEGER DEFAULT 0,
     channel_push_attempts INTEGER NOT NULL DEFAULT 0,
+    push_failures INTEGER NOT NULL DEFAULT 0,
     CHECK (delivery_state <> 'delivering' OR (lease_expires_at IS NOT NULL AND lease_token IS NOT NULL))
   )`);
 }
@@ -47,7 +51,8 @@ export function migrateMessagesSchema(db: Database): void {
   const has = (c: string) => names.includes(c);
   // Include channel_push_attempts in the fast-path guard so a deployment already on the
   // delivery_state schema but predating the #6 column still falls through to add it.
-  if (!has("delivered") && has("delivery_state") && has("urgency") && has("push_after") && has("channel_push_attempts")) return; // already migrated
+  if (!has("delivered") && has("delivery_state") && has("urgency") && has("push_after")
+    && has("channel_push_attempts") && has("push_failures")) return; // already migrated
 
   db.run("BEGIN IMMEDIATE");
   try {
@@ -63,6 +68,9 @@ export function migrateMessagesSchema(db: Database): void {
     // Additive, non-behavior-changing: existing rows backfill to 0 attempts. NOT NULL is
     // safe with a DEFAULT at ADD COLUMN time; no acked backend reads or writes it.
     if (!has("channel_push_attempts")) db.run("ALTER TABLE messages ADD COLUMN channel_push_attempts INTEGER NOT NULL DEFAULT 0");
+    // Same additive shape (#70). A row written before the column existed backfills to 0, i.e.
+    // "no failures seen yet" — the honest reading, since the broker that wrote it never counted.
+    if (!has("push_failures")) db.run("ALTER TABLE messages ADD COLUMN push_failures INTEGER NOT NULL DEFAULT 0");
     if (has("delivered")) {
       db.run("UPDATE messages SET delivery_state = CASE WHEN delivered = 1 THEN 'delivered' ELSE 'queued' END");
       db.run("ALTER TABLE messages DROP COLUMN delivered");
@@ -227,6 +235,173 @@ export function decideDeferralEscalation(
   if (consecutiveDeferrals < cap) return { escalate: false, reason: `under cap (${consecutiveDeferrals}/${cap})` };
   if (consecutiveDeferrals === cap) return { escalate: true, reason: `cap reached (${consecutiveDeferrals}/${cap})` };
   return { escalate: false, reason: `already escalated (${consecutiveDeferrals}/${cap})` };
+}
+
+export type PushDemotionDecision = { demote: boolean; reason: string };
+
+/** Default consecutive failed pushes of one row before it is demoted to poll-only (issue #70). */
+export const DEFAULT_PUSH_FAILURE_DEMOTION_CAP = 5;
+
+/**
+ * Decide whether a row whose pushes keep failing should leave the push channel (issue #70).
+ *
+ * A failed push is not a lost message — releaseToQueued puts the row back with its push_after
+ * intact, so the next heartbeat retries it and check_messages can always drain it. What it does
+ * cost is the doorbell: ringDoorbellAfterSettle withholds a ring while the recipient still holds
+ * a queued pushable row, because such a row is one the next heartbeat claims, and a ring spent on
+ * mail a poll then cannot release strands it. That withhold is bounded by the push LEAVING the
+ * queue — which a pane whose send-keys always exits non-zero never lets happen. So the poll-only
+ * mail behind it (an fyi, a floored forward) is readable but never announced, forever.
+ *
+ * Demotion closes that by making a permanently failing push stop being a push: clearing the row's
+ * push_after moves it into the same poll-only channel as the mail behind it, the withhold opens,
+ * and one ring announces the whole readable backlog. Nothing is dropped — the row keeps its text
+ * and its place in the queue, it just stops claiming an interruption this host cannot deliver.
+ *
+ * This owns the STREAK rule, and the streak is the load-bearing part: a single failure is
+ * routinely transient (a pane redrawing, a momentary tmux fault), and demoting on it would strip
+ * the push channel from healthy sessions. Only an unbroken run of `cap` failed sends on the same
+ * row is evidence the pane cannot take keystrokes at all. Idempotent at and above the cap, unlike
+ * decideDeferralEscalation's fires-once rule: escalation emits a log (so a repeat is noise), while
+ * this drives a state change that is already a no-op once applied, and answering "no" above the
+ * cap would leave a row that somehow re-entered the channel stuck there. A cap of 0 or less
+ * disables demotion.
+ *
+ * Pure and storage-agnostic like its siblings: the caller owns where the count lives (a per-row
+ * push_failures column, so a restart cannot reset it) and what a "failure" is. Only one outcome
+ * qualifies: a send that RAN and missed (send-keys exited non-zero). A readiness deferral never
+ * sent anything and keeps its own #42 counter, and a spawn FAULT (deliverViaTmux's onFault: the
+ * process could not be created at all) is evidence about the host, not the pane — counting it
+ * would let a transient tmux outage demote a row, which is the failure mode the streak exists to
+ * prevent. A fault neither advances the streak nor clears it: the run of pane evidence is simply
+ * not extended by an attempt that never reached the pane.
+ */
+export function decidePushDemotion(
+  consecutiveFailures: number,
+  cap: number,
+): PushDemotionDecision {
+  if (cap <= 0) return { demote: false, reason: "demotion disabled (cap <= 0)" };
+  if (consecutiveFailures < cap) return { demote: false, reason: `under cap (${consecutiveFailures}/${cap})` };
+  return { demote: true, reason: `cap reached (${consecutiveFailures}/${cap})` };
+}
+
+/**
+ * Whether one finished tmux attempt is the kind of failure the #70 demotion streak counts: a send
+ * that RAN and missed. All three exclusions are attempts that also return false and also leave the
+ * row queued, so the boolean alone cannot separate them — the caller passes what deliverViaTmux's
+ * callbacks told it.
+ *
+ *  - `ok`: the send landed. Nothing to count (the caller resets the streak instead).
+ *  - `deferred`: the readiness probe positively identified a shell, so nothing was sent. It has
+ *    its own consecutive-deferral counter and escalation (#42).
+ *  - `faulted`: the attempt never reached the pane — the spawn rejected, or the send outlived its
+ *    deadline and was killed. This is evidence about the host, not the pane, and counting it would
+ *    let a transient outage lasting `cap` heartbeats demote a healthy pane's mail, which is
+ *    precisely what requiring a streak was meant to prevent. It does not clear the streak either:
+ *    an attempt that never reached the pane neither confirms nor refutes the pane evidence so far.
+ */
+export function countsAsPushFailure(
+  outcome: { ok: boolean; deferred: boolean; faulted: boolean },
+): boolean {
+  return !outcome.ok && !outcome.deferred && !outcome.faulted;
+}
+
+/** The row's current consecutive-failed-push count; 0 for a row that is gone. */
+export function getPushFailures(db: Database, id: number): number {
+  const row = db.query("SELECT push_failures AS n FROM messages WHERE id=?").get(id) as { n: number } | null;
+  return row?.n ?? 0;
+}
+
+/**
+ * Record one failed push of a row and return the new count. Call after releaseToQueued, so the
+ * row is back in 'queued' and the count describes mail still waiting. Unscoped by state on
+ * purpose: the failure already happened, and refusing to record it on a row that raced into
+ * another state would silently reset the streak.
+ */
+export function bumpPushFailures(db: Database, id: number): number {
+  db.run("UPDATE messages SET push_failures=push_failures+1 WHERE id=?", [id]);
+  return getPushFailures(db, id);
+}
+
+/** A push landed: the pane works, so the row's failure run ends. */
+export function resetPushFailures(db: Database, id: number): void {
+  db.run("UPDATE messages SET push_failures=0 WHERE id=?", [id]);
+}
+
+/**
+ * Move a recipient's whole queued pushable backlog out of the push channel by clearing push_after,
+ * so nothing auto-pushes those rows again and they are drained by check_messages (and announced by
+ * the doorbell) like any other poll-only mail. Returns how many rows were demoted.
+ *
+ * Scoped by RECIPIENT, not by the row that tripped the cap, because the streak is evidence about
+ * the PANE: `cap` consecutive failed sends say this session cannot be typed into, which is equally
+ * true of every row queued behind the one that proved it. Demoting only the head row leaves the
+ * next one pushable, so the doorbell's withhold (a queued pushable row is one the next heartbeat
+ * claims) stays shut and each younger row has to earn its own full run of failures — N x cap
+ * heartbeats for a backlog of N, and a recipient still receiving mail never reaches the end of it.
+ * One scoped UPDATE is what actually opens the guard.
+ *
+ * Mail arriving AFTER this lands starts pushable again, on purpose: the pane may have recovered,
+ * and the only way to find out is to try. So the bound is not "one demotion forever" but one
+ * cap-run per recovery attempt — the recipient pays at most `cap` failed sends before its newer
+ * backlog goes quiet again, however long the pane stays broken.
+ *
+ * Scoped to 'queued' + still-pushable rows, so it can never race a live lease (a 'delivering' row
+ * belongs to an in-flight attempt) and never rewrites an already-demoted row.
+ *
+ * Reports how many of the demoted rows were `interrupt`, counted over the same predicate just
+ * before the UPDATE, because that is the part a human needs told: an interrupt says its sender is
+ * blocked on this recipient, and demotion takes away the push it asked for. The caller cannot
+ * recover the number afterwards (the rows are demoted by then) and cannot infer it from the row
+ * that tripped the cap — a `normal` head can carry a queue of interrupts behind it, which is
+ * exactly the case a head-only log misses.
+ */
+export function demoteQueuedPushable(db: Database, toId: string): { demoted: number; interrupts: number } {
+  const scope = "to_id=? AND delivery_state='queued' AND push_after IS NOT NULL";
+  const interrupts = (db.query(
+    `SELECT COUNT(*) AS n FROM messages WHERE ${scope} AND urgency='interrupt'`,
+  ).get(toId) as { n: number }).n;
+  const demoted = db.run(`UPDATE messages SET push_after=NULL WHERE ${scope}`, [toId]).changes;
+  return { demoted, interrupts };
+}
+
+/**
+ * The row's current push_after, or `fallback` when the row is gone (delivered rows keep the column,
+ * so a missing row means deleted or pruned — nothing left to report on).
+ *
+ * Exists because a caller that reports a row's push-eligibility must read it AFTER the delivery
+ * attempt it triggered, not from the value it inserted: a failed push can demote the whole
+ * recipient backlog mid-burst (demoteQueuedPushable), including a row inserted moments earlier, so
+ * the inserted value is stale exactly when the answer matters most (#70).
+ */
+export function readPushAfter(db: Database, id: number, fallback: number | null): number | null {
+  const row = db.query("SELECT push_after AS p FROM messages WHERE id=?").get(id) as { p: number | null } | null;
+  return row === null ? fallback : row.p;
+}
+
+/**
+ * What a forward may honestly report as its `poll_only` disposition (#39), given the row's reading
+ * and whether another delivery attempt for the same recipient was still in flight when it was
+ * taken. `undefined` means "cannot confirm", which the wire protocol already models: the field is
+ * optional, and describeSendOutcome renders an absent value with wording that is true whichever way
+ * it resolves. That is the honest answer under contention, not a guess in either direction.
+ *
+ * The contention matters because a delivery attempt this request does not own can demote the
+ * recipient's whole queued backlog when it fails (#70) — including the row just inserted. A
+ * forward whose own deliverNext returns immediately (another request holds the recipient) reads
+ * push_after BEFORE that attempt settles, so a `false` here would promise a push that is about to
+ * be taken away. The skew is one-directional: demotion only ever clears push_after, and nothing
+ * restores it on an existing row, so the stale reading can only be too optimistic.
+ *
+ * Waiting for the other attempt instead was considered and rejected: it can hold its lease for a
+ * pane probe plus a send (2s each), while the ORIGINATING broker aborts the forward fetch at 5s —
+ * so waiting trades a slightly optimistic flag for a real risk of reporting the whole forward as
+ * unreachable, on a message that was in fact queued. It would also narrow the window rather than
+ * close it, since the next heartbeat can demote the row a moment after any response is sent. This
+ * report is a snapshot, and saying "unknown" when it is unknown is the accurate form of one.
+ */
+export function reportedPollOnly(pollOnly: boolean, attemptInFlight: boolean): boolean | undefined {
+  return attemptInFlight ? undefined : pollOnly;
 }
 
 /**
@@ -417,7 +592,16 @@ export function formatPeerMessage(msg: { id: number; from_id: string; text: stri
   return `${PASTE_START}${body}${PASTE_END}`;
 }
 
-export type TmuxSpawn = (args: string[]) => Promise<{ exitCode: number }>;
+/**
+ * One tmux invocation. `exitCode` 0 is the only success. `timedOut` says the caller's own
+ * kill-timer fired, i.e. the process was still running when its deadline passed and was killed —
+ * NOT that tmux decided to exit non-zero. The distinction cannot be recovered from the exit code:
+ * a killed process resolves to 128+signal (143 for SIGTERM), an ordinary number that reads exactly
+ * like a genuine tmux failure. It cannot be recovered from the signal either, since an unrelated
+ * external SIGTERM looks identical; only the spawner knows whose timer fired. Callers that
+ * penalize a pane for its failures need this (#70), so the flag is reported rather than inferred.
+ */
+export type TmuxSpawn = (args: string[]) => Promise<{ exitCode: number; timedOut?: boolean }>;
 
 /** Like TmuxSpawn, but also returns the process stdout so a probe can read it. */
 export type TmuxQuery = (args: string[]) => Promise<{ exitCode: number; stdout: string }>;
@@ -588,6 +772,34 @@ export function makeSpawnTmuxQuery(timeoutMs: number): TmuxQuery {
 }
 
 /**
+ * Build the real TmuxSpawn for the inject: spawn tmux, report the exit code, and kill the process
+ * if it outlives timeoutMs so a wedged tmux cannot stall delivery. The twin of makeSpawnTmuxQuery,
+ * minus the stdout capture — a send-keys has no output to read.
+ *
+ * It reports `timedOut` because the kill is otherwise invisible downstream: `proc.exited` resolves
+ * to 128+signal (143) for a process this timer killed, which is just another non-zero exit to
+ * anyone reading the code alone. A tmux daemon stalling for a few heartbeats would then look
+ * exactly like a pane refusing keystrokes and, under #70, cost the row its push channel. Only the
+ * spawner can tell the two apart, so it is recorded here at the one place that knows.
+ *
+ * A spawn fault (process creation itself failing) still rejects to the caller's try/catch rather
+ * than being reported through this flag; deliverViaTmux routes both to the same fault handling.
+ */
+export function makeSpawnTmuxSend(timeoutMs: number): TmuxSpawn {
+  return async (args) => {
+    const proc = Bun.spawn(args, { stdout: "ignore", stderr: "ignore" });
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; try { proc.kill(); } catch {} }, timeoutMs);
+    try {
+      const exitCode = await proc.exited;
+      return { exitCode, timedOut };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+}
+
+/**
  * Probe a pane's readiness for injection by reading its foreground command via tmux.
  * Fails open: any probe fault (non-zero exit or spawn rejection) yields ready, so a broken
  * probe can never starve delivery. Only a clean probe that positively identifies a shell
@@ -617,10 +829,21 @@ export async function probePaneReadiness(
  * skipped — not on a probe fault (which fails open and injects) nor on a send failure. The
  * broker uses it to count consecutive not-ready deferrals per recipient and escalate a pane
  * that is stuck a shell (issue #42); callers that do not track this omit it.
+ *
+ * `onFault` fires for the two ways an attempt can fail WITHOUT the pane refusing anything: the
+ * spawn rejected (process creation failed, the tmux binary momentarily unavailable), or the send
+ * ran past its deadline and the spawner killed it (`timedOut`, e.g. a stalled tmux server —
+ * whose 128+signal exit code is otherwise indistinguishable from a genuine failure). All of these
+ * return false and leave the message queued, but they are evidence about the HOST, not the pane,
+ * and a caller that penalizes a row for its failures must tell them apart: counting them toward
+ * the #70 demotion streak would let a transient outage lasting `cap` heartbeats strip an interrupt
+ * of its push channel. The two callbacks are mutually exclusive, and neither fires on the ordinary
+ * ran-and-exited-non-zero miss, which is the only outcome the streak counts.
  */
 export async function deliverViaTmux(
   pane: string, socket: string | null, text: string, spawn: TmuxSpawn, query?: TmuxQuery,
   onDefer?: (reason: string) => void,
+  onFault?: (error: unknown) => void,
 ): Promise<boolean> {
   try {
     if (query) {
@@ -631,14 +854,25 @@ export async function deliverViaTmux(
         return false;
       }
     }
-    const { exitCode } = await spawn(buildTmuxArgs(pane, socket, text));
-    return exitCode === 0;
+    const { exitCode, timedOut } = await spawn(buildTmuxArgs(pane, socket, text));
+    if (exitCode === 0) return true;
+    if (timedOut) {
+      // The send outlived its deadline and was killed, so tmux never reported a verdict: the
+      // non-zero code is the kill, not the pane. Same handling as a spawn fault.
+      const e = new Error(`tmux send timed out and was killed (exit ${exitCode})`);
+      console.error(`[claude-peers broker] tmux delivery timed out for pane ${pane}: ${e.message}`);
+      onFault?.(e);
+    }
+    return false;
   } catch (e) {
     // A non-zero exit is handled above; reaching here means the spawn itself
     // rejected (a bug or environment fault, not a normal failed delivery). The
     // message still stays queued — never silently dropped — but the fault is
-    // logged so it does not vanish, unlike the ordinary non-zero-exit miss.
+    // logged so it does not vanish, unlike the ordinary non-zero-exit miss, and
+    // reported through onFault so a caller can hold it against the environment
+    // rather than against the pane.
     console.error(`[claude-peers broker] tmux delivery spawn error for pane ${pane}:`, e);
+    onFault?.(e);
     return false;
   }
 }
