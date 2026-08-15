@@ -221,9 +221,14 @@ bun cli.ts status            # broker status + all peers (local and remote)
 bun cli.ts peers             # list peers
 bun cli.ts send <id> [--urgency interrupt|normal|fyi] <msg>   # send a message into a Claude session (default: interrupt)
 bun cli.ts doorbell <id> [--since <id>] [--timeout <sec>] [--watch]   # block until <id> has unpushable mail, then exit
+bun cli.ts doctor [--json]   # diagnose broker, backend, and queue health
 bun cli.ts ping-siblings     # ping each configured sibling broker, report latency
 bun cli.ts kill-broker       # stop the broker
 ```
+
+`bun cli.ts doctor` is the read-only health check for when something is not arriving and `status` looks fine. It separates states the other commands cannot: a broker process that answers `/health` but cannot serve a peer read; a broker running an older protocol than this build (reported, never enforced — doctor does not retire anything); sibling reachability and each sibling's protocol version; a peer whose process is gone versus one that is alive but stale versus one whose tmux pane is live yet sitting at a shell prompt, so pushes defer; and per-recipient queue depth, oldest pending age, stalled delivery leases, and rows that have exhausted their push attempts. Every failed check carries a stable code (`BROKER_UNREACHABLE`, `PEER_BACKEND_UNREADY`, `QUEUE_LEASE_STALLED`, …), a plain explanation, and a remediation; `--json` emits the same report for monitoring. Exit status is 0 clean, 1 warnings only, 2 any failure.
+
+It never writes: it reads `/health` and `/list-peers`, opens the SQLite store read-only, and asks tmux what a pane is running. Queue answers are counts and ages — no message text, no capability tokens, and nothing from the environment ever reaches the output (guarded by `tests/privacy.test.ts`). With the broker down it still reports queue state straight from SQLite.
 
 `bun cli.ts send` is authenticated like any other session: it registers a short-lived, queued-only ephemeral peer (no tmux pane, so it is never a delivery target) to obtain a capability token, sends under that identity, and unregisters automatically in a `finally`. It does not bypass the token gate. (The `cli.ts kill-broker` command locates the broker process via `netstat -ano` on Windows and `lsof` elsewhere, so it works on both ([PR #19](https://github.com/jamditis/claude-peers-mcp/pull/19)); a supervised broker is better stopped through its service or Task Scheduler entry.)
 
