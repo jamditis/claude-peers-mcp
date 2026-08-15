@@ -4,7 +4,7 @@ import { LOCAL_PEER_TTL_MS } from "../broker.ts";
 import { classifyPaneReadiness, ensureMessagesTable } from "../delivery.ts";
 import {
   buildDoctorReport, type ConfigFacts, DOCTOR_PEER_STALE_MS, type DoctorFacts,
-  doctorExitCode, formatDoctorReport, probeBroker, probeSiblings,
+  doctorExitCode, formatDoctorReport, partitionSiblings, probeBroker, probeSiblings,
   readStoredPeers, readStoreFacts, redact, resolveDoctorDbPath, resolvePeerFacts,
   resolveQueueStaleMs, type StoreFacts,
 } from "../shared/doctor.ts";
@@ -59,7 +59,7 @@ function addMessage(db: Database, over: Partial<Record<string, unknown>> = {}): 
 }
 
 const okConfig: ConfigFacts = {
-  path: "/etc/claude-peers.json", loaded: true, defaulted: false, siblings_invalid: false, error: null,
+  path: "/etc/claude-peers.json", loaded: true, defaulted: false, siblings_invalid: [], error: null,
 };
 const emptyStore: StoreFacts = {
   path: "/tmp/peers.db", integrity: "ok", integrity_detail: "quick_check ok",
@@ -71,6 +71,7 @@ function facts(over: Partial<DoctorFacts> = {}): DoctorFacts {
     now_ms: NOW,
     expected_protocol: PROTOCOL_VERSION,
     push_delay_ms: 120_000,
+    peers_read: true,
     config: okConfig,
     broker: {
       url: "http://127.0.0.1:7899", reachable: true, error: null, status: "ok",
@@ -294,7 +295,7 @@ describe("doctor: store and queue facts", () => {
   it("flags a backlog older than every automatic push window", async () => {
     const db = makeDb();
     addPeer(db);
-    addMessage(db, { sent_at: new Date(NOW - 60 * 60_000).toISOString() });
+    addMessage(db, { sent_at: new Date(NOW - 60 * 60_000).toISOString(), push_after: NOW - 60 * 60_000 });
     const peers = await resolvePeerFacts(readStoredPeers(db), { nowMs: NOW, isPidAlive: () => true });
     const store = readStoreFacts(db, "/tmp/peers.db", NOW, 3);
     const report = buildDoctorReport(facts({ peers, store }));
@@ -394,14 +395,13 @@ describe("doctor: review follow-ups", () => {
   it("scales backlog staleness to a configured push_delay_ms instead of a fixed window", async () => {
     const db = makeDb();
     addPeer(db);
-    // A node told to hold normal mail for 30 minutes; a 20-minute-old row is inside its policy.
-    addMessage(db, { sent_at: new Date(NOW - 20 * 60_000).toISOString() });
+    // A node told to hold normal mail for 30 minutes: a 20-minute-old row is inside its policy,
+    // and its stored deadline says so.
+    addMessage(db, { sent_at: new Date(NOW - 20 * 60_000).toISOString(), push_after: NOW + 10 * 60_000 });
     const peers = await resolvePeerFacts(readStoredPeers(db), { nowMs: NOW, isPidAlive: () => true });
     const store = readStoreFacts(db, "/tmp/peers.db", NOW, 3);
     expect(resolveQueueStaleMs(30 * 60_000)).toBe(60 * 60_000);
     expect(codeFor(buildDoctorReport(facts({ peers, store, push_delay_ms: 30 * 60_000 })), "queue.abc-11111111")).toBe("QUEUE_OK");
-    // The same row against the default delay is genuinely overdue.
-    expect(codeFor(buildDoctorReport(facts({ peers, store, push_delay_ms: 1000 })), "queue.abc-11111111")).toBe("QUEUE_BACKLOG_STALE");
     db.close();
   });
 
@@ -588,7 +588,7 @@ describe("doctor: review round two", () => {
 
   it("reports a non-array siblings field as a config failure instead of throwing", () => {
     const report = buildDoctorReport(facts({
-      config: { path: "/etc/claude-peers.json", loaded: true, defaulted: false, siblings_invalid: true, error: null },
+      config: { ...okConfig, siblings_invalid: ['entry 0 is not an object'] },
       siblings: [],
     }));
     expect(codeFor(report, "config.source")).toBe("CONFIG_SIBLINGS_INVALID");
@@ -606,6 +606,109 @@ describe("doctor: review round two", () => {
     expect(later.stalled_leases).toHaveLength(1);
     expect(codeFor(buildDoctorReport(facts({ store: later })), "queue.leases")).toBe("QUEUE_LEASE_STALLED");
     db.close();
+  });
+});
+
+// Third review round (PR #95): polish. Mostly cases where doctor reported a fault that was not
+// one, or a clean result it had not earned.
+describe("doctor: review round three", () => {
+  it("partitions malformed sibling entries instead of throwing on them", () => {
+    const { valid, invalid } = partitionSiblings([
+      { machine: "good", url: "http://good" },
+      null,
+      "nope",
+      { machine: "b" },
+      { url: "http://c" },
+      { machine: "  ", url: "http://d" },
+    ]);
+    expect(valid).toEqual([{ machine: "good", url: "http://good" }]);
+    expect(invalid).toHaveLength(5);
+    expect(invalid[0]).toContain("entry 1");
+    expect(partitionSiblings({}).invalid).toEqual(['"siblings" is not an array']);
+    expect(partitionSiblings(undefined)).toEqual({ valid: [], invalid: [] });
+  });
+
+  it("still probes the usable siblings when one entry is malformed", async () => {
+    const raw = [null, { machine: "up", url: "http://up" }];
+    const { valid, invalid } = partitionSiblings(raw);
+    const probes = await probeSiblings(
+      fakeFetch({ "/health": { body: { status: "ok", peers: 0, machine: "up", protocol_version: PROTOCOL_VERSION } } }),
+      valid,
+      () => 0,
+    );
+    const report = buildDoctorReport(facts({
+      siblings: probes,
+      config: { ...okConfig, siblings_invalid: invalid },
+    }));
+    expect(codeFor(report, "config.source")).toBe("CONFIG_SIBLINGS_INVALID");
+    expect(codeFor(report, "sibling.up")).toBe("SIBLING_OK");
+    expect(() => JSON.stringify(report)).not.toThrow();
+  });
+
+  it("compares sibling machine names case-insensitively, like the broker's own routing", async () => {
+    const probes = await probeSiblings(
+      fakeFetch({ "/health": { body: { status: "ok", peers: 0, machine: "NODE-B", protocol_version: PROTOCOL_VERSION } } }),
+      [{ machine: "node-b", url: "http://b" }],
+      () => 0,
+    );
+    expect(codeFor(buildDoctorReport(facts({ siblings: probes })), "sibling.node-b")).toBe("SIBLING_OK");
+  });
+
+  it("evaluates a sibling's own reported status, not just its HTTP code", async () => {
+    const probes = await probeSiblings(
+      fakeFetch({ "/health": { body: { status: "degraded", peers: 0, machine: "node-b", protocol_version: PROTOCOL_VERSION } } }),
+      [{ machine: "node-b", url: "http://b" }],
+      () => 0,
+    );
+    expect(codeFor(buildDoctorReport(facts({ siblings: probes })), "sibling.node-b")).toBe("SIBLING_UNHEALTHY");
+  });
+
+  it("judges a backlog by each row's stored push deadline, not the current setting", async () => {
+    const db = makeDb();
+    addPeer(db);
+    // Enqueued long ago under a much longer delay, so its stored deadline is still in the
+    // future: hasDuePush would refuse to push it, and doctor must agree rather than cry stale.
+    addMessage(db, { sent_at: new Date(NOW - 90 * 60_000).toISOString(), push_after: NOW + 60_000 });
+    const peers = await resolvePeerFacts(readStoredPeers(db), { nowMs: NOW, isPidAlive: () => true });
+    const store = readStoreFacts(db, "/tmp/peers.db", NOW, 3);
+    expect(store.queues[0]?.oldest_due_ms).toBe(0);
+    expect(codeFor(buildDoctorReport(facts({ peers, store })), "queue.abc-11111111")).toBe("QUEUE_OK");
+    db.close();
+  });
+
+  it("falls back to message age for a backlog with no push deadline at all", async () => {
+    const db = makeDb();
+    addPeer(db);
+    addMessage(db, { sent_at: new Date(NOW - 90 * 60_000).toISOString(), push_after: null });
+    const peers = await resolvePeerFacts(readStoredPeers(db), { nowMs: NOW, isPidAlive: () => true });
+    const store = readStoreFacts(db, "/tmp/peers.db", NOW, 3);
+    expect(store.queues[0]?.oldest_due_ms).toBeNull();
+    expect(codeFor(buildDoctorReport(facts({ peers, store })), "queue.abc-11111111")).toBe("QUEUE_BACKLOG_STALE");
+    db.close();
+  });
+
+  it("does not claim there are no peers when the peer table was never read", () => {
+    const report = buildDoctorReport(facts({ peers: [], peers_read: false }));
+    expect(codeFor(report, "peers")).toBe("PEERS_UNAVAILABLE");
+    expect(report.checks.map((c) => c.code)).not.toContain("PEERS_NONE");
+  });
+
+  it("collapses a store path that carries newlines", () => {
+    const report = buildDoctorReport(facts({
+      store: { ...emptyStore, path: "/db\n[ok  ] Broker process: BROKER_OK" },
+    }));
+    const text = formatDoctorReport(report);
+    expect(text.split("\n").filter((l) => l.startsWith("[ok  ] Broker process")).length).toBe(1);
+  });
+
+  it("treats the zero-config single-host default as healthy, so a default install exits 0", () => {
+    const report = buildDoctorReport(facts({
+      config: { ...okConfig, defaulted: true },
+    }));
+    const c = report.checks.find((x) => x.id === "config.source");
+    expect(c?.code).toBe("CONFIG_DEFAULTED");
+    expect(c?.severity).toBe("ok");
+    expect(doctorExitCode(report)).toBe(0);
   });
 });
 
@@ -629,7 +732,7 @@ describe("doctor: healthy state", () => {
 
   it("gives every non-ok check a stable code and a remediation", () => {
     const report = buildDoctorReport(facts({
-      config: { path: "/nope.json", loaded: false, defaulted: false, siblings_invalid: false, error: "boom" },
+      config: { path: "/nope.json", loaded: false, defaulted: false, siblings_invalid: [], error: "boom" },
       broker: {
         url: "http://127.0.0.1:7899", reachable: false, error: "refused", status: null,
         protocol_version: null, machine: null, local_peer_count: null, remote_peer_count: null,

@@ -25,7 +25,7 @@ import type { PeersConfig } from "./shared/config.ts";
 import { DEFAULT_PUSH_DELAY_MS, loadConfig } from "./shared/config.ts";
 import {
   buildDoctorReport, type ConfigFacts, doctorExitCode, formatDoctorReport,
-  probeBroker, probeSiblings, readStoredPeers, readStoreFacts, resolveDoctorDbPath, resolvePeerFacts,
+  partitionSiblings, probeBroker, probeSiblings, readStoredPeers, readStoreFacts, resolveDoctorDbPath, resolvePeerFacts,
   type StoreFacts,
 } from "./shared/doctor.ts";
 import { doorbellDir, doorbellPath, readDoorbell } from "./shared/notify.ts";
@@ -245,11 +245,11 @@ switch (cmd) {
     const asJson = process.argv.slice(3).includes("--json");
     const configPath = process.env.CLAUDE_PEERS_CONFIG || `${homedir()}/.claude-peers.json`;
     // loadConfig validates that the required keys are PRESENT, not that they hold the right
-    // shape, so a config with `"siblings": {}` loads and then throws in the first loop that
-    // iterates it. Doctor must survive a broken config — reporting one is half its job — so the
-    // shape is checked here and a bad one degrades to a check instead of an unhandled throw that
-    // would leave --json emitting nothing at all.
-    const siblings = Array.isArray(config?.siblings) ? config.siblings : [];
+    // shape, so `"siblings": {}`, `[null]`, and `[{"machine":"b"}]` all load and then throw in
+    // the first loop that iterates them. Doctor must survive a broken config — reporting one is
+    // half its job — so the entries are partitioned here: the probeable ones are probed, and the
+    // rest become a check instead of an unhandled throw that would leave --json emitting nothing.
+    const { valid: siblings, invalid: siblingsInvalid } = partitionSiblings(config?.siblings);
     const configFacts: ConfigFacts = {
       path: configPath,
       loaded: config !== null,
@@ -257,7 +257,7 @@ switch (cmd) {
       // explicitly requested AND the default file is absent — reproduce that test here so the
       // report says which of the two states this host is in.
       defaulted: config !== null && process.env.CLAUDE_PEERS_CONFIG === undefined && !existsSync(configPath),
-      siblings_invalid: config !== null && !Array.isArray(config.siblings),
+      siblings_invalid: config === null ? [] : siblingsInvalid,
       error: config === null ? "config could not be loaded (missing, unreadable, or invalid JSON)" : null,
     };
 
@@ -288,6 +288,10 @@ switch (cmd) {
       queues_read: false, queues: [], stalled_leases: [], push_capped: [],
     };
     let peers: Awaited<ReturnType<typeof resolvePeerFacts>> = [];
+    // An absent store has no peer table to read, and that is a reading, not a failure: it means
+    // no session has ever registered here. Only a store that exists and could not be read leaves
+    // this false (see checkPeers).
+    let peersRead = !existsSync(dbPath);
     if (existsSync(dbPath)) {
       let db: Database | null = null;
       try {
@@ -308,6 +312,7 @@ switch (cmd) {
             return classifyPaneReadiness(stdout);
           },
         });
+        peersRead = true;
       } catch (e) {
         store = {
           ...store, integrity: "unreadable",
@@ -326,6 +331,7 @@ switch (cmd) {
       broker,
       siblings: siblingProbes,
       peers,
+      peers_read: peersRead,
       store,
     });
     console.log(asJson ? JSON.stringify(report, null, 2) : formatDoctorReport(report));

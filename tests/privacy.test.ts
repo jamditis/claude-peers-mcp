@@ -127,7 +127,8 @@ describe("doctor output privacy", () => {
       now_ms: now,
       expected_protocol: PROTOCOL_VERSION,
       push_delay_ms: 120_000,
-      config: { path: "/etc/claude-peers.json", loaded: true, defaulted: false, siblings_invalid: false, error: null },
+      peers_read: true,
+      config: { path: "/etc/claude-peers.json", loaded: true, defaulted: false, siblings_invalid: [], error: null },
       broker: {
         url: "http://127.0.0.1:7899", reachable: true, error: null,
         status: "ok", protocol_version: PROTOCOL_VERSION, machine: "node-a",

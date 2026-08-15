@@ -77,13 +77,13 @@ export interface ConfigFacts {
   /** True when no config file existed and the zero-config single-host default is in force. */
   defaulted: boolean;
   /**
-   * The config parsed but `siblings` is not an array. loadConfig checks that required keys are
-   * PRESENT, not that they are well-typed, so `"siblings": {}` loads happily and then explodes in
-   * the first federation loop that iterates it. Doctor reports it as a config fault instead of
-   * dying, and this flag is what keeps that fault a structured check (with valid --json) rather
-   * than a stack trace.
+   * Descriptions of `siblings` entries doctor could not probe — a non-array value, or entries
+   * that are not objects or lack a machine/url string. loadConfig checks that required keys are
+   * PRESENT, not that they are well-typed, so everything from `"siblings": {}` to `[null]` loads
+   * happily and then explodes in the first federation loop that iterates it. Reporting the fault
+   * is what keeps it a structured check (with valid --json) rather than a stack trace.
    */
-  siblings_invalid: boolean;
+  siblings_invalid: string[];
   error: string | null;
 }
 
@@ -108,6 +108,8 @@ export interface SiblingProbeFacts {
   reachable: boolean;
   /** The machine name the host at `url` calls ITSELF. A mismatch means the URL is misrouted. */
   reported_machine: string | null;
+  /** The sibling's own self-assessment from /health, judged exactly as the local broker's is. */
+  status: string | null;
   protocol_version: number | null;
   latency_ms: number | null;
   error: string | null;
@@ -159,6 +161,16 @@ export interface QueueFacts {
   never_push: number;
   oldest_pending_at: string | null;
   oldest_age_ms: number | null;
+  /**
+   * How long the recipient's earliest push deadline has been due (epoch-ms `push_after`, the
+   * column hasDuePush reads), or null when no pending row has one — all poll-only, or a store
+   * with no push_after column. Judging "overdue" from this rather than from sent_at is what keeps
+   * doctor consistent with the broker: push_after is STORED at insert from the delay in force
+   * then, so a row enqueued under a longer push_delay_ms carries its own later deadline, and
+   * inferring staleness from the CURRENT setting would call it stale while hasDuePush correctly
+   * still refuses to push it.
+   */
+  oldest_due_ms: number | null;
 }
 
 export interface StalledLeaseFacts {
@@ -195,6 +207,8 @@ export interface DoctorFacts {
   expected_protocol: number;
   /** The node's configured push_delay_ms, so backlog staleness is judged against its own policy. */
   push_delay_ms: number;
+  /** Whether the peer table was actually read (see checkPeers; false means "unknown", not "none"). */
+  peers_read: boolean;
   config: ConfigFacts;
   broker: BrokerProbeFacts;
   siblings: SiblingProbeFacts[];
@@ -243,6 +257,43 @@ export function resolveDoctorDbPath(
 }
 
 // --- Fact gathering (injected seams; no globals) ---
+
+/** A sibling entry doctor can actually probe: both fields present and non-empty strings. */
+export interface ValidSibling { machine: string; url: string; }
+
+/**
+ * Split a config's `siblings` value into the entries that can be probed and a description of the
+ * ones that cannot.
+ *
+ * loadConfig checks that required keys exist, not what they contain, so everything from
+ * `"siblings": {}` to `[null]` to `[{"machine": "b"}]` reaches this code. probeSiblings reads
+ * `s.url` to build the request and `s.machine` to label the result — including inside its own
+ * catch — so one malformed entry throws past every boundary and doctor emits no report at all,
+ * which is the one outcome a diagnostic must never have. Entries are described by INDEX rather
+ * than by their contents: an entry that failed validation cannot be trusted to name itself.
+ */
+export function partitionSiblings(raw: unknown): { valid: ValidSibling[]; invalid: string[] } {
+  if (raw === undefined || raw === null) return { valid: [], invalid: [] };
+  if (!Array.isArray(raw)) return { valid: [], invalid: ['"siblings" is not an array'] };
+  const valid: ValidSibling[] = [];
+  const invalid: string[] = [];
+  raw.forEach((entry, i) => {
+    if (entry === null || typeof entry !== "object") {
+      invalid.push(`entry ${i} is not an object`);
+      return;
+    }
+    const e = entry as Record<string, unknown>;
+    const machine = typeof e.machine === "string" ? e.machine.trim() : "";
+    const url = typeof e.url === "string" ? e.url.trim() : "";
+    const missing = [machine === "" ? "machine" : null, url === "" ? "url" : null].filter(Boolean);
+    if (missing.length > 0) {
+      invalid.push(`entry ${i} is missing ${missing.join(" and ")}`);
+      return;
+    }
+    valid.push({ machine, url });
+  });
+  return { valid, invalid };
+}
 
 export type DoctorFetch = (
   url: string,
@@ -319,20 +370,21 @@ export async function probeSiblings(
       if (!res.ok) {
         return {
           machine: s.machine, url: s.url, reachable: false, reported_machine: null,
-          protocol_version: null, latency_ms, error: `health returned ${res.status}`,
+          status: null, protocol_version: null, latency_ms, error: `health returned ${res.status}`,
         };
       }
       const h = (await res.json()) as Record<string, unknown>;
       return {
         machine: s.machine, url: s.url, reachable: true,
         reported_machine: typeof h.machine === "string" ? redact(h.machine, 60) : null,
+        status: typeof h.status === "string" ? redact(h.status, 40) : null,
         protocol_version: typeof h.protocol_version === "number" ? h.protocol_version : 1,
         latency_ms, error: null,
       };
     } catch (e) {
       return {
         machine: s.machine, url: s.url, reachable: false, reported_machine: null,
-        protocol_version: null, latency_ms: null,
+        status: null, protocol_version: null, latency_ms: null,
         error: redact(e instanceof Error ? e.message : String(e)),
       };
     }
@@ -423,10 +475,11 @@ export function readStoreFacts(db: Database, path: string, nowMs: number, pushCa
   // the two states it encoded, and an absent push_after reads as 0 (due now), which is exactly
   // what migrateMessagesSchema backfills.
   const modernState = hasColumn(db, "messages", "delivery_state");
+  const hasPushAfter = hasColumn(db, "messages", "push_after");
   const state = modernState
     ? "delivery_state"
     : "(CASE WHEN delivered=1 THEN 'delivered' ELSE 'queued' END)";
-  const pushAfter = hasColumn(db, "messages", "push_after") ? "push_after" : "0";
+  const pushAfter = hasPushAfter ? "push_after" : "0";
   // Leases arrived with delivery_state; without both columns no row can be 'delivering', so
   // there is no lease to stall and the query is skipped rather than guessed at.
   const hasLeases = modernState
@@ -439,19 +492,22 @@ export function readStoreFacts(db: Database, path: string, nowMs: number, pushCa
               SUM(CASE WHEN ${state}='queued' THEN 1 ELSE 0 END) AS queued,
               SUM(CASE WHEN ${state}='delivering' THEN 1 ELSE 0 END) AS delivering,
               SUM(CASE WHEN ${pushAfter} IS NULL THEN 1 ELSE 0 END) AS never_push,
-              MIN(sent_at) AS oldest_pending_at
+              MIN(sent_at) AS oldest_pending_at,
+              ${hasPushAfter ? "MIN(CASE WHEN push_after IS NOT NULL THEN push_after END)" : "NULL"} AS oldest_push_after
          FROM messages
         WHERE ${state} IN ('queued','delivering')
         GROUP BY to_id
         ORDER BY to_id`,
-    ).all() as Array<{ to_id: string; queued: number; delivering: number; never_push: number; oldest_pending_at: string | null }>;
-    facts.queues = queues.map((q) => {
+    ).all() as Array<{ to_id: string; queued: number; delivering: number; never_push: number; oldest_pending_at: string | null; oldest_push_after: number | null }>;
+    facts.queues = queues.map(({ oldest_push_after, ...q }) => {
       const parsed = q.oldest_pending_at === null ? Number.NaN : Date.parse(q.oldest_pending_at);
       return {
         ...q,
         // Clamp at 0: a store written by a host whose clock is ahead must read as "just now",
-        // never as negative age.
+        // never as negative age. A deadline still in the future clamps to 0 too — not yet due is
+        // not overdue.
         oldest_age_ms: Number.isFinite(parsed) ? Math.max(0, nowMs - parsed) : null,
+        oldest_due_ms: oldest_push_after === null ? null : Math.max(0, nowMs - oldest_push_after),
       };
     });
 
@@ -574,25 +630,29 @@ export function checkConfig(c: ConfigFacts): DoctorCheck[] {
   if (!c.loaded) {
     return [check(
       "config.source", "Config", "CONFIG_UNREADABLE", "fail",
-      `Could not load config at ${c.path}${c.error ? `: ${c.error}` : ""}.`,
+      `Could not load config at ${redact(c.path, 120)}${c.error ? `: ${c.error}` : ""}.`,
       "Fix or recreate the config file (see deploy/configs/ for per-host samples), or point CLAUDE_PEERS_CONFIG at a valid one.",
     )];
   }
-  if (c.siblings_invalid) {
+  if (c.siblings_invalid.length > 0) {
     return [check(
       "config.source", "Config", "CONFIG_SIBLINGS_INVALID", "fail",
-      `${c.path} has a "siblings" field that is not an array, so federation cannot be set up from it and no sibling was probed.`,
+      `${redact(c.path, 120)} has ${c.siblings_invalid.length} unusable "siblings" entr${c.siblings_invalid.length === 1 ? "y" : "ies"} (${c.siblings_invalid.join("; ")}); those siblings were not probed and federation cannot reach them.`,
       'Set "siblings" to an array of {"machine","url"} entries (an empty array [] for a single-host node).',
     )];
   }
   if (c.defaulted) {
+    // Not a warning. A single host with no config file is a supported, documented deployment
+    // (loadConfig returns singleHostDefault for exactly this case), so flagging it would mean a
+    // healthy default install could never exit 0 — and a check that cannot be satisfied is a
+    // check an operator learns to ignore. An explicitly requested config that failed to load is
+    // a different thing entirely, and fails above.
     return [check(
-      "config.source", "Config", "CONFIG_DEFAULTED", "warn",
-      `No config file at ${c.path}; running the zero-config single-host default (loopback only, no siblings).`,
-      "Write a config file if this host is meant to federate; otherwise this is expected.",
+      "config.source", "Config", "CONFIG_DEFAULTED", "ok",
+      `No config file at ${redact(c.path, 120)}; running the zero-config single-host default (loopback only, no siblings). Write one if this host is meant to federate.`,
     )];
   }
-  return [check("config.source", "Config", "CONFIG_OK", "ok", `Loaded ${c.path}.`)];
+  return [check("config.source", "Config", "CONFIG_OK", "ok", `Loaded ${redact(c.path, 120)}.`)];
 }
 
 export function checkBroker(b: BrokerProbeFacts, expectedProtocol: number): DoctorCheck[] {
@@ -663,27 +723,31 @@ export function checkBroker(b: BrokerProbeFacts, expectedProtocol: number): Doct
 }
 
 export function checkStore(s: StoreFacts): DoctorCheck[] {
+  // A POSIX filename may contain newlines, and db_path comes from a config file or an env var —
+  // foreign input by the same standard as everything else here. The FACTS keep the real path
+  // (the caller opens the file with it); only the rendered form is collapsed and capped.
+  const shown = redact(s.path, 120);
   switch (s.integrity) {
     case "missing":
       return [check(
         "store.integrity", "Message store", "STORE_MISSING", "warn",
-        `No SQLite store at ${s.path}.`,
+        `No SQLite store at ${shown}.`,
         "Expected before the first session registers; the broker creates it on start.",
       )];
     case "unreadable":
       return [check(
         "store.integrity", "Message store", "STORE_UNREADABLE", "fail",
-        `Could not read ${s.path}: ${s.integrity_detail}.`,
+        `Could not read ${shown}: ${s.integrity_detail}.`,
         "Check file permissions and that db_path points at the broker's store.",
       )];
     case "corrupt":
       return [check(
         "store.integrity", "Message store", "STORE_CORRUPT", "fail",
-        `PRAGMA quick_check on ${s.path} reported: ${s.integrity_detail}.`,
+        `PRAGMA quick_check on ${shown} reported: ${s.integrity_detail}.`,
         "Stop the broker (`bun cli.ts kill-broker`), back up the file, then recover it with sqlite3 .recover or move it aside to start clean (queued mail is lost).",
       )];
     default:
-      return [check("store.integrity", "Message store", "STORE_OK", "ok", `${s.path}: quick_check ok.`)];
+      return [check("store.integrity", "Message store", "STORE_OK", "ok", `${shown}: quick_check ok.`)];
   }
 }
 
@@ -703,7 +767,11 @@ export function checkSiblings(siblings: SiblingProbeFacts[], expectedProtocol: n
     // config pointing two entries at one URL (a copy-paste, a stale IP another node has taken
     // over) is visible here and nowhere else: gossip would keep filing that host's peers under
     // the wrong name, and every other check would read green.
-    if (s.reported_machine !== null && s.reported_machine !== s.machine) {
+    // Case-insensitively, the way resolveTargetBroker compares these very names when routing a
+    // forward (issue #17: sibling config and gossiped machine name come from independently-edited
+    // files, so casing drifts). A case-sensitive compare here would report a mismatch on a pair
+    // the broker itself considers a match, sending an operator to fix working federation.
+    if (s.reported_machine !== null && s.reported_machine.toLowerCase() !== s.machine.toLowerCase()) {
       return check(
         `sibling.${s.machine}`, `Sibling ${s.machine}`, "SIBLING_MACHINE_MISMATCH", "warn",
         `${s.url} is configured as ${s.machine} but calls itself ${s.reported_machine}, so this entry points at the wrong host.`,
@@ -715,6 +783,16 @@ export function checkSiblings(siblings: SiblingProbeFacts[], expectedProtocol: n
         `sibling.${s.machine}`, `Sibling ${s.machine}`, "SIBLING_PROTOCOL_MISMATCH", "warn",
         `${s.machine} speaks protocol ${s.protocol_version}; this node expects ${expectedProtocol}. Fields newer than ${s.protocol_version} are dropped in both directions.`,
         `Upgrade the ${s.protocol_version < expectedProtocol ? "sibling" : "local"} node so both run the same release.`,
+      );
+    }
+    // A sibling's own self-assessment counts for as much as the local broker's, which is already
+    // evaluated: a 2xx only says the HTTP layer worked, and "degraded" in the body is the host
+    // telling us it is not well.
+    if (s.status !== null && s.status !== "ok") {
+      return check(
+        `sibling.${s.machine}`, `Sibling ${s.machine}`, "SIBLING_UNHEALTHY", "warn",
+        `${s.url} answered but reports its own status as "${s.status}" (protocol ${s.protocol_version}).`,
+        `Check the broker log on ${s.machine}; peers there may not be reachable even though the host answers.`,
       );
     }
     return check(
@@ -729,7 +807,18 @@ export function checkSiblings(siblings: SiblingProbeFacts[], expectedProtocol: n
  * explains everything downstream of it, so it wins over a stale heartbeat, which in turn wins
  * over a backend that merely cannot take a push right now.
  */
-export function checkPeers(peers: PeerFacts[], staleMs = DOCTOR_PEER_STALE_MS): DoctorCheck[] {
+export function checkPeers(
+  peers: PeerFacts[], staleMs = DOCTOR_PEER_STALE_MS, peersRead = true,
+): DoctorCheck[] {
+  // Same rule as the queue section: an empty list because the read failed is not an empty list.
+  // "No peers registered" printed over an unreadable store is a false all-clear.
+  if (!peersRead) {
+    return [check(
+      "peers", "Peers", "PEERS_UNAVAILABLE", "warn",
+      "The peer table could not be read, so no conclusion about registered sessions or their backends is possible.",
+      "Fix the store (see the message-store check above), then re-run doctor.",
+    )];
+  }
   if (peers.length === 0) {
     return [check("peers", "Peers", "PEERS_NONE", "ok", "No peers registered.")];
   }
@@ -814,8 +903,8 @@ export function checkQueues(
     return [check(
       "queue", "Queues", "QUEUE_UNAVAILABLE", missing ? "ok" : "warn",
       missing
-        ? `No store at ${s.path} yet, so there is no queue to read.`
-        : `Queue and lease state could not be read from ${s.path}: ${s.integrity_detail}. No conclusion about pending mail or stalled leases is possible.`,
+        ? `No store at ${redact(s.path, 120)} yet, so there is no queue to read.`
+        : `Queue and lease state could not be read from ${redact(s.path, 120)}: ${s.integrity_detail}. No conclusion about pending mail or stalled leases is possible.`,
       missing ? null : "Fix the store (see the message-store check above), then re-run doctor.",
     )];
   }
@@ -848,7 +937,10 @@ export function checkQueues(
       ));
       continue;
     }
-    if (q.oldest_age_ms !== null && q.oldest_age_ms > staleMs) {
+    // Overdue against the row's OWN stored deadline when it has one; a wholly poll-only backlog
+    // has no deadline to miss, so its age since sent_at is the only signal available.
+    const overdueMs = q.oldest_due_ms ?? q.oldest_age_ms;
+    if (overdueMs !== null && overdueMs > staleMs) {
       checks.push(check(
         id, title, "QUEUE_BACKLOG_STALE", "warn",
         `${counts}. Older than ${formatMs(staleMs)} — past this node's own push window — so the recipient is not draining.`,
@@ -891,7 +983,7 @@ export function buildDoctorReport(facts: DoctorFacts): DoctorReport {
     ...checkBroker(facts.broker, facts.expected_protocol),
     ...checkStore(facts.store),
     ...checkSiblings(facts.siblings, facts.expected_protocol),
-    ...checkPeers(facts.peers),
+    ...checkPeers(facts.peers, DOCTOR_PEER_STALE_MS, facts.peers_read),
     ...checkQueues(facts.store, facts.peers, resolveQueueStaleMs(facts.push_delay_ms)),
   ];
   const counts = { ok: 0, warn: 0, fail: 0 };
