@@ -11,9 +11,9 @@ import { Database } from "bun:sqlite";
 import {
   bumpPushFailures, claimForDelivery, confirmDelivered, countsAsPushFailure, DEFAULT_DEFERRAL_ESCALATION_CAP,
   DEFAULT_PUSH_FAILURE_DEMOTION_CAP, decideDeferralEscalation, decidePushDemotion,
-  demoteToPollOnly, deliverViaTmux, ensureMessagesTable,
+  demoteQueuedPushable, deliverViaTmux, ensureMessagesTable,
   formatPeerMessage, generateAuthToken, generateLeaseToken, hasDuePush,
-  isFederationRoute, isLoopback, isMessageDelivered, isPidDead, makeSpawnTmuxQuery,
+  isFederationRoute, isLoopback, isMessageDelivered, isPidDead, makeSpawnTmuxQuery, makeSpawnTmuxSend,
   migrateMessagesSchema, nextDeliverable, pidProbe, promoteQueuedForFlush,
   pruneMessages, pushAfterFor, reclaimIfExpired, reclaimLeaklessDelivering,
   releasableQueuedPrefix, releaseToQueued, resetDeliveringOnStart, resetPushFailures,
@@ -684,12 +684,10 @@ if (import.meta.main) {
     process.exit(0);
   }
 
-  const realTmuxSpawn: TmuxSpawn = async (args) => {
-    const proc = Bun.spawn(args, { stdout: "ignore", stderr: "ignore" });
-    const timer = setTimeout(() => { try { proc.kill(); } catch {} }, TMUX_TIMEOUT_MS);
-    try { const exitCode = await proc.exited; return { exitCode }; }
-    finally { clearTimeout(timer); }
-  };
+  // Kills a send that outlives TMUX_TIMEOUT_MS and reports that it did so: a killed process
+  // resolves 128+signal, which the delivery path would otherwise read as the pane refusing the
+  // keystrokes and hold against the row's #70 streak (see makeSpawnTmuxSend).
+  const realTmuxSpawn: TmuxSpawn = makeSpawnTmuxSend(TMUX_TIMEOUT_MS);
 
   // Same shape as realTmuxSpawn but pipes stdout so a readiness probe can read the pane's
   // foreground command. Used only for the pre-send pane check (display-message), never for
@@ -774,10 +772,19 @@ if (import.meta.main) {
   }
 
   // Record one failed push of a row and, once its run of consecutive failures reaches the cap,
-  // take it out of the push channel (#70). The demotion is not a drop: the row keeps its text and
-  // its place in the queue, check_messages still drains it, and — the point — clearing push_after
-  // opens ringDoorbellAfterSettle's withhold, so this row and the poll-only mail stuck behind it
-  // are announced by the doorbell on this very burst's settle instead of never.
+  // take this recipient's whole queued pushable backlog out of the push channel (#70). Demotion is
+  // not a drop: every row keeps its text and its place in the queue, check_messages still drains
+  // them, and — the point — clearing push_after opens ringDoorbellAfterSettle's withhold, so the
+  // demoted rows and the poll-only mail stuck behind them are announced by the doorbell on this
+  // very burst's settle instead of never.
+  //
+  // The streak is counted per row (the row is what kept failing) but spent per recipient, because
+  // what it proves is about the PANE: a session that refused `cap` sends in a row will refuse the
+  // next row just as surely. Demoting only the failing row leaves the one behind it pushable, so
+  // the withhold stays shut and every younger row has to earn its own full run — the backlog case
+  // the guard was supposed to open for. Mail arriving after this starts pushable again, so a
+  // recovered pane is retried and the cost of a still-broken one is one cap-run per recovery
+  // attempt (see demoteQueuedPushable).
   //
   // Losing push urgency is a real demotion, so it is logged rather than done quietly, and an
   // interrupt row (a sender blocked on this recipient) says so in the same line: the send-keys
@@ -787,11 +794,13 @@ if (import.meta.main) {
   function notePushFailure(row: { id: number; to_id: string; urgency: string }): void {
     const failures = bumpPushFailures(db, row.id);
     const decision = decidePushDemotion(failures, PUSH_FAILURE_DEMOTION_CAP);
-    if (!decision.demote || !demoteToPollOnly(db, row.id)) return;
+    if (!decision.demote) return;
+    const demoted = demoteQueuedPushable(db, row.to_id);
+    if (demoted === 0) return;
     const lost = row.urgency === "interrupt"
-      ? " it was an interrupt, so it loses its push urgency and now waits for check_messages/the doorbell"
+      ? ` message #${row.id} was an interrupt, so it loses its push urgency and now waits for check_messages/the doorbell`
       : "";
-    console.error(`[claude-peers broker] demoting message #${row.id} to peer ${row.to_id} to poll-only: ${decision.reason} consecutive failed pushes (send-keys ran and missed);${lost || " the row stays queued for check_messages and the doorbell now announces it"}`);
+    console.error(`[claude-peers broker] demoting ${demoted} queued message(s) for peer ${row.to_id} to poll-only: message #${row.id} hit ${decision.reason} consecutive failed pushes (send-keys ran and missed), so this pane is not accepting keystrokes;${lost || " they stay queued for check_messages and the doorbell now announces them"}`);
   }
 
   async function attemptDeliverNext(toId: string): Promise<"accepted" | "queued" | null> {

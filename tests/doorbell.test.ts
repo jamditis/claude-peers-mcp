@@ -594,11 +594,67 @@ describe("a ring waits for a push that is coming later, not just one already in 
       loud.kill();
       await loud.exited;
       const err = await new Response(loud.stderr).text();
-      expect(err).toContain(`demoting message #${id}`);
+      expect(err).toContain(`message #${id} hit`);
       expect(err).toContain("interrupt");
     } finally {
       loud.kill();
       await loud.exited;
+    }
+  }, 20_000);
+
+  const PORT_BULK = 17950;
+  const DB_PATH_BULK = join(work, "bulk.db");
+  const CONFIG_PATH_BULK = join(work, "bulk-config.json");
+
+  // Demoting only the row that tripped the cap does not actually open the guard when a backlog is
+  // queued: the next row is still pushable, countPushableQueued stays > 0, and every younger row
+  // would have to earn its own full run of failures before the bell could ring. The streak is
+  // evidence about the pane, so it is spent on the recipient's whole queued pushable backlog.
+  it("demotes the recipient's whole pushable backlog, so a burst does not re-close the guard (#70)", async () => {
+    writeFileSync(CONFIG_PATH_BULK, JSON.stringify({
+      machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_BULK,
+      id_prefix: "dbk", siblings: [], allowed_ips: ["127.0.0.1"], db_path: DB_PATH_BULK,
+      push_delay_ms: 0,
+    }));
+    const bulk = Bun.spawn(["bun", "broker.ts"], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH_BULK, PATH: `${work}:${process.env.PATH}` },
+      stdout: "ignore", stderr: "ignore",
+    });
+    try {
+      expect(await waitForHealth(PORT_BULK)).toBe(true);
+      const rcpt = await regRcpt({ cwd: "/tmp/bulk", tmux_pane: FAIL_PANE }, PORT_BULK);
+      const sender = await regSender({ cwd: "/tmp/bulk-s" }, PORT_BULK);
+
+      // Three pushable rows to the broken pane, then the poll-only row that the bell is for.
+      for (const text of ["one", "two", "three"]) {
+        await okAt(PORT_BULK, "/send-message",
+          { from_id: sender.id, to_id: rcpt.id, text, urgency: "normal" }, sender.token);
+      }
+      await okAt(PORT_BULK, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "poll only", urgency: "fyi" }, sender.token);
+      const peek = await okAt(PORT_BULK, "/peek", { id: rcpt.id }, rcpt.token);
+      expect(peek.count).toBe(4);
+
+      // Every attempt fails on the same head-of-line row, so the cap is reached there. More
+      // heartbeats than the cap needs: past the demotion nothing is pushable, so they attempt
+      // nothing and their settles re-ring a value the clamp refuses.
+      for (let i = 0; i < 8; i++) await okAt(PORT_BULK, "/heartbeat", { id: rcpt.id }, rcpt.token);
+
+      const probe = new Database(DB_PATH_BULK);
+      const rows = probe.query(
+        "SELECT delivery_state, push_after FROM messages WHERE to_id = ? ORDER BY id",
+      ).all(rcpt.id) as { delivery_state: string; push_after: number | null }[];
+      probe.close();
+      expect(rows.length).toBe(4);
+      // The whole backlog left the push channel together, and nothing was dropped doing it.
+      expect(rows.every((r) => r.push_after === null)).toBe(true);
+      expect(rows.every((r) => r.delivery_state === "queued")).toBe(true);
+      // Which is what lets the guard open: the bell announces everything readable, fyi included.
+      expect(readDoorbell(DB_PATH_BULK, rcpt.id, -1)).toBe(peek.max_id);
+    } finally {
+      bulk.kill();
+      await bulk.exited;
     }
   }, 20_000);
 });
