@@ -13,11 +13,11 @@ import {
   DEFAULT_PUSH_FAILURE_DEMOTION_CAP, decideDeferralEscalation, decidePushDemotion,
   demoteQueuedPushable, deliverViaTmux, ensureMessagesTable,
   formatPeerMessage, generateAuthToken, generateLeaseToken, hasDuePush,
-  isFederationRoute, isLoopback, isMessageDelivered, isPidDead, makeSpawnTmuxQuery, makeSpawnTmuxSend,
+  isFederationRoute, isLoopback, isMessageDelivered, isPidDead, makeSpawnTmuxQuery,
   migrateMessagesSchema, nextDeliverable, pidProbe, promoteQueuedForFlush,
   pruneMessages, pushAfterFor, readPushAfter, reclaimIfExpired, reclaimLeaklessDelivering, reportedPollOnly,
   releasableQueuedPrefix, releaseToQueued, resetDeliveringOnStart, resetPushFailures,
-  type TmuxQuery, type TmuxSpawn,
+  type TmuxQuery,
 } from "./delivery.ts";
 import { loadConfig, type SiblingConfig } from "./shared/config.ts";
 import { displaySessionName } from "./shared/format-peers.ts";
@@ -684,14 +684,12 @@ if (import.meta.main) {
     process.exit(0);
   }
 
-  // Kills a send that outlives TMUX_TIMEOUT_MS and reports that it did so: a killed process
-  // resolves 128+signal, which the delivery path would otherwise read as the pane refusing the
-  // keystrokes and hold against the row's #70 streak (see makeSpawnTmuxSend).
-  const realTmuxSpawn: TmuxSpawn = makeSpawnTmuxSend(TMUX_TIMEOUT_MS);
-
-  // Same shape as realTmuxSpawn but pipes stdout so a readiness probe can read the pane's
-  // foreground command. Used only for the pre-send pane check (display-message), never for
-  // the inject itself. Subject to the same kill-timer so a hung probe cannot block delivery.
+  // The single tmux seam for delivery: it pipes stdout, which both stages of a send need — the
+  // pre-send readiness probe reads the pane's foreground command, and the guarded inject reads
+  // which branch tmux took (#44). It kills anything that outlives TMUX_TIMEOUT_MS, so a hung tmux
+  // cannot block delivery, and reports that it did so: a killed process resolves 128+signal,
+  // which the delivery path would otherwise read as the pane refusing the keystrokes and hold
+  // against the row's #70 streak (see makeSpawnTmuxQuery).
   const realTmuxQuery: TmuxQuery = makeSpawnTmuxQuery(TMUX_TIMEOUT_MS);
 
   function peerDelivery(toId: string): { kind: string; pane: string | null; socket: string | null } | null {
@@ -834,16 +832,18 @@ if (import.meta.main) {
     let faultedThisAttempt = false;
     try {
       const text = formatPeerMessage(row);
-      // The query arg enables a pre-send readiness probe: if the pane's foreground process is
-      // a bare shell rather than a live Claude session, deliverViaTmux skips the inject and
-      // returns false, so the row stays queued instead of pasting into a shell. This catches
-      // the outlived-pane case below before the text lands; the post-send liveness re-probe
-      // still guards the narrower race where the peer dies during the await. onDefer fires on
-      // exactly that not-ready skip: count it toward this recipient's streak and, once the run
-      // of consecutive deferrals reaches the cap, escalate a pane that is stuck a shell louder
-      // than the per-attempt defer log (#42) — a permanently shelled pid is invisible to the
-      // dead-pid sweep, so its mail would otherwise stall in silence.
-      const ok = await deliverViaTmux(target.pane, target.socket, text, realTmuxSpawn, realTmuxQuery,
+      // deliverViaTmux probes the pane before injecting: if its foreground process is a bare
+      // shell rather than a live Claude session, it skips the inject and returns false, so the
+      // row stays queued instead of pasting into a shell. That catches the outlived-pane case
+      // below before the text lands, and the inject it then issues re-checks the pane inside
+      // the same tmux process, so a session that exits in the gap is not pasted into on the
+      // strength of the earlier probe (#44). The post-send liveness re-probe still guards the narrower race where the peer
+      // dies during the await. onDefer fires on exactly those not-ready skips: count each
+      // toward this recipient's streak and, once the run of consecutive deferrals reaches the
+      // cap, escalate a pane that is stuck a shell louder than the per-attempt defer log (#42)
+      // — a permanently shelled pid is invisible to the dead-pid sweep, so its mail would
+      // otherwise stall in silence.
+      const ok = await deliverViaTmux(target.pane, target.socket, text, realTmuxQuery,
         (reason) => {
           deferredThisAttempt = true;
           const streak = (deferralStreaks.get(toId) ?? 0) + 1;

@@ -593,18 +593,19 @@ export function formatPeerMessage(msg: { id: number; from_id: string; text: stri
 }
 
 /**
- * One tmux invocation. `exitCode` 0 is the only success. `timedOut` says the caller's own
- * kill-timer fired, i.e. the process was still running when its deadline passed and was killed —
- * NOT that tmux decided to exit non-zero. The distinction cannot be recovered from the exit code:
- * a killed process resolves to 128+signal (143 for SIGTERM), an ordinary number that reads exactly
- * like a genuine tmux failure. It cannot be recovered from the signal either, since an unrelated
- * external SIGTERM looks identical; only the spawner knows whose timer fired. Callers that
- * penalize a pane for its failures need this (#70), so the flag is reported rather than inferred.
+ * One tmux invocation, with its stdout — the single seam every tmux process in the delivery path
+ * goes through, because both stages need output: the readiness probe reads the pane's foreground
+ * command, and the guarded inject reads which branch tmux took.
+ *
+ * `exitCode` 0 is the only success. `timedOut` says the caller's own kill-timer fired, i.e. the
+ * process was still running when its deadline passed and was killed — NOT that tmux decided to
+ * exit non-zero. The distinction cannot be recovered from the exit code: a killed process resolves
+ * to 128+signal (143 for SIGTERM), an ordinary number that reads exactly like a genuine tmux
+ * failure. It cannot be recovered from the signal either, since an unrelated external SIGTERM
+ * looks identical; only the spawner knows whose timer fired. Callers that penalize a pane for its
+ * failures need this (#70), so the flag is reported rather than inferred.
  */
-export type TmuxSpawn = (args: string[]) => Promise<{ exitCode: number; timedOut?: boolean }>;
-
-/** Like TmuxSpawn, but also returns the process stdout so a probe can read it. */
-export type TmuxQuery = (args: string[]) => Promise<{ exitCode: number; stdout: string }>;
+export type TmuxQuery = (args: string[]) => Promise<{ exitCode: number; stdout: string; timedOut?: boolean }>;
 
 /** Build the argv for one tmux process that types the text then presses Enter. */
 export function buildTmuxArgs(pane: string, socket: string | null, text: string): string[] {
@@ -667,8 +668,10 @@ export function classifyPaneReadiness(currentCommand: string): PaneReadiness {
  * atomic-guard counterpart to classifyPaneReadiness. A single
  * `tmux if-shell -F <predicate> "send-keys ..."` re-reads pane_current_command and sends
  * in one process, closing the probe-to-send TOCTOU window (issue #44): a pane that stops
- * running Claude between an earlier probe and the send cannot receive a stray paste,
- * because the predicate is re-evaluated at send time inside the same tmux invocation.
+ * running Claude between an earlier probe and the send is not pasted into on the strength of
+ * that stale probe, because the predicate is re-evaluated at send time inside the same tmux
+ * invocation — in the same uninterrupted server callback as the keystrokes it selects (the
+ * source-level argument for that, and the residual window it leaves, are in buildGuardedTmuxArgs).
  *
  * The point of deriving the predicate from the SHELL_COMMANDS set here, rather than
  * hand-copying the list into a tmux `case` string, is that the classifier and the atomic
@@ -678,13 +681,19 @@ export function classifyPaneReadiness(currentCommand: string): PaneReadiness {
  * `#{==:#{pane_current_command},<sh>}` comparison, then negate, so an empty or unrecognized
  * command falls open to ready, matching classifyPaneReadiness's fail-open denylist rule.
  *
- * Two differences from the pure classifier a caller must weigh before wiring this into the
- * send path (they are why #44 needs a deliberate decision, not a reflexive patch): tmux `-F` comparisons are
- * case-sensitive and do not trim, whereas classifyPaneReadiness folds case and trims, so a
- * pane reporting "BASH" reads ready here but not-ready there. In practice
- * pane_current_command is the lowercase basename, so the two agree, but the divergence is
- * real. And `#{||:...}` / `#{?...}` format conditionals require a tmux new enough to
- * support them (roughly 2.9+); an older tmux would treat the predicate as a literal.
+ * Two differences from the pure classifier, both live in the wired path (buildGuardedTmuxArgs)
+ * and are accepted deliberately. tmux `-F` comparisons are case-sensitive and do not trim,
+ * whereas classifyPaneReadiness folds case and trims, so a pane reporting "BASH" reads ready
+ * here but not-ready there. In practice pane_current_command is the lowercase basename, so the
+ * two agree — and the pre-send probe (which does fold case) still runs first, so the divergence
+ * can only make the atomic guard more permissive than the probe, never less.
+ *
+ * Version sensitivity: the `#{==:...}` / `#{||:...}` comparison operators need roughly tmux
+ * 2.9+; `#{?...}` conditionals are much older. On a tmux too old for the comparisons they
+ * expand to nothing, which leaves `#{?,0,1}` — a false condition, so the predicate yields "1",
+ * ready. That degradation is the fail-open direction on purpose: an old tmux loses the atomic
+ * backstop and keeps today's behavior (probe, then send) rather than silently starving a pane
+ * that no format can vouch for.
  */
 export function buildPaneReadyFormat(shellCommands: Iterable<string> = SHELL_COMMANDS): string {
   const isShell = [...shellCommands]
@@ -692,6 +701,118 @@ export function buildPaneReadyFormat(shellCommands: Iterable<string> = SHELL_COM
     .reduce((acc, cmp) => (acc === "" ? cmp : `#{||:${acc},${cmp}}`), "");
   if (isShell === "") return "1"; // no shells defined: nothing is a shell, so every pane is ready
   return `#{?${isShell},0,1}`; // truthy (1) only when the command matched no shell name
+}
+
+/**
+ * Quote one argument for tmux's OWN command-string parser — the parser that reads the command
+ * arguments of `if-shell`, not a shell. tmux single quotes are fully literal (no escapes, no
+ * `#{...}` expansion, no `;` command split, and a newline inside them stays part of the
+ * argument), so wrapping in single quotes and closing/reopening around each embedded quote
+ * (`'\''`, the shell idiom, which tmux's backslash escaping outside quotes also accepts) makes
+ * arbitrary peer text safe to nest. This is what keeps the bracketed-paste wrapper and the
+ * message body byte-identical to the unnested send: nothing in the text can end the argument
+ * early and become a second tmux command.
+ */
+export function quoteTmuxArg(arg: string): string {
+  return `'${arg.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * Render a tmux argv (in the `buildTmuxArgs` shape, where a bare ";" separates commands) into a
+ * single tmux command string suitable for nesting inside `if-shell`. Every element is quoted
+ * except the separator, which must stay bare to keep its meaning.
+ */
+export function renderTmuxCommandString(argv: string[]): string {
+  return argv.map((a) => (a === ";" ? ";" : quoteTmuxArg(a))).join(" ");
+}
+
+// Markers the guarded send prints on the invoking client's stdout so the caller can tell which
+// branch tmux took. `if-shell` does not report the predicate's outcome in its exit code, and the
+// obvious alternative — an else-branch of `run-shell "exit N"`, whose status does propagate —
+// was rejected after testing against tmux 3.4: a run-shell that exits non-zero poisons the
+// server, so the NEXT unrelated tmux client (including an ordinary send-keys) fails with "no
+// current client". Printing a marker keeps both branches exit-0 and leaves no residue.
+export const GUARD_SENT_MARKER = "claude-peers-guard:sent";
+export const GUARD_DEFERRED_MARKER = "claude-peers-guard:deferred";
+
+/**
+ * Build the argv for the ATOMIC guarded inject (issue #44): one tmux process that re-evaluates
+ * the pane's foreground command and, only if it still is not a shell, types the text and presses
+ * Enter.
+ *
+ * The pre-send probe and the send used to be two tmux spawns, so a session that exited in the
+ * gap between them received the message text as a shell command line. Measured on this host, that
+ * gap is two client round-trips through the tmux server: ~5ms for the probe plus ~4ms before the
+ * send lands. Here the readiness predicate (buildPaneReadyFormat, derived from the one
+ * SHELL_COMMANDS set) is evaluated by `if-shell -F` inside the same tmux process that runs the
+ * send-keys, against the same `-t` pane.
+ *
+ * Why the `-F` form specifically closes the gap, since "if-shell evaluates a condition and then
+ * runs a command" sounds like it must have a seam between the two. It does — but only on the
+ * shell-command form. In cmd-if-shell.c the `-F` branch is fully synchronous: it expands the
+ * format, calls args_make_commands_now(), cmdq_insert_after(item, new_item), and returns
+ * CMD_RETURN_NORMAL. No job_run(), no cmd_if_shell_callback(), no CMD_RETURN_WAIT — that async
+ * path (a real yield to the event loop, where anything can happen) is the non-`-F` form's. And
+ * cmdq_next() in cmd-queue.c is a `for (;;)` loop that fires successive items back to back,
+ * returning to the event loop only when the queue empties or an item is CMDQ_WAITING, which is
+ * set only by CMD_RETURN_WAIT; send-keys never returns it. So the inserted send-keys runs in the
+ * same uninterrupted callback as the predicate that selected it. Verified against tmux 2.9, 3.4
+ * and 3.5a sources, and empirically in a tmux 3.4 server log (-vv, microsecond timestamps):
+ * cmdq_insert_after at ...060730, the send-keys firing at ...060740 — 10us later, with nothing
+ * from any other client or queue interleaved.
+ *
+ * What that does NOT mean is that the pane can never change under us, and the docstring should
+ * not claim it. pane_current_command is not tmux state that an event updates: format.c's
+ * format_cb_current_command calls osdep_get_name(wp->fd, wp->tty), a live read of the tty's
+ * foreground process group. In the case this guard exists for, Claude exiting inside a pane whose
+ * process is the shell, tmux is never notified at all — there is no SIGCHLD, nothing to yield to.
+ * So the residual window is not a scheduling seam but the wall-clock between that OS read and the
+ * write into the pty, straight-line C inside one server callback. tmux offers no stronger
+ * primitive (there is no compare-and-swap send), so this is the floor, not a compromise: the race
+ * goes from two client round-trips wide to microseconds, and the pre-send probe plus the #42
+ * deferral counting still handle the pane that is durably a shell.
+ *
+ * The send itself is buildTmuxArgs' argv, rendered through renderTmuxCommandString, so the two
+ * paths cannot drift in how a message is typed; only the socket moves out (it belongs to the
+ * outer tmux process, not to the nested command).
+ *
+ * Each branch ends in a `display-message -p` marker, which is how the caller learns what
+ * happened — see classifyGuardedSend and the GUARD_*_MARKER note above.
+ */
+export function buildGuardedTmuxArgs(
+  pane: string, socket: string | null, text: string, shellCommands: Iterable<string> = SHELL_COMMANDS,
+): string[] {
+  const sendThenReport = `${renderTmuxCommandString(buildTmuxArgs(pane, null, text).slice(1))} ; ${
+    renderTmuxCommandString(["display-message", "-p", GUARD_SENT_MARKER])}`;
+  const args = ["tmux"];
+  if (socket) args.push("-S", socket);
+  args.push(
+    "if-shell", "-F", "-t", pane, buildPaneReadyFormat(shellCommands),
+    sendThenReport,
+    renderTmuxCommandString(["display-message", "-p", GUARD_DEFERRED_MARKER]),
+  );
+  return args;
+}
+
+export type GuardedSendOutcome = "sent" | "deferred" | "failed";
+
+/**
+ * Read the outcome of one buildGuardedTmuxArgs invocation from its exit code and stdout.
+ *
+ * "deferred" requires the positive signal — the else-branch marker — because that branch firing
+ * means the predicate identified a shell, which is an identification, not a fault, and must
+ * requeue the row rather than paste into the shell.
+ *
+ * Everything else with a clean exit reads as "sent", which is the fail-open half: a tmux that
+ * printed no marker at all (too old for the format operators, a stubbed tmux, output swallowed)
+ * still ran the send-keys, and refusing to confirm it would strand mail on a working pane. Only
+ * a non-zero exit — a genuine tmux failure such as a pane that no longer exists — is "failed",
+ * exactly as a non-zero exit meant before the guard existed.
+ */
+export function classifyGuardedSend(exitCode: number, stdout: string): GuardedSendOutcome {
+  if (exitCode !== 0) return "failed";
+  if (stdout.includes(GUARD_DEFERRED_MARKER)) return "deferred";
+  return "sent";
 }
 
 /** Build the argv that asks tmux for a pane's foreground command name. */
@@ -752,52 +873,35 @@ export const SESSION_NAME_TIMEOUT_MS = 2_000;
 
 /**
  * Build a real TmuxQuery: spawn tmux, capture stdout, report the exit code, and kill the process
- * if it outlives timeoutMs so a hung tmux cannot stall the caller. A spawn fault rejects to the
- * caller's try/catch rather than being swallowed here. Both callers that need a stdout-capturing
- * tmux query -- the broker's pre-send readiness probe and the server's session-name lookup --
- * share this one implementation, differing only in the timeout they pass.
+ * if it outlives timeoutMs so a hung tmux cannot stall the caller. Every tmux process in the
+ * delivery path comes from here -- the readiness probe, the guarded inject, and the server's
+ * session-name lookup -- differing only in the timeout they pass.
+ *
+ * It reports `timedOut` when its own timer did the killing, because the kill is otherwise
+ * invisible downstream: `proc.exited` resolves to 128+signal (143) for a process this timer
+ * killed, which is just another non-zero exit to anyone reading the code alone. A tmux daemon
+ * stalling for a few heartbeats would then look exactly like a pane refusing keystrokes and,
+ * under #70, cost the row its push channel. Only the spawner can tell the two apart, so it is
+ * recorded here at the one place that knows.
+ *
+ * A spawn fault (process creation itself failing) still rejects to the caller's try/catch rather
+ * than being reported through this flag; deliverViaTmux routes both to the same fault handling.
  */
 export function makeSpawnTmuxQuery(timeoutMs: number): TmuxQuery {
   return async (args) => {
     const proc = Bun.spawn(args, { stdout: "pipe", stderr: "ignore" });
-    const timer = setTimeout(() => { try { proc.kill(); } catch {} }, timeoutMs);
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; try { proc.kill(); } catch {} }, timeoutMs);
     try {
       const stdout = await new Response(proc.stdout).text();
       const exitCode = await proc.exited;
-      return { exitCode, stdout };
+      return { exitCode, stdout, timedOut };
     } finally {
       clearTimeout(timer);
     }
   };
 }
 
-/**
- * Build the real TmuxSpawn for the inject: spawn tmux, report the exit code, and kill the process
- * if it outlives timeoutMs so a wedged tmux cannot stall delivery. The twin of makeSpawnTmuxQuery,
- * minus the stdout capture — a send-keys has no output to read.
- *
- * It reports `timedOut` because the kill is otherwise invisible downstream: `proc.exited` resolves
- * to 128+signal (143) for a process this timer killed, which is just another non-zero exit to
- * anyone reading the code alone. A tmux daemon stalling for a few heartbeats would then look
- * exactly like a pane refusing keystrokes and, under #70, cost the row its push channel. Only the
- * spawner can tell the two apart, so it is recorded here at the one place that knows.
- *
- * A spawn fault (process creation itself failing) still rejects to the caller's try/catch rather
- * than being reported through this flag; deliverViaTmux routes both to the same fault handling.
- */
-export function makeSpawnTmuxSend(timeoutMs: number): TmuxSpawn {
-  return async (args) => {
-    const proc = Bun.spawn(args, { stdout: "ignore", stderr: "ignore" });
-    let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; try { proc.kill(); } catch {} }, timeoutMs);
-    try {
-      const exitCode = await proc.exited;
-      return { exitCode, timedOut };
-    } finally {
-      clearTimeout(timer);
-    }
-  };
-}
 
 /**
  * Probe a pane's readiness for injection by reading its foreground command via tmux.
@@ -819,51 +923,79 @@ export async function probePaneReadiness(
 }
 
 /**
- * Inject text into a pane via one tmux spawn. Success iff tmux exits 0. When `query` is
- * supplied, the pane's readiness is probed first: if the pane is positively a shell prompt
- * rather than a live Claude session, the injection is skipped and false is returned so the
- * message stays queued for a later attempt instead of landing as a stray shell command.
- * Omitting `query` preserves the original inject-unconditionally behavior.
+ * Inject text into a pane, in two stages that answer two different questions.
  *
- * `onDefer` fires only when a clean probe positively identifies a shell and the injection is
- * skipped — not on a probe fault (which fails open and injects) nor on a send failure. The
- * broker uses it to count consecutive not-ready deferrals per recipient and escalate a pane
- * that is stuck a shell (issue #42); callers that do not track this omit it.
+ * First the pre-send probe (probePaneReadiness): a separate tmux process reads the pane's
+ * foreground command, and a clean probe that positively identifies a shell defers the whole
+ * attempt — no send is issued, false is returned, and the row stays queued. Then the guarded
+ * send (buildGuardedTmuxArgs): one tmux process that re-evaluates the same readiness predicate
+ * and types the text in the same invocation, which narrows the window in which a session that
+ * exits right after a clean probe can still be pasted into — from two client round-trips (~10ms
+ * measured) down to the straight-line C between tmux's own read of the pane and the write into
+ * the pty (issue #44; buildGuardedTmuxArgs documents why the `-F` form has no yield point and
+ * what residual remains). The guard is a backstop for that window, not a replacement for the
+ * probe.
  *
- * `onFault` fires for the two ways an attempt can fail WITHOUT the pane refusing anything: the
- * spawn rejected (process creation failed, the tmux binary momentarily unavailable), or the send
- * ran past its deadline and the spawner killed it (`timedOut`, e.g. a stalled tmux server —
- * whose 128+signal exit code is otherwise indistinguishable from a genuine failure). All of these
- * return false and leave the message queued, but they are evidence about the HOST, not the pane,
- * and a caller that penalizes a row for its failures must tell them apart: counting them toward
- * the #70 demotion streak would let a transient outage lasting `cap` heartbeats strip an interrupt
- * of its push channel. The two callbacks are mutually exclusive, and neither fires on the ordinary
- * ran-and-exited-non-zero miss, which is the only outcome the streak counts.
+ * One seam (`run`) spawns every tmux process here, because both stages need stdout: the probe
+ * reads the pane command, the send reads the branch marker classifyGuardedSend reads back.
+ *
+ * Three outcomes leave the message queued, and the callbacks exist so a caller can tell them
+ * apart — because only ONE of them is evidence that a push ran and missed, the single thing the
+ * #70 demotion streak counts (countsAsPushFailure):
+ *
+ *  - DEFER (`onDefer`): a shell was positively identified, either by the pre-send probe or by
+ *    the guard's else branch when the pane changed under a probe that had cleared it. Both are
+ *    the same identification, one just later, so both fire the callback; the broker counts them
+ *    toward the stuck-pane escalation (issue #42) and not toward the demotion streak. Nothing
+ *    was typed, and the pane — not the send — is what failed.
+ *  - FAULT (`onFault`): the attempt never got a verdict out of tmux. Either the send spawn
+ *    REJECTED (process creation failed, the tmux binary momentarily unavailable), or the send
+ *    outlived its deadline and the spawner killed it (`timedOut` — a stalled tmux server, whose
+ *    128+signal exit code is otherwise indistinguishable from a genuine failure). Both say
+ *    something about the HOST, not the pane, so they neither advance nor clear the demotion
+ *    streak; counting them would let a transient outage lasting `cap` heartbeats strip an
+ *    interrupt of its push channel. A probe that faults is not this: probePaneReadiness swallows
+ *    its own errors and fails open, so a broken probe still injects.
+ *  - MISS: tmux ran the send and exited non-zero on its own. Neither callback fires. This is the
+ *    only outcome the demotion streak counts, and it is unchanged from before the guard existed.
+ *
+ * The callbacks are mutually exclusive, and a clean exit that is not a defer returns true —
+ * including the marker-less answer a stubbed or pre-2.9 tmux gives, which classifyGuardedSend
+ * fails open on rather than strand mail on a working pane.
  */
 export async function deliverViaTmux(
-  pane: string, socket: string | null, text: string, spawn: TmuxSpawn, query?: TmuxQuery,
+  pane: string, socket: string | null, text: string, run: TmuxQuery,
   onDefer?: (reason: string) => void,
   onFault?: (error: unknown) => void,
 ): Promise<boolean> {
   try {
-    if (query) {
-      const readiness = await probePaneReadiness(pane, socket, query);
-      if (!readiness.ready) {
-        console.error(`[claude-peers broker] deferring tmux delivery to pane ${pane}: ${readiness.reason}`);
-        onDefer?.(readiness.reason);
-        return false;
-      }
+    const readiness = await probePaneReadiness(pane, socket, run);
+    if (!readiness.ready) {
+      console.error(`[claude-peers broker] deferring tmux delivery to pane ${pane}: ${readiness.reason}`);
+      onDefer?.(readiness.reason);
+      return false;
     }
-    const { exitCode, timedOut } = await spawn(buildTmuxArgs(pane, socket, text));
-    if (exitCode === 0) return true;
-    if (timedOut) {
+    const { exitCode, stdout, timedOut } = await run(buildGuardedTmuxArgs(pane, socket, text));
+    const outcome = classifyGuardedSend(exitCode, stdout);
+    if (outcome === "deferred") {
+      // The pane stopped running Claude between the probe and the send — the exact race the
+      // guard exists for. Nothing was typed, so the row simply stays queued.
+      const reason = "pane foreground became a shell between probe and send";
+      console.error(`[claude-peers broker] atomic guard suppressed tmux delivery to pane ${pane}: ${reason}`);
+      onDefer?.(reason);
+      return false;
+    }
+    if (outcome === "failed" && timedOut) {
       // The send outlived its deadline and was killed, so tmux never reported a verdict: the
-      // non-zero code is the kill, not the pane. Same handling as a spawn fault.
+      // non-zero code is the kill, not the pane. Same handling as a spawn fault. Checked after
+      // the branch markers on purpose — a kill mid-send cannot have printed one, so a marker in
+      // hand is the more specific answer.
       const e = new Error(`tmux send timed out and was killed (exit ${exitCode})`);
       console.error(`[claude-peers broker] tmux delivery timed out for pane ${pane}: ${e.message}`);
       onFault?.(e);
+      return false;
     }
-    return false;
+    return outcome === "sent";
   } catch (e) {
     // A non-zero exit is handled above; reaching here means the spawn itself
     // rejected (a bug or environment fault, not a normal failed delivery). The
