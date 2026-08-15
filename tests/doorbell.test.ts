@@ -112,13 +112,16 @@ beforeAll(async () => {
   // 'tmux'), records argv, exits 0 — enough for a tmux recipient to take the push path.
   // A send-keys to SLOW_PANE sleeps, holding the delivery lease open long enough for a second
   // send to land mid-push. Only the lease-race tests register that pane; every other pane still
-  // returns instantly, so the rest of the suite keeps its old timing.
+  // returns instantly, so the rest of the suite keeps its old timing. The inject arrives as
+  // `if-shell -F -t <pane> <predicate> '<send-keys ...>' ...` (#44), so send-keys is matched as
+  // a substring of the nested command string rather than as an argument of its own; the pane
+  // still arrives as if-shell's own -t argument.
   const stub = join(work, "tmux");
   writeFileSync(stub, `#!/usr/bin/env bash
 if [ "$1" = "-V" ]; then echo "tmux 3.4"; exit 0; fi
 _sk=0; _slow=0; _fail=0
 for _a in "$@"; do
-  [ "$_a" = "send-keys" ] && _sk=1
+  case "$_a" in *send-keys*) _sk=1;; esac
   [ "$_a" = "${SLOW_PANE}" ] && _slow=1
   [ "$_a" = "${FAIL_PANE}" ] && _fail=1
 done

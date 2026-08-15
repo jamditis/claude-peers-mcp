@@ -5,11 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildPaneCommandArgs, buildPaneReadyFormat, buildSessionNameArgs, buildTmuxArgs, claimForDelivery, classifyPaneReadiness, SHELL_COMMANDS,
+  buildGuardedTmuxArgs, classifyGuardedSend, GUARD_DEFERRED_MARKER, GUARD_SENT_MARKER,
+  quoteTmuxArg, renderTmuxCommandString,
   bumpChannelPushAttempts, getChannelPushAttempts, resolveChannelPushCap,
   confirmDelivered, DEFAULT_CHANNEL_PUSH_CAP,
   DEFAULT_DEFERRAL_ESCALATION_CAP, DEFAULT_PUSH_FAILURE_DEMOTION_CAP,
   bumpPushFailures, countsAsPushFailure, decidePushDemotion, demoteQueuedPushable, getPushFailures, resetPushFailures,
-  makeSpawnTmuxSend, readPushAfter, reportedPollOnly,
+  readPushAfter, reportedPollOnly,
   decideChannelPush, decideDeferralEscalation, deliverViaTmux,
   ensureMessagesTable, findLeaklessDelivering, formatPeerMessage, hasDuePush,
   isFederationRoute, isLoopback, isMessageDelivered, isPidDead,
@@ -17,7 +19,7 @@ import {
   probePaneReadiness, promoteQueuedForFlush, pruneMessages, pushAfterFor, reclaimIfExpired,
   reclaimLeaklessDelivering, releasableQueuedPrefix, releaseToQueued,
   makeSpawnTmuxQuery, resetDeliveringOnStart, resolveSessionName, resolveTmuxTarget,
-  SESSION_NAME_ENV, type TmuxQuery, type TmuxSpawn,
+  SESSION_NAME_ENV, type TmuxQuery,
 } from "../delivery.ts";
 import type { DeliveryState } from "../shared/types.ts";
 
@@ -732,121 +734,246 @@ describe("buildTmuxArgs", () => {
   });
 });
 
+// One injected seam stands in for tmux across both stages of a send: the display-message
+// readiness probe answers with `foreground`, and the guarded if-shell inject answers with the
+// branch tmux would have taken. `branch: "silent"` is the marker-less tmux (too old for the
+// format operators, or a stub) the send path must still fail open on; `timedOut` is the spawner
+// reporting that its own kill-timer, not tmux, ended the send (#70).
+function fakeTmux(opts: {
+  foreground?: string;
+  probeExit?: number;
+  branch?: "sent" | "deferred" | "silent";
+  sendExit?: number;
+  timedOut?: boolean;
+}) {
+  const calls: string[][] = [];
+  const run: TmuxQuery = async (args) => {
+    calls.push(args);
+    if (args.includes("if-shell")) {
+      const branch = opts.branch ?? "sent";
+      const stdout = branch === "silent" ? "" : `${branch === "sent" ? GUARD_SENT_MARKER : GUARD_DEFERRED_MARKER}\n`;
+      return { exitCode: opts.sendExit ?? 0, stdout, timedOut: opts.timedOut ?? false };
+    }
+    return { exitCode: opts.probeExit ?? 0, stdout: opts.foreground ?? "node\n" };
+  };
+  return { run, calls, injected: () => calls.some((a) => a.includes("if-shell")) };
+}
+
 describe("deliverViaTmux", () => {
-  it("returns true on exit 0", async () => {
-    const spawn: TmuxSpawn = async () => ({ exitCode: 0 });
-    expect(await deliverViaTmux("%1", null, "hi", spawn)).toBe(true);
+  it("returns true when the guarded inject reports it sent", async () => {
+    const tmux = fakeTmux({ foreground: "node\n" });
+    expect(await deliverViaTmux("%1", null, "hi", tmux.run)).toBe(true);
+    expect(tmux.injected()).toBe(true);
   });
-  it("returns false on non-zero exit", async () => {
-    const spawn: TmuxSpawn = async () => ({ exitCode: 1 });
-    expect(await deliverViaTmux("%1", null, "hi", spawn)).toBe(false);
+  it("returns false on a non-zero exit from the inject", async () => {
+    const tmux = fakeTmux({ foreground: "node\n", sendExit: 1 });
+    expect(await deliverViaTmux("%1", null, "hi", tmux.run)).toBe(false);
   });
   it("returns false when the spawn throws (timeout/abort)", async () => {
-    const spawn: TmuxSpawn = async () => { throw new Error("timed out"); };
-    expect(await deliverViaTmux("%1", null, "hi", spawn)).toBe(false);
+    const run: TmuxQuery = async () => { throw new Error("timed out"); };
+    expect(await deliverViaTmux("%1", null, "hi", run)).toBe(false);
   });
   it("injects when the readiness probe reports a Claude pane (node)", async () => {
-    let sent = false;
-    const spawn: TmuxSpawn = async () => { sent = true; return { exitCode: 0 }; };
-    const query: TmuxQuery = async () => ({ exitCode: 0, stdout: "node\n" });
-    expect(await deliverViaTmux("%1", null, "hi", spawn, query)).toBe(true);
-    expect(sent).toBe(true);
+    const tmux = fakeTmux({ foreground: "node\n" });
+    expect(await deliverViaTmux("%1", null, "hi", tmux.run)).toBe(true);
+    expect(tmux.injected()).toBe(true);
   });
   it("defers (false) and never injects when the pane is a bare shell", async () => {
-    let sent = false;
-    const spawn: TmuxSpawn = async () => { sent = true; return { exitCode: 0 }; };
-    const query: TmuxQuery = async () => ({ exitCode: 0, stdout: "bash\n" });
-    expect(await deliverViaTmux("%1", null, "hi", spawn, query)).toBe(false);
-    expect(sent).toBe(false); // the wrong text must not land in the shell
+    const tmux = fakeTmux({ foreground: "bash\n" });
+    expect(await deliverViaTmux("%1", null, "hi", tmux.run)).toBe(false);
+    expect(tmux.injected()).toBe(false); // the wrong text must not land in the shell
   });
   it("fails open and injects when the probe errors", async () => {
-    let sent = false;
-    const spawn: TmuxSpawn = async () => { sent = true; return { exitCode: 0 }; };
-    const query: TmuxQuery = async () => { throw new Error("probe blew up"); };
-    expect(await deliverViaTmux("%1", null, "hi", spawn, query)).toBe(true);
-    expect(sent).toBe(true);
+    const calls: string[][] = [];
+    const run: TmuxQuery = async (args) => {
+      calls.push(args);
+      if (args.includes("if-shell")) return { exitCode: 0, stdout: `${GUARD_SENT_MARKER}\n` };
+      throw new Error("probe blew up");
+    };
+    expect(await deliverViaTmux("%1", null, "hi", run)).toBe(true);
+    expect(calls.some((a) => a.includes("if-shell"))).toBe(true);
+  });
+  it("fails open when tmux prints no branch marker at all (old or stubbed tmux)", async () => {
+    const tmux = fakeTmux({ foreground: "node\n", branch: "silent" });
+    expect(await deliverViaTmux("%1", null, "hi", tmux.run)).toBe(true);
+  });
+  it("returns false and requeues when the atomic guard suppressed the send (#44)", async () => {
+    // The probe cleared the pane, then Claude exited before the send: tmux takes the else
+    // branch, nothing is typed, and the caller must learn the send did not happen.
+    const tmux = fakeTmux({ foreground: "node\n", branch: "deferred" });
+    expect(await deliverViaTmux("%1", null, "hi", tmux.run)).toBe(false);
+    expect(tmux.injected()).toBe(true); // the inject was attempted; tmux declined it
   });
   it("calls onDefer with the readiness reason when it defers on a shell pane (#42)", async () => {
-    const spawn: TmuxSpawn = async () => ({ exitCode: 0 });
-    const query: TmuxQuery = async () => ({ exitCode: 0, stdout: "bash\n" });
+    const tmux = fakeTmux({ foreground: "bash\n" });
     const reasons: string[] = [];
-    expect(await deliverViaTmux("%1", null, "hi", spawn, query, (r) => reasons.push(r))).toBe(false);
+    expect(await deliverViaTmux("%1", null, "hi", tmux.run, (r) => reasons.push(r))).toBe(false);
     expect(reasons.length).toBe(1);
     expect(reasons[0]).toContain("shell");
   });
-  it("does not call onDefer when the pane is ready, the probe faults, or there is no probe", async () => {
-    const spawn: TmuxSpawn = async () => ({ exitCode: 0 });
+  it("calls onDefer once when the guard suppresses a send the probe had cleared (#44)", async () => {
+    // The else branch firing is a positive shell identification, not a fault, so it counts
+    // toward the stuck-pane streak exactly like a probe deferral does.
+    const tmux = fakeTmux({ foreground: "node\n", branch: "deferred" });
+    const reasons: string[] = [];
+    expect(await deliverViaTmux("%1", null, "hi", tmux.run, (r) => reasons.push(r))).toBe(false);
+    expect(reasons.length).toBe(1);
+    expect(reasons[0]).toContain("shell");
+  });
+  it("does not call onDefer when the pane is ready, the probe faults, or the send fails", async () => {
     let calls = 0;
     const onDefer = () => { calls++; };
     // ready pane injects
-    await deliverViaTmux("%1", null, "hi", spawn, async () => ({ exitCode: 0, stdout: "node\n" }), onDefer);
+    await deliverViaTmux("%1", null, "hi", fakeTmux({ foreground: "node\n" }).run, onDefer);
     // probe fault fails open and injects
-    await deliverViaTmux("%1", null, "hi", spawn, async () => { throw new Error("x"); }, onDefer);
-    // no probe at all
-    await deliverViaTmux("%1", null, "hi", spawn, undefined, onDefer);
+    await deliverViaTmux("%1", null, "hi", async (args) => {
+      if (args.includes("if-shell")) return { exitCode: 0, stdout: `${GUARD_SENT_MARKER}\n` };
+      throw new Error("x");
+    }, onDefer);
+    // a genuine tmux failure is a failed send, not a readiness deferral
+    await deliverViaTmux("%1", null, "hi", fakeTmux({ foreground: "node\n", sendExit: 1 }).run, onDefer);
     expect(calls).toBe(0);
   });
   it("calls onFault when the send outlived its deadline and was killed (#70)", async () => {
-    // The killed process reports a perfectly ordinary non-zero exit (128+signal), so without the
-    // spawner's own flag this is indistinguishable from the pane refusing the keystrokes.
-    const spawn: TmuxSpawn = async () => ({ exitCode: 143, timedOut: true });
+    // The killed process reports a perfectly ordinary non-zero exit (128+signal) and, having been
+    // killed mid-send, printed no branch marker — so without the spawner's own flag this is
+    // indistinguishable from the pane refusing the keystrokes.
+    const tmux = fakeTmux({ foreground: "node\n", branch: "silent", sendExit: 143, timedOut: true });
     const faults: unknown[] = [];
-    expect(await deliverViaTmux("%1", null, "hi", spawn, undefined, undefined, (e) => faults.push(e))).toBe(false);
+    expect(await deliverViaTmux("%1", null, "hi", tmux.run, undefined, (e) => faults.push(e))).toBe(false);
     expect(faults.length).toBe(1);
     expect(String(faults[0])).toContain("timed out");
   });
-  it("calls onFault with the error when the spawn itself rejects (#70)", async () => {
-    // The spawn never ran, so nothing was learned about the pane. A caller that penalizes a row
+  it("calls onFault with the error when the send spawn itself rejects (#70)", async () => {
+    // The send never ran, so nothing was learned about the pane. A caller that penalizes a row
     // for its failures needs this told apart from an exit-1 miss, which looks identical in the
     // return value.
     const boom = new Error("spawn EAGAIN");
-    const spawn: TmuxSpawn = async () => { throw boom; };
+    const run: TmuxQuery = async (args) => {
+      if (args.includes("if-shell")) throw boom;
+      return { exitCode: 0, stdout: "node\n" };
+    };
     const faults: unknown[] = [];
-    expect(await deliverViaTmux("%1", null, "hi", spawn, undefined, undefined, (e) => faults.push(e))).toBe(false);
+    expect(await deliverViaTmux("%1", null, "hi", run, undefined, (e) => faults.push(e))).toBe(false);
     expect(faults).toEqual([boom]);
   });
-  it("does not call onFault on a non-zero exit, a shell defer, or a successful send (#70)", async () => {
+  it("does not call onFault on a non-zero exit, a shell defer, a guard suppression, or a send (#70)", async () => {
     let faults = 0;
     const onFault = () => { faults++; };
-    const readyProbe: TmuxQuery = async () => ({ exitCode: 0, stdout: "node\n" });
     // ran and missed: the one outcome the #70 streak counts, and it is not a fault
-    await deliverViaTmux("%1", null, "hi", async () => ({ exitCode: 1 }), readyProbe, undefined, onFault);
+    await deliverViaTmux("%1", null, "hi", fakeTmux({ foreground: "node\n", sendExit: 1 }).run, undefined, onFault);
     // deferred on a shell pane: onDefer's case, not this one
-    await deliverViaTmux("%1", null, "hi", async () => ({ exitCode: 0 }),
-      async () => ({ exitCode: 0, stdout: "bash\n" }), undefined, onFault);
+    await deliverViaTmux("%1", null, "hi", fakeTmux({ foreground: "bash\n" }).run, undefined, onFault);
+    // the guard declined the send: also onDefer's case — tmux answered, it did not fail
+    await deliverViaTmux("%1", null, "hi", fakeTmux({ foreground: "node\n", branch: "deferred" }).run, undefined, onFault);
     // delivered
-    await deliverViaTmux("%1", null, "hi", async () => ({ exitCode: 0 }), readyProbe, undefined, onFault);
+    await deliverViaTmux("%1", null, "hi", fakeTmux({ foreground: "node\n" }).run, undefined, onFault);
     expect(faults).toBe(0);
   });
   it("reports a defer and a fault as mutually exclusive outcomes (#70)", async () => {
-    // A deferred attempt returns before the spawn, so it can never also fault; a faulting spawn
+    // A deferred attempt returns before the send, so it can never also fault; a faulting send
     // was only reached because the pane probed ready, so it can never also defer.
+    const sendRejectsAfter = (foreground: string): TmuxQuery => async (args) => {
+      if (args.includes("if-shell")) throw new Error("nope");
+      return { exitCode: 0, stdout: foreground };
+    };
     const seen: string[] = [];
-    await deliverViaTmux("%1", null, "hi", async () => { throw new Error("nope"); },
-      async () => ({ exitCode: 0, stdout: "bash\n" }), () => seen.push("defer"), () => seen.push("fault"));
-    expect(seen).toEqual(["defer"]); // the spawn was never reached
-    await deliverViaTmux("%1", null, "hi", async () => { throw new Error("nope"); },
-      async () => ({ exitCode: 0, stdout: "node\n" }), () => seen.push("defer"), () => seen.push("fault"));
+    await deliverViaTmux("%1", null, "hi", sendRejectsAfter("bash\n"),
+      () => seen.push("defer"), () => seen.push("fault"));
+    expect(seen).toEqual(["defer"]); // the send was never reached
+    await deliverViaTmux("%1", null, "hi", sendRejectsAfter("node\n"),
+      () => seen.push("defer"), () => seen.push("fault"));
     expect(seen).toEqual(["defer", "fault"]);
+  });
+  it("probes first, then injects — never the other way round", async () => {
+    const tmux = fakeTmux({ foreground: "node\n" });
+    await deliverViaTmux("%1", "/tmp/sock", "hi", tmux.run);
+    expect(tmux.calls.length).toBe(2);
+    expect(tmux.calls[0]).toEqual(buildPaneCommandArgs("%1", "/tmp/sock"));
+    expect(tmux.calls[1]).toEqual(buildGuardedTmuxArgs("%1", "/tmp/sock", "hi"));
   });
 });
 
-describe("makeSpawnTmuxSend (#70)", () => {
+describe("quoteTmuxArg / renderTmuxCommandString", () => {
+  it("wraps in single quotes and closes/reopens around embedded quotes", () => {
+    expect(quoteTmuxArg("plain")).toBe("'plain'");
+    expect(quoteTmuxArg("it's")).toBe("'it'\\''s'");
+  });
+  it("leaves the bare ; separator unquoted and quotes everything else", () => {
+    expect(renderTmuxCommandString(["send-keys", "-t", "%2", ";", "x y"]))
+      .toBe("'send-keys' '-t' '%2' ; 'x y'");
+  });
+});
+
+describe("buildGuardedTmuxArgs", () => {
+  it("nests the send-keys pair and both branch markers in one if-shell invocation", () => {
+    expect(buildGuardedTmuxArgs("%2", "/tmp/sock", "TXT", ["bash"])).toEqual([
+      "tmux", "-S", "/tmp/sock",
+      "if-shell", "-F", "-t", "%2", "#{?#{==:#{pane_current_command},bash},0,1}",
+      "'send-keys' '-t' '%2' '-l' 'TXT' ; 'send-keys' '-t' '%2' 'Enter' ; 'display-message' '-p' 'claude-peers-guard:sent'",
+      "'display-message' '-p' 'claude-peers-guard:deferred'",
+    ]);
+  });
+  it("omits -S when there is no socket, and keeps the socket out of the nested command", () => {
+    const args = buildGuardedTmuxArgs("%2", null, "TXT", ["bash"]);
+    expect(args.slice(0, 5)).toEqual(["tmux", "if-shell", "-F", "-t", "%2"]);
+    expect(args.some((a) => a.includes("-S"))).toBe(false);
+  });
+  it("uses the same predicate as buildPaneReadyFormat, so the denylist stays one source of truth", () => {
+    expect(buildGuardedTmuxArgs("%2", null, "TXT")[5]).toBe(buildPaneReadyFormat());
+  });
+  it("carries buildTmuxArgs' send shape, so guarded and plain sends cannot drift", () => {
+    // Every element of the plain send (minus the leading tmux) appears, in order, quoted.
+    const plain = buildTmuxArgs("%2", null, "TXT").slice(1);
+    expect(buildGuardedTmuxArgs("%2", null, "TXT")[6]).toStartWith(renderTmuxCommandString(plain));
+  });
+  it("quotes hostile message text so nothing in it can escape the nested command", () => {
+    // Quotes, a command separator, format-like sequences, a comment marker, and a newline: all
+    // of it must survive as ONE tmux argument, byte-identical to the plain send's text.
+    const text = `${PASTE_START}[peer a #1] "dq" 'sq'; kill-server ; #{pane_id} #S \\b\nline2${PASTE_END}`;
+    const nested = buildGuardedTmuxArgs("%2", null, text)[6] as string;
+    expect(nested).toBe(
+      `'send-keys' '-t' '%2' '-l' ${quoteTmuxArg(text)} ; 'send-keys' '-t' '%2' 'Enter'`
+      + ` ; 'display-message' '-p' '${GUARD_SENT_MARKER}'`,
+    );
+    // The separators tmux acts on are the two bare ones above; the `;` and `#{...}` inside the
+    // message live within the quoted argument, where tmux neither splits nor expands them.
+    expect(quoteTmuxArg(text)).toContain("; kill-server ;");
+  });
+});
+
+describe("classifyGuardedSend", () => {
+  it("reads the else-branch marker as a positive deferral", () => {
+    expect(classifyGuardedSend(0, `${GUARD_DEFERRED_MARKER}\n`)).toBe("deferred");
+  });
+  it("reads the then-branch marker as sent", () => {
+    expect(classifyGuardedSend(0, `${GUARD_SENT_MARKER}\n`)).toBe("sent");
+  });
+  it("fails open: a clean exit with no marker counts as sent", () => {
+    expect(classifyGuardedSend(0, "")).toBe("sent");
+  });
+  it("treats any non-zero exit as a failed send, marker or not", () => {
+    expect(classifyGuardedSend(1, "")).toBe("failed");
+    expect(classifyGuardedSend(1, `${GUARD_DEFERRED_MARKER}\n`)).toBe("failed");
+  });
+});
+
+describe("makeSpawnTmuxQuery timeout reporting (#70)", () => {
   it("flags a process it had to kill, and reports the killed exit as non-zero", async () => {
     // Real processes, because the whole finding is about what Bun actually resolves for a killed
     // child: 128+signal, a plain number no reader downstream could tell from a tmux failure.
-    const spawn = makeSpawnTmuxSend(100);
+    const spawn = makeSpawnTmuxQuery(100);
     const res = await spawn(["sleep", "5"]);
     expect(res.timedOut).toBe(true);
     expect(res.exitCode).not.toBe(0); // which is exactly why the flag has to be carried
   });
 
   it("does not flag a process that exited on its own, zero or not", async () => {
-    const spawn = makeSpawnTmuxSend(5_000);
+    const spawn = makeSpawnTmuxQuery(5_000);
     const missed = await spawn(["sh", "-c", "exit 1"]);
-    expect(missed).toEqual({ exitCode: 1, timedOut: false }); // ran and missed: real pane evidence
-    const landed = await spawn(["sh", "-c", "exit 0"]);
-    expect(landed).toEqual({ exitCode: 0, timedOut: false });
+    expect(missed).toEqual({ exitCode: 1, stdout: "", timedOut: false }); // ran and missed: real pane evidence
+    const landed = await spawn(["sh", "-c", "echo hi"]);
+    expect(landed).toEqual({ exitCode: 0, stdout: "hi\n", timedOut: false });
   });
 });
 
@@ -1410,16 +1537,28 @@ describe("push failure streak persistence and demotion (#70)", () => {
   // does the row's streak advance and the cap get consulted. Driving the real functions (rather
   // than asserting on a hand-written outcome record) is the point — the fault/miss split has to
   // hold end to end, since both look identical in the boolean deliverViaTmux returns.
-  async function attempt(db: Database, id: number, spawn: TmuxSpawn, cap: number): Promise<void> {
+  async function attempt(db: Database, id: number, run: TmuxQuery, cap: number): Promise<void> {
     let deferred = false;
     let faulted = false;
-    const readyProbe: TmuxQuery = async () => ({ exitCode: 0, stdout: "node\n" });
-    const ok = await deliverViaTmux("%1", null, "hi", spawn, readyProbe,
+    const ok = await deliverViaTmux("%1", null, "hi", run,
       () => { deferred = true; }, () => { faulted = true; });
     if (ok) { resetPushFailures(db, id); return; }
     if (!countsAsPushFailure({ ok, deferred, faulted })) return;
     if (decidePushDemotion(bumpPushFailures(db, id), cap).demote) demoteQueuedPushable(db, "b");
   }
+
+  // The three seams the suite drives, all past a probe that clears the pane, so the outcome is
+  // decided by the send alone: one whose spawn rejects (fault), one that runs and exits non-zero
+  // (miss), and one the atomic guard declines at send time (defer, #44).
+  const rejectingSend: TmuxQuery = async (args) => {
+    if (args.includes("if-shell")) throw new Error("spawn EAGAIN");
+    return { exitCode: 0, stdout: "node\n" };
+  };
+  const missingSend: TmuxQuery = fakeTmux({ foreground: "node\n", sendExit: 1 }).run;
+  const guardedOffSend: TmuxQuery = fakeTmux({ foreground: "node\n", branch: "deferred" }).run;
+  const landingSend: TmuxQuery = fakeTmux({ foreground: "node\n" }).run;
+  // A send the spawner's own deadline killed: exit 128+SIGTERM, no marker, timedOut set (#70).
+  const hangingSend: TmuxQuery = fakeTmux({ foreground: "node\n", branch: "silent", sendExit: 143, timedOut: true }).run;
 
   const pushAfterOf = (db: Database, id: number) =>
     (db.query("SELECT push_after AS p FROM messages WHERE id=?").get(id) as { p: number | null }).p;
@@ -1429,9 +1568,8 @@ describe("push failure streak persistence and demotion (#70)", () => {
     // environment blip lasting `cap` heartbeats would permanently strip this row of its push
     // channel -- worst for an interrupt, whose sender is blocked on the push.
     const { db, id } = seeded("interrupt");
-    const rejecting: TmuxSpawn = async () => { throw new Error("spawn EAGAIN"); };
     for (let i = 0; i < DEFAULT_PUSH_FAILURE_DEMOTION_CAP * 2; i++) {
-      await attempt(db, id, rejecting, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+      await attempt(db, id, rejectingSend, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
     }
     expect(getPushFailures(db, id)).toBe(0);      // the streak never advanced
     expect(pushAfterOf(db, id)).not.toBeNull();   // still pushable, so the retry keeps its urgency
@@ -1440,12 +1578,26 @@ describe("push failure streak persistence and demotion (#70)", () => {
 
   it("does not demote a row whose sends keep timing out (#70)", async () => {
     // A stalled tmux server is killed by the send's own deadline, and the killed process exits
-    // 128+SIGTERM. Read as a miss, five such heartbeats would permanently demote a row whose pane
-    // never refused anything — the same transient-blip failure the fault exclusion exists for.
+    // 128+SIGTERM having printed no branch marker. Read as a miss, five such heartbeats would
+    // permanently demote a row whose pane never refused anything — the same transient-blip
+    // failure the fault exclusion exists for.
     const { db, id } = seeded("interrupt");
-    const hanging: TmuxSpawn = async () => ({ exitCode: 143, timedOut: true });
     for (let i = 0; i < DEFAULT_PUSH_FAILURE_DEMOTION_CAP * 2; i++) {
-      await attempt(db, id, hanging, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+      await attempt(db, id, hangingSend, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+    }
+    expect(getPushFailures(db, id)).toBe(0);
+    expect(pushAfterOf(db, id)).not.toBeNull();
+    db.close();
+  });
+
+  it("does not demote a row whose sends the atomic guard keeps declining (#44/#70)", async () => {
+    // The guard's else branch is tmux positively identifying a shell at send time — a deferral,
+    // not a failed push. It reaches the same "false" return as a miss, so the streak has to read
+    // the callbacks rather than the boolean; a pane that is merely shelled keeps its own #42
+    // escalation and its mail keeps its push channel for when Claude comes back.
+    const { db, id } = seeded("interrupt");
+    for (let i = 0; i < DEFAULT_PUSH_FAILURE_DEMOTION_CAP * 2; i++) {
+      await attempt(db, id, guardedOffSend, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
     }
     expect(getPushFailures(db, id)).toBe(0);
     expect(pushAfterOf(db, id)).not.toBeNull();
@@ -1456,12 +1608,11 @@ describe("push failure streak persistence and demotion (#70)", () => {
     // The companion half: the same driver, the same cap, a spawn that RUNS. This is pane
     // evidence, so the streak advances and the row leaves the push channel at the cap.
     const { db, id } = seeded();
-    const missing: TmuxSpawn = async () => ({ exitCode: 1 });
     for (let i = 0; i < DEFAULT_PUSH_FAILURE_DEMOTION_CAP - 1; i++) {
-      await attempt(db, id, missing, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+      await attempt(db, id, missingSend, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
     }
     expect(pushAfterOf(db, id)).not.toBeNull();   // below the cap: still pushable
-    await attempt(db, id, missing, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+    await attempt(db, id, missingSend, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
     expect(pushAfterOf(db, id)).toBeNull();       // at the cap: demoted
     db.close();
   });
@@ -1470,11 +1621,9 @@ describe("push failure streak persistence and demotion (#70)", () => {
     // A fault neither counts nor clears: interleaving outages with genuine misses must leave the
     // row exactly as many misses from demotion as the misses alone put it.
     const { db, id } = seeded();
-    const missing: TmuxSpawn = async () => ({ exitCode: 1 });
-    const rejecting: TmuxSpawn = async () => { throw new Error("spawn EAGAIN"); };
     for (let i = 0; i < DEFAULT_PUSH_FAILURE_DEMOTION_CAP - 1; i++) {
-      await attempt(db, id, missing, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
-      await attempt(db, id, rejecting, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+      await attempt(db, id, missingSend, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+      await attempt(db, id, rejectingSend, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
     }
     expect(getPushFailures(db, id)).toBe(DEFAULT_PUSH_FAILURE_DEMOTION_CAP - 1); // misses only
     expect(pushAfterOf(db, id)).not.toBeNull();
@@ -1483,13 +1632,12 @@ describe("push failure streak persistence and demotion (#70)", () => {
 
   it("clears the streak once a send finally lands, so an old run cannot demote later (#70)", async () => {
     const { db, id } = seeded();
-    const missing: TmuxSpawn = async () => ({ exitCode: 1 });
     for (let i = 0; i < DEFAULT_PUSH_FAILURE_DEMOTION_CAP - 1; i++) {
-      await attempt(db, id, missing, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+      await attempt(db, id, missingSend, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
     }
-    await attempt(db, id, async () => ({ exitCode: 0 }), DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+    await attempt(db, id, landingSend, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
     expect(getPushFailures(db, id)).toBe(0);
-    await attempt(db, id, missing, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
+    await attempt(db, id, missingSend, DEFAULT_PUSH_FAILURE_DEMOTION_CAP);
     expect(pushAfterOf(db, id)).not.toBeNull(); // one fresh miss is nowhere near the cap
     db.close();
   });
