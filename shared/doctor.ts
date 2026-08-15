@@ -20,7 +20,8 @@
 // did not choose.
 
 import type { Database } from "bun:sqlite";
-import type { PaneReadiness } from "../delivery.ts";
+import { HOLDERLESS_DELIVERING, type PaneReadiness } from "../delivery.ts";
+import { displaySessionName } from "./format-peers.ts";
 
 /** Severity of a single check. `fail` means broken now; `warn` means degraded or at risk. */
 export type DoctorSeverity = "ok" | "warn" | "fail";
@@ -49,9 +50,23 @@ export interface DoctorReport {
 // A local peer whose last_seen is older than this is not heartbeating. Mirrors the broker's
 // LOCAL_PEER_TTL_MS; a parity test pins the two together so a broker-side change surfaces here.
 export const DOCTOR_PEER_STALE_MS = 45_000;
-// Pending mail older than this has outlived every automatic push window (push_delay_ms
-// defaults to 2 minutes), so it is waiting on a recipient that is not draining.
+// Floor for "this backlog is not draining", used when push_delay_ms is at or below the default.
 export const DOCTOR_QUEUE_STALE_MS = 15 * 60_000;
+
+/**
+ * How old pending mail must be before doctor calls the backlog stale.
+ *
+ * It cannot be a fixed constant: `push_delay_ms` is an operator knob, and a node configured to
+ * hold normal-urgency mail for, say, half an hour is doing exactly what it was told when a row
+ * sits queued for twenty minutes. Flagging that would train an operator to ignore the check.
+ * So the window is at least twice the configured delay — one delay to become push-due, another
+ * for the push and the recipient's own poll to have had their chance — with the constant as the
+ * floor for the default and shorter delays.
+ */
+export function resolveQueueStaleMs(pushDelayMs: number): number {
+  const delay = Number.isFinite(pushDelayMs) && pushDelayMs > 0 ? pushDelayMs : 0;
+  return Math.max(DOCTOR_QUEUE_STALE_MS, delay * 2);
+}
 
 // --- Fact types (what doctor observes; deliberately free of secrets) ---
 
@@ -79,9 +94,12 @@ export interface BrokerProbeFacts {
 }
 
 export interface SiblingProbeFacts {
+  /** The machine name this sibling is configured AS. */
   machine: string;
   url: string;
   reachable: boolean;
+  /** The machine name the host at `url` calls ITSELF. A mismatch means the URL is misrouted. */
+  reported_machine: string | null;
   protocol_version: number | null;
   latency_ms: number | null;
   error: string | null;
@@ -124,8 +142,13 @@ export interface QueueFacts {
   to_id: string;
   queued: number;
   delivering: number;
-  /** Rows with push_after IS NULL: fyi and floored forwards, which nothing will ever push. */
-  poll_only: number;
+  /**
+   * Rows with push_after IS NULL — fyi and floored forwards, poll-only whatever the recipient is.
+   * This is only HALF of the broker's isPollOnly rule: the other half is the recipient itself
+   * (a session with no push backend makes all of its mail poll-only, push_after or not), which
+   * needs peer facts and so is applied in checkQueues rather than baked into this count.
+   */
+  never_push: number;
   oldest_pending_at: string | null;
   oldest_age_ms: number | null;
 }
@@ -133,9 +156,14 @@ export interface QueueFacts {
 export interface StalledLeaseFacts {
   message_id: number;
   to_id: string;
-  /** How long the lease has been expired, or null for a leaseless delivering row. */
+  /** How long the lease has been expired, or null when the row carries no expiry at all. */
   expired_ms: number | null;
-  leaseless: boolean;
+  /**
+   * The row is `delivering` with a missing lease column, so no attempt can own it (the broker's
+   * HOLDERLESS_DELIVERING invariant). Reported as a boolean: whether a lease token exists, never
+   * what it is.
+   */
+  holderless: boolean;
 }
 
 export interface StoreFacts {
@@ -151,6 +179,8 @@ export interface StoreFacts {
 export interface DoctorFacts {
   now_ms: number;
   expected_protocol: number;
+  /** The node's configured push_delay_ms, so backlog staleness is judged against its own policy. */
+  push_delay_ms: number;
   config: ConfigFacts;
   broker: BrokerProbeFacts;
   siblings: SiblingProbeFacts[];
@@ -165,11 +195,37 @@ export interface DoctorFacts {
 // SQLite is not ours to trust, so scrub anything token-shaped before it can reach the output.
 const TOKEN_SHAPED = /\b[0-9a-f]{32,}\b/gi;
 const BEARER = /Bearer\s+\S+/gi;
+// The text renderer is line-per-check, so a newline inside a foreign string would let that string
+// forge a check line ("[ok  ] Broker process: BROKER_OK"). Collapsing C0/DEL — which also strips
+// any escape sequence's introducer — keeps every foreign value on the line it was printed on.
+// biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point here — this strip is what keeps them out of the rendered report
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]+/g;
 
-/** Strip token-shaped runs and Authorization values from a string we did not author. */
+/** Strip token-shaped runs, Authorization values, and control characters from foreign text. */
 export function redact(text: string, maxLen = 200): string {
-  const scrubbed = text.replace(BEARER, "Bearer [redacted]").replace(TOKEN_SHAPED, "[redacted]");
+  const scrubbed = text
+    .replace(BEARER, "Bearer [redacted]")
+    .replace(TOKEN_SHAPED, "[redacted]")
+    .replace(CONTROL_CHARS, " ")
+    .trim();
   return scrubbed.length > maxLen ? `${scrubbed.slice(0, maxLen)}…` : scrubbed;
+}
+
+/**
+ * Which SQLite file doctor should inspect.
+ *
+ * A loaded config already carries the resolution (loadConfig lets CLAUDE_PEERS_DB override the
+ * file's db_path), so it wins outright. The env override only has to be repeated for the case
+ * that has no config at all — doctor still runs when the config is broken, and that is exactly
+ * when reading the wrong store would be most misleading: an empty queue reported with confidence
+ * while the broker's real store, named only by the env var, holds the stuck mail.
+ */
+export function resolveDoctorDbPath(
+  configDbPath: string | undefined,
+  envDbPath: string | undefined,
+  homeDefault: string,
+): string {
+  return configDbPath ?? (envDbPath && envDbPath.length > 0 ? envDbPath : homeDefault);
 }
 
 // --- Fact gathering (injected seams; no globals) ---
@@ -221,36 +277,43 @@ export async function probeBroker(fetchFn: DoctorFetch, url: string): Promise<Br
   return base;
 }
 
-/** Probe every configured sibling's /health for reachability and its protocol version. */
+/**
+ * Probe every configured sibling's /health for reachability, protocol version, and the machine
+ * name it calls itself. Probes run concurrently: each carries its own multi-second timeout, and
+ * serially a handful of unreachable siblings would add up to a diagnostic that looks hung
+ * exactly when the fleet is broken. Promise.all preserves configuration order in the result.
+ */
 export async function probeSiblings(
   fetchFn: DoctorFetch,
   siblings: Array<{ machine: string; url: string }>,
   nowMs: () => number,
 ): Promise<SiblingProbeFacts[]> {
-  const out: SiblingProbeFacts[] = [];
-  for (const s of siblings) {
+  return Promise.all(siblings.map(async (s): Promise<SiblingProbeFacts> => {
     const started = nowMs();
     try {
       const res = await fetchFn(`${s.url}/health`);
       const latency_ms = nowMs() - started;
       if (!res.ok) {
-        out.push({ machine: s.machine, url: s.url, reachable: false, protocol_version: null, latency_ms, error: `health returned ${res.status}` });
-        continue;
+        return {
+          machine: s.machine, url: s.url, reachable: false, reported_machine: null,
+          protocol_version: null, latency_ms, error: `health returned ${res.status}`,
+        };
       }
       const h = (await res.json()) as Record<string, unknown>;
-      out.push({
+      return {
         machine: s.machine, url: s.url, reachable: true,
+        reported_machine: typeof h.machine === "string" ? redact(h.machine, 60) : null,
         protocol_version: typeof h.protocol_version === "number" ? h.protocol_version : 1,
         latency_ms, error: null,
-      });
+      };
     } catch (e) {
-      out.push({
-        machine: s.machine, url: s.url, reachable: false, protocol_version: null,
-        latency_ms: null, error: redact(e instanceof Error ? e.message : String(e)),
-      });
+      return {
+        machine: s.machine, url: s.url, reachable: false, reported_machine: null,
+        protocol_version: null, latency_ms: null,
+        error: redact(e instanceof Error ? e.message : String(e)),
+      };
     }
-  }
-  return out;
+  }));
 }
 
 /** Whether a column exists, so a legacy store missing a newer column degrades instead of throwing. */
@@ -274,11 +337,26 @@ function hasTable(db: Database, table: string): boolean {
   }
 }
 
-/** The peer rows doctor inspects. Explicit column list: `token` must never be selected. */
+/**
+ * The peer rows doctor inspects. Explicit column list: `token` must never be selected.
+ *
+ * The projection is built from PRAGMA table_info rather than written out flat, because the store
+ * predates several of these columns (`name` arrived in protocol 7, the delivery columns in 2) and
+ * the broker only adds them when IT next opens the file. Doctor opens the store READ-ONLY, so it
+ * can never do that migration itself — a flat SELECT would throw "no such column" and label an
+ * old-but-perfectly-healthy store unreadable, which is the opposite of a diagnostic's job. A
+ * missing column reads as the value its migration backfills: NULL for name and the pane
+ * coordinates, 'none' for delivery_kind (no push backend on record).
+ */
 export function readStoredPeers(db: Database): StoredPeer[] {
   if (!hasTable(db, "peers")) return [];
+  const col = (name: string, fallback: string) =>
+    (hasColumn(db, "peers", name) ? name : `${fallback} AS ${name}`);
   return db.query(
-    "SELECT id, name, machine, pid, delivery_kind, tmux_pane, tmux_socket, last_seen FROM peers",
+    `SELECT id, pid, machine, last_seen,
+            ${col("name", "NULL")}, ${col("delivery_kind", "'none'")},
+            ${col("tmux_pane", "NULL")}, ${col("tmux_socket", "NULL")}
+       FROM peers`,
   ).all() as StoredPeer[];
 }
 
@@ -313,13 +391,13 @@ export function readStoreFacts(db: Database, path: string, nowMs: number, pushCa
       `SELECT to_id,
               SUM(CASE WHEN delivery_state='queued' THEN 1 ELSE 0 END) AS queued,
               SUM(CASE WHEN delivery_state='delivering' THEN 1 ELSE 0 END) AS delivering,
-              SUM(CASE WHEN push_after IS NULL THEN 1 ELSE 0 END) AS poll_only,
+              SUM(CASE WHEN push_after IS NULL THEN 1 ELSE 0 END) AS never_push,
               MIN(sent_at) AS oldest_pending_at
          FROM messages
         WHERE delivery_state IN ('queued','delivering')
         GROUP BY to_id
         ORDER BY to_id`,
-    ).all() as Array<{ to_id: string; queued: number; delivering: number; poll_only: number; oldest_pending_at: string | null }>;
+    ).all() as Array<{ to_id: string; queued: number; delivering: number; never_push: number; oldest_pending_at: string | null }>;
     facts.queues = queues.map((q) => {
       const parsed = q.oldest_pending_at === null ? Number.NaN : Date.parse(q.oldest_pending_at);
       return {
@@ -331,17 +409,23 @@ export function readStoreFacts(db: Database, path: string, nowMs: number, pushCa
     });
 
     // A delivering row is stalled when its lease has expired (the owner never confirmed or
-    // released) or when it carries no lease at all (findLeaklessDelivering's permanent jam).
+    // released) or when it is holderless. Holderless is the broker's OWN predicate, imported
+    // rather than restated: a row with a future lease_expires_at but a NULL lease_token belongs
+    // to no attempt (claimForDelivery writes state, expiry, and token in one UPDATE), and
+    // nextDeliverable nonetheless reads that future timestamp as a live attempt and blocks the
+    // recipient head-of-line until it passes. Expiry alone would call that jam healthy.
+    // `lease_token IS NULL` is selected as a boolean; the token value itself is never read.
     const stalled = db.query(
-      `SELECT id, to_id, lease_expires_at FROM messages
-        WHERE delivery_state='delivering' AND (lease_expires_at IS NULL OR lease_expires_at < ?)
+      `SELECT id, to_id, lease_expires_at, (lease_token IS NULL) AS no_token FROM messages
+        WHERE ${HOLDERLESS_DELIVERING}
+           OR (delivery_state='delivering' AND lease_expires_at < ?)
         ORDER BY id`,
-    ).all(nowMs) as Array<{ id: number; to_id: string; lease_expires_at: number | null }>;
+    ).all(nowMs) as Array<{ id: number; to_id: string; lease_expires_at: number | null; no_token: number }>;
     facts.stalled_leases = stalled.map((r) => ({
       message_id: r.id,
       to_id: r.to_id,
       expired_ms: r.lease_expires_at === null ? null : Math.max(0, nowMs - r.lease_expires_at),
-      leaseless: r.lease_expires_at === null,
+      holderless: r.lease_expires_at === null || r.no_token === 1,
     }));
 
     if (hasColumn(db, "messages", "channel_push_attempts") && pushCap > 0) {
@@ -547,6 +631,17 @@ export function checkSiblings(siblings: SiblingProbeFacts[], expectedProtocol: n
         `Check that ${s.machine} is up and its broker is running, and that the network path (e.g. the tailnet) is connected.`,
       );
     }
+    // The host answered, but is it the host we think? /health names the machine it runs on, so a
+    // config pointing two entries at one URL (a copy-paste, a stale IP another node has taken
+    // over) is visible here and nowhere else: gossip would keep filing that host's peers under
+    // the wrong name, and every other check would read green.
+    if (s.reported_machine !== null && s.reported_machine !== s.machine) {
+      return check(
+        `sibling.${s.machine}`, `Sibling ${s.machine}`, "SIBLING_MACHINE_MISMATCH", "warn",
+        `${s.url} is configured as ${s.machine} but calls itself ${s.reported_machine}, so this entry points at the wrong host.`,
+        `Fix the sibling URL for ${s.machine} in the config (two entries may share one address, or the address moved to another node).`,
+      );
+    }
     if (s.protocol_version !== null && s.protocol_version !== expectedProtocol) {
       return check(
         `sibling.${s.machine}`, `Sibling ${s.machine}`, "SIBLING_PROTOCOL_MISMATCH", "warn",
@@ -571,7 +666,11 @@ export function checkPeers(peers: PeerFacts[], staleMs = DOCTOR_PEER_STALE_MS): 
     return [check("peers", "Peers", "PEERS_NONE", "ok", "No peers registered.")];
   }
   return peers.map((p) => {
-    const label = p.name ? `${p.id} (${p.name})` : p.id;
+    // A session name comes from the tmux session or an env override — operator-controlled, but
+    // not OURS, and the text renderer is one line per check. displaySessionName is the same
+    // collapse-and-cap list_peers applies, so a name carrying newlines cannot forge a check line
+    // and an oversized one cannot bury the report. redact strips control characters underneath.
+    const label = p.name ? `${p.id} (${redact(displaySessionName(p.name), 60)})` : p.id;
     const id = `peer.${p.id}`;
     const title = `Peer ${label}`;
     const age = formatMs(p.age_ms);
@@ -630,6 +729,13 @@ export function checkQueues(
   const checks: DoctorCheck[] = [];
   const known = new Set(peers.map((p) => p.id));
   const unreadyPeers = new Set(peers.filter((p) => p.backend === "unready" || p.backend === "absent").map((p) => p.id));
+  // The recipient half of the broker's isPollOnly rule: a session with no push backend at all
+  // ('none', or a tmux registration with no pane) can never be pushed to, so ALL of its pending
+  // mail is poll-only regardless of push_after. Counting only push_after IS NULL would report
+  // "0 poll-only" for a delivery_kind='none' session whose entire backlog waits on check_messages.
+  const unpushable = new Set(
+    peers.filter((p) => p.backend === "none" || p.backend === "absent").map((p) => p.id),
+  );
 
   if (s.queues.length === 0) {
     checks.push(check("queue", "Queues", "QUEUE_EMPTY", "ok", "No pending messages."));
@@ -637,8 +743,12 @@ export function checkQueues(
   for (const q of s.queues) {
     const id = `queue.${q.to_id}`;
     const title = `Queue ${q.to_id}`;
+    // An unknown recipient is unpushable too: no peer row means no backend (QUEUE_ORPHANED below).
+    const pollOnly = unpushable.has(q.to_id) || !known.has(q.to_id)
+      ? q.queued + q.delivering
+      : q.never_push;
     const counts =
-      `${q.queued} queued, ${q.delivering} delivering, ${q.poll_only} poll-only; oldest ${formatMs(q.oldest_age_ms)} old`;
+      `${q.queued} queued, ${q.delivering} delivering, ${pollOnly} poll-only; oldest ${formatMs(q.oldest_age_ms)} old`;
     if (!known.has(q.to_id)) {
       checks.push(check(
         id, title, "QUEUE_ORPHANED", "warn",
@@ -658,7 +768,7 @@ export function checkQueues(
     if (q.oldest_age_ms !== null && q.oldest_age_ms > staleMs) {
       checks.push(check(
         id, title, "QUEUE_BACKLOG_STALE", "warn",
-        `${counts}. Past every automatic push window, so the recipient is not draining.`,
+        `${counts}. Older than ${formatMs(staleMs)} — past this node's own push window — so the recipient is not draining.`,
         "Have that session run check_messages; if it never does, it is wedged — restart it.",
       ));
       continue;
@@ -667,14 +777,14 @@ export function checkQueues(
   }
 
   if (s.stalled_leases.length > 0) {
-    const leaseless = s.stalled_leases.filter((l) => l.leaseless).length;
+    const holderless = s.stalled_leases.filter((l) => l.holderless).length;
     const oldest = s.stalled_leases.reduce<number | null>(
       (acc, l) => (l.expired_ms === null ? acc : acc === null ? l.expired_ms : Math.max(acc, l.expired_ms)), null,
     );
     checks.push(check(
       "queue.leases", "Delivery leases", "QUEUE_LEASE_STALLED", "fail",
-      `${s.stalled_leases.length} row(s) stuck in delivering past lease expiry (${leaseless} with no lease at all; oldest expired ${formatMs(oldest)} ago). They block the recipient's queued prefix.`,
-      "Restart the broker (`bun cli.ts kill-broker`): it requeues orphaned delivering rows on start. A leaseless row on a legacy table cannot expire on its own.",
+      `${s.stalled_leases.length} row(s) stuck in delivering (${holderless} holderless — a missing lease column, so no attempt owns them; oldest expired ${formatMs(oldest)} ago). They block the recipient's queued prefix.`,
+      "Restart the broker (`bun cli.ts kill-broker`): it requeues orphaned delivering rows on start and its sweep reclaims holderless ones. A holderless row with a future expiry never times out on its own.",
     ));
   } else {
     checks.push(check("queue.leases", "Delivery leases", "QUEUE_LEASE_OK", "ok", "No stalled leases."));
@@ -699,7 +809,7 @@ export function buildDoctorReport(facts: DoctorFacts): DoctorReport {
     ...checkStore(facts.store),
     ...checkSiblings(facts.siblings, facts.expected_protocol),
     ...checkPeers(facts.peers),
-    ...checkQueues(facts.store, facts.peers),
+    ...checkQueues(facts.store, facts.peers, resolveQueueStaleMs(facts.push_delay_ms)),
   ];
   const counts = { ok: 0, warn: 0, fail: 0 };
   for (const c of checks) counts[c.severity]++;

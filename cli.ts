@@ -22,10 +22,10 @@ import {
   isPidDead, makeSpawnTmuxQuery,pidProbe, resolveChannelPushCap,
 } from "./delivery.ts";
 import type { PeersConfig } from "./shared/config.ts";
-import { loadConfig } from "./shared/config.ts";
+import { DEFAULT_PUSH_DELAY_MS, loadConfig } from "./shared/config.ts";
 import {
   buildDoctorReport, type ConfigFacts, doctorExitCode, formatDoctorReport,
-  probeBroker, probeSiblings, readStoredPeers, readStoreFacts, resolvePeerFacts,
+  probeBroker, probeSiblings, readStoredPeers, readStoreFacts, resolveDoctorDbPath, resolvePeerFacts,
   type StoreFacts,
 } from "./shared/doctor.ts";
 import { doorbellDir, doorbellPath, readDoorbell } from "./shared/notify.ts";
@@ -269,7 +269,7 @@ switch (cmd) {
 
     // SQLite is read directly, and on purpose: it is the one source that still answers when the
     // broker is down, which is exactly when an operator wants to know what is stuck in the queue.
-    const dbPath = config?.db_path ?? `${homedir()}/.claude-peers.db`;
+    const dbPath = resolveDoctorDbPath(config?.db_path, process.env.CLAUDE_PEERS_DB, `${homedir()}/.claude-peers.db`);
     let store: StoreFacts = {
       path: dbPath, integrity: "missing", integrity_detail: "no store file", queues: [],
       stalled_leases: [], push_capped: [],
@@ -308,6 +308,7 @@ switch (cmd) {
     const report = buildDoctorReport({
       now_ms: nowMs,
       expected_protocol: PROTOCOL_VERSION,
+      push_delay_ms: config?.push_delay_ms ?? DEFAULT_PUSH_DELAY_MS,
       config: configFacts,
       broker,
       siblings,

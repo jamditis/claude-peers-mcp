@@ -9,7 +9,7 @@ import {
   confirmDelivered, DEFAULT_CHANNEL_PUSH_CAP,
   DEFAULT_DEFERRAL_ESCALATION_CAP, decideChannelPush, decideDeferralEscalation, deliverViaTmux,
   ensureMessagesTable, findLeaklessDelivering, formatPeerMessage, hasDuePush,
-  isFederationRoute, isLoopback, isMessageDelivered, isPidDead,
+  bumpsIdleWindow, isFederationRoute, isLoopback, isMessageDelivered, isPidDead,
   migrateMessagesSchema, nextDeliverable, PASTE_END, PASTE_START,
   probePaneReadiness, promoteQueuedForFlush, pruneMessages, pushAfterFor, reclaimIfExpired,
   reclaimLeaklessDelivering, releasableQueuedPrefix, releaseToQueued,
@@ -1006,6 +1006,23 @@ describe("isFederationRoute", () => {
     for (const path of ["/register", "/heartbeat", "/set-summary", "/list-peers",
       "/send-message", "/poll-messages", "/unregister", "/retire", "/health", "/unknown", "/"]) {
       expect(isFederationRoute(path)).toBe(false);
+    }
+  });
+});
+
+describe("bumpsIdleWindow", () => {
+  it("counts the routes that represent real local work", () => {
+    for (const path of ["/register", "/heartbeat", "/heartbeat-probe", "/set-summary",
+      "/send-message", "/poll-messages", "/peek", "/unregister", "/retire"]) {
+      expect(bumpsIdleWindow(path)).toBe(true);
+    }
+  });
+  it("does not count federation traffic or read-only listing", () => {
+    // A chatty sibling must not hold a locally-idle broker open, and neither must a monitor:
+    // `bun cli.ts doctor` lists without registering, so a listing bump would let a diagnostic
+    // on a short interval keep alive the very broker it reports as idle.
+    for (const path of ["/gossip", "/forward-message", "/list-peers"]) {
+      expect(bumpsIdleWindow(path)).toBe(false);
     }
   });
 });

@@ -4,8 +4,9 @@ import { LOCAL_PEER_TTL_MS } from "../broker.ts";
 import { classifyPaneReadiness, ensureMessagesTable } from "../delivery.ts";
 import {
   buildDoctorReport, type ConfigFacts, DOCTOR_PEER_STALE_MS, type DoctorFacts,
-  doctorExitCode, formatDoctorReport, probeBroker, probeSiblings, 
-  readStoredPeers, readStoreFacts,redact, resolvePeerFacts, type StoreFacts,
+  doctorExitCode, formatDoctorReport, probeBroker, probeSiblings,
+  readStoredPeers, readStoreFacts, redact, resolveDoctorDbPath, resolvePeerFacts,
+  resolveQueueStaleMs, type StoreFacts,
 } from "../shared/doctor.ts";
 import { PROTOCOL_VERSION } from "../shared/types.ts";
 
@@ -67,6 +68,7 @@ function facts(over: Partial<DoctorFacts> = {}): DoctorFacts {
   return {
     now_ms: NOW,
     expected_protocol: PROTOCOL_VERSION,
+    push_delay_ms: 120_000,
     config: okConfig,
     broker: {
       url: "http://127.0.0.1:7899", reachable: true, error: null, status: "ok",
@@ -260,18 +262,18 @@ describe("doctor: store and queue facts", () => {
     const store = readStoreFacts(db, "/tmp/peers.db", NOW, 3);
     expect(store.integrity).toBe("ok");
     const q = store.queues.find((x) => x.to_id === "abc-11111111");
-    expect(q).toMatchObject({ queued: 2, delivering: 1, poll_only: 1 });
+    expect(q).toMatchObject({ queued: 2, delivering: 1, never_push: 1 });
     expect(q?.oldest_age_ms).toBe(5000);
     expect(store.stalled_leases).toEqual([]);
     db.close();
   });
 
-  it("detects a stalled lease (delivering past expiry) and a leaseless delivering row", () => {
+  it("detects a stalled lease (delivering past expiry)", () => {
     const db = makeDb();
     addMessage(db, { delivery_state: "delivering", lease_expires_at: NOW - 30_000, lease_token: "expired" });
     const store = readStoreFacts(db, "/tmp/peers.db", NOW, 3);
     expect(store.stalled_leases).toHaveLength(1);
-    expect(store.stalled_leases[0]).toMatchObject({ to_id: "abc-11111111", expired_ms: 30_000, leaseless: false });
+    expect(store.stalled_leases[0]).toMatchObject({ to_id: "abc-11111111", expired_ms: 30_000, holderless: false });
     const report = buildDoctorReport(facts({ store }));
     expect(codeFor(report, "queue.leases")).toBe("QUEUE_LEASE_STALLED");
     expect(doctorExitCode(report)).toBe(2);
@@ -327,6 +329,142 @@ describe("doctor: store and queue facts", () => {
     expect(store.queues).toEqual([]);
     expect(readStoredPeers(db)).toEqual([]);
     db.close();
+  });
+});
+
+// Review follow-ups (PR #95). Each case below is a state an earlier version of these checks got
+// wrong: a jam it called healthy, a healthy store it called broken, or a value it printed raw.
+describe("doctor: review follow-ups", () => {
+  /** A legacy messages table: the pre-CHECK schema, so a holderless delivering row can exist. */
+  function legacyMessagesDb(): Database {
+    const db = new Database(":memory:");
+    db.run(`CREATE TABLE messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT NOT NULL, to_id TEXT NOT NULL,
+      text TEXT NOT NULL, sent_at TEXT NOT NULL,
+      delivery_state TEXT NOT NULL DEFAULT 'queued',
+      lease_expires_at INTEGER, lease_token TEXT,
+      urgency TEXT NOT NULL DEFAULT 'interrupt', push_after INTEGER DEFAULT 0
+    )`);
+    return db;
+  }
+
+  it("flags a holderless delivering row whose lease has not expired yet", () => {
+    const db = legacyMessagesDb();
+    // Future expiry, no token: nextDeliverable reads the timestamp as a live attempt and blocks
+    // the recipient forever, so an expiry-only predicate would call this jam QUEUE_LEASE_OK.
+    db.run(
+      "INSERT INTO messages (from_id, to_id, text, sent_at, delivery_state, lease_expires_at, lease_token, urgency, push_after) VALUES ('z','abc-11111111','body',?,'delivering',?,NULL,'normal',?)",
+      [new Date(NOW - 1000).toISOString(), NOW + 3_600_000, NOW] as never[],
+    );
+    const store = readStoreFacts(db, "/tmp/peers.db", NOW, 3);
+    expect(store.stalled_leases).toHaveLength(1);
+    expect(store.stalled_leases[0]).toMatchObject({ holderless: true });
+    const report = buildDoctorReport(facts({ store }));
+    expect(codeFor(report, "queue.leases")).toBe("QUEUE_LEASE_STALLED");
+    db.close();
+  });
+
+  it("never reports a lease token value, only whether one exists", () => {
+    const db = makeDb();
+    addMessage(db, { delivery_state: "delivering", lease_expires_at: NOW - 1, lease_token: "leasetok12345678" });
+    const store = readStoreFacts(db, "/tmp/peers.db", NOW, 3);
+    expect(JSON.stringify(store)).not.toContain("leasetok12345678");
+    db.close();
+  });
+
+  it("reads a legacy peers table missing name and delivery columns instead of failing the store", () => {
+    const db = new Database(":memory:");
+    db.run(`CREATE TABLE peers (
+      id TEXT PRIMARY KEY, pid INTEGER NOT NULL, machine TEXT NOT NULL,
+      tailscale_ip TEXT NOT NULL, cwd TEXT NOT NULL, git_root TEXT, tty TEXT,
+      summary TEXT NOT NULL DEFAULT '', registered_at TEXT NOT NULL, last_seen TEXT NOT NULL
+    )`);
+    db.run(
+      "INSERT INTO peers (id, pid, machine, tailscale_ip, cwd, git_root, tty, summary, registered_at, last_seen) VALUES ('old-1', 7, 'node-a', '100.0.0.1', '/w', NULL, NULL, '', ?, ?)",
+      [new Date(NOW - 1000).toISOString(), new Date(NOW).toISOString()] as never[],
+    );
+    const stored = readStoredPeers(db);
+    expect(stored).toHaveLength(1);
+    expect(stored[0]).toMatchObject({ id: "old-1", name: null, delivery_kind: "none", tmux_pane: null });
+    db.close();
+  });
+
+  it("scales backlog staleness to a configured push_delay_ms instead of a fixed window", async () => {
+    const db = makeDb();
+    addPeer(db);
+    // A node told to hold normal mail for 30 minutes; a 20-minute-old row is inside its policy.
+    addMessage(db, { sent_at: new Date(NOW - 20 * 60_000).toISOString() });
+    const peers = await resolvePeerFacts(readStoredPeers(db), { nowMs: NOW, isPidAlive: () => true });
+    const store = readStoreFacts(db, "/tmp/peers.db", NOW, 3);
+    expect(resolveQueueStaleMs(30 * 60_000)).toBe(60 * 60_000);
+    expect(codeFor(buildDoctorReport(facts({ peers, store, push_delay_ms: 30 * 60_000 })), "queue.abc-11111111")).toBe("QUEUE_OK");
+    // The same row against the default delay is genuinely overdue.
+    expect(codeFor(buildDoctorReport(facts({ peers, store, push_delay_ms: 1000 })), "queue.abc-11111111")).toBe("QUEUE_BACKLOG_STALE");
+    db.close();
+  });
+
+  it("counts every row for a recipient with no push backend as poll-only", async () => {
+    const db = makeDb();
+    addPeer(db); // delivery_kind=none
+    addMessage(db, { push_after: NOW });   // pushable in the column, unpushable in reality
+    addMessage(db, { push_after: NOW });
+    const peers = await resolvePeerFacts(readStoredPeers(db), { nowMs: NOW, isPidAlive: () => true });
+    const store = readStoreFacts(db, "/tmp/peers.db", NOW, 3);
+    expect(store.queues[0]?.never_push).toBe(0);
+    const detail = buildDoctorReport(facts({ peers, store })).checks.find((c) => c.id === "queue.abc-11111111")?.detail;
+    expect(detail).toContain("2 poll-only");
+    db.close();
+  });
+
+  it("resolves the store path from the config, then CLAUDE_PEERS_DB, then the home default", () => {
+    expect(resolveDoctorDbPath("/cfg.db", "/env.db", "/home.db")).toBe("/cfg.db");
+    expect(resolveDoctorDbPath(undefined, "/env.db", "/home.db")).toBe("/env.db");
+    expect(resolveDoctorDbPath(undefined, "", "/home.db")).toBe("/home.db");
+    expect(resolveDoctorDbPath(undefined, undefined, "/home.db")).toBe("/home.db");
+  });
+
+  it("flags a sibling URL whose host calls itself something else", async () => {
+    const probes = await probeSiblings(
+      fakeFetch({ "/health": { body: { status: "ok", peers: 0, machine: "node-c", protocol_version: PROTOCOL_VERSION } } }),
+      [{ machine: "node-b", url: "http://misrouted" }],
+      () => 0,
+    );
+    expect(probes[0]?.reported_machine).toBe("node-c");
+    const report = buildDoctorReport(facts({ siblings: probes }));
+    expect(codeFor(report, "sibling.node-b")).toBe("SIBLING_MACHINE_MISMATCH");
+  });
+
+  it("probes siblings concurrently", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const slow = async (_url: string) => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await new Promise((r) => setTimeout(r, 20));
+      inFlight--;
+      return { ok: true, status: 200, json: async () => ({ status: "ok", peers: 0, protocol_version: PROTOCOL_VERSION }) };
+    };
+    const probes = await probeSiblings(slow, [
+      { machine: "a", url: "http://a" }, { machine: "b", url: "http://b" }, { machine: "c", url: "http://c" },
+    ], () => 0);
+    expect(peak).toBe(3);
+    // Order still follows the config, not completion order.
+    expect(probes.map((p) => p.machine)).toEqual(["a", "b", "c"]);
+  });
+
+  it("cannot let a peer name forge a check line or blow up the report", async () => {
+    const db = makeDb();
+    addPeer(db, { name: `evil\n[ok  ] Broker process: BROKER_OK\n${"x".repeat(300)}` });
+    const peers = await resolvePeerFacts(readStoredPeers(db), { nowMs: NOW, isPidAlive: () => true });
+    const text = formatDoctorReport(buildDoctorReport(facts({ peers })));
+    // One BROKER_OK line only — the forged one collapsed into the peer's own line.
+    expect(text.split("\n").filter((l) => l.startsWith("[ok  ] Broker process")).length).toBe(1);
+    for (const line of text.split("\n")) expect(line.length).toBeLessThan(300);
+    db.close();
+  });
+
+  it("collapses control characters out of foreign strings", () => {
+    expect(redact("line one\nline two\r\tthree")).toBe("line one line two three");
   });
 });
 

@@ -9,7 +9,7 @@
 
 import { Database } from "bun:sqlite";
 import {
-  claimForDelivery, confirmDelivered, DEFAULT_DEFERRAL_ESCALATION_CAP,
+  bumpsIdleWindow, claimForDelivery, confirmDelivered, DEFAULT_DEFERRAL_ESCALATION_CAP,
   decideDeferralEscalation, deliverViaTmux, ensureMessagesTable,
   formatPeerMessage, generateAuthToken, generateLeaseToken, hasDuePush,
   isFederationRoute, isLoopback, isMessageDelivered, isPidDead, makeSpawnTmuxQuery,
@@ -1280,11 +1280,12 @@ if (import.meta.main) {
         const validationError = validateControlPlaneBody(path, rawBody);
         if (validationError) return validationError;
         const body = rawBody as ControlPlaneRequest;
-        // Refresh the idle window only for local control-plane traffic, not sibling federation
-        // (/gossip, /forward-message). Self-exit reaps a broker with no LOCAL work; a federated
-        // broker otherwise gets its idle clock reset forever by a sibling's periodic gossip and
-        // never reaps itself. (/health is a GET handled above and never reaches here.)
-        if (!isFederationRoute(path)) lastActivityAt = Date.now();
+        // Refresh the idle window only for traffic that represents local work — see
+        // bumpsIdleWindow for which paths do not (sibling federation, and read-only /list-peers
+        // browsing). Self-exit reaps a broker with no LOCAL work; a federated broker otherwise
+        // gets its idle clock reset forever by a sibling's periodic gossip and never reaps
+        // itself. (/health is a GET handled above and never reaches here.)
+        if (bumpsIdleWindow(path)) lastActivityAt = Date.now();
         // While retiring, refuse every path that creates new persistent work or can
         // start a delivery — /heartbeat drives deliverNext, so it must be refused too,
         // or a heartbeat at a drain-loop yield could start a send the broker then exits under.
