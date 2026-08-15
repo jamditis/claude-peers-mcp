@@ -9,7 +9,7 @@ import {
   confirmDelivered, DEFAULT_CHANNEL_PUSH_CAP,
   DEFAULT_DEFERRAL_ESCALATION_CAP, DEFAULT_PUSH_FAILURE_DEMOTION_CAP,
   bumpPushFailures, countsAsPushFailure, decidePushDemotion, demoteQueuedPushable, getPushFailures, resetPushFailures,
-  makeSpawnTmuxSend, readPushAfter,
+  makeSpawnTmuxSend, readPushAfter, reportedPollOnly,
   decideChannelPush, decideDeferralEscalation, deliverViaTmux,
   ensureMessagesTable, findLeaklessDelivering, formatPeerMessage, hasDuePush,
   isFederationRoute, isLoopback, isMessageDelivered, isPidDead,
@@ -1255,6 +1255,22 @@ describe("countsAsPushFailure (#70)", () => {
     expect(countsAsPushFailure({ ok: true, deferred: false, faulted: false })).toBe(false);
     expect(countsAsPushFailure({ ok: false, deferred: true, faulted: false })).toBe(false);
     expect(countsAsPushFailure({ ok: false, deferred: false, faulted: true })).toBe(false);
+  });
+});
+
+describe("reportedPollOnly (#70)", () => {
+  it("passes the reading through when this request owned the attempt", () => {
+    expect(reportedPollOnly(true, false)).toBe(true);
+    expect(reportedPollOnly(false, false)).toBe(false);
+  });
+
+  it("reports nothing when a foreign attempt could still demote the row", () => {
+    // Absent is a real answer on this wire, not a missing one: describeSendOutcome words an
+    // undefined poll_only so it holds either way. Saying "still push-eligible" here would promise
+    // a push that a failing attempt is about to take away, and only that direction is possible —
+    // demotion clears push_after and nothing puts it back.
+    expect(reportedPollOnly(false, true)).toBeUndefined();
+    expect(reportedPollOnly(true, true)).toBeUndefined();
   });
 });
 

@@ -380,6 +380,31 @@ export function readPushAfter(db: Database, id: number, fallback: number | null)
 }
 
 /**
+ * What a forward may honestly report as its `poll_only` disposition (#39), given the row's reading
+ * and whether another delivery attempt for the same recipient was still in flight when it was
+ * taken. `undefined` means "cannot confirm", which the wire protocol already models: the field is
+ * optional, and describeSendOutcome renders an absent value with wording that is true whichever way
+ * it resolves. That is the honest answer under contention, not a guess in either direction.
+ *
+ * The contention matters because a delivery attempt this request does not own can demote the
+ * recipient's whole queued backlog when it fails (#70) — including the row just inserted. A
+ * forward whose own deliverNext returns immediately (another request holds the recipient) reads
+ * push_after BEFORE that attempt settles, so a `false` here would promise a push that is about to
+ * be taken away. The skew is one-directional: demotion only ever clears push_after, and nothing
+ * restores it on an existing row, so the stale reading can only be too optimistic.
+ *
+ * Waiting for the other attempt instead was considered and rejected: it can hold its lease for a
+ * pane probe plus a send (2s each), while the ORIGINATING broker aborts the forward fetch at 5s —
+ * so waiting trades a slightly optimistic flag for a real risk of reporting the whole forward as
+ * unreachable, on a message that was in fact queued. It would also narrow the window rather than
+ * close it, since the next heartbeat can demote the row a moment after any response is sent. This
+ * report is a snapshot, and saying "unknown" when it is unknown is the accurate form of one.
+ */
+export function reportedPollOnly(pollOnly: boolean, attemptInFlight: boolean): boolean | undefined {
+  return attemptInFlight ? undefined : pollOnly;
+}
+
+/**
  * Whether the recipient has any pending row that is push-due now — the gate that
  * decides if a delivery attempt may interrupt their session at all. A due
  * 'delivering' row counts: it is a retry in progress, still due work. NULL

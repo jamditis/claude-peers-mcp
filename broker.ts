@@ -15,7 +15,7 @@ import {
   formatPeerMessage, generateAuthToken, generateLeaseToken, hasDuePush,
   isFederationRoute, isLoopback, isMessageDelivered, isPidDead, makeSpawnTmuxQuery, makeSpawnTmuxSend,
   migrateMessagesSchema, nextDeliverable, pidProbe, promoteQueuedForFlush,
-  pruneMessages, pushAfterFor, readPushAfter, reclaimIfExpired, reclaimLeaklessDelivering,
+  pruneMessages, pushAfterFor, readPushAfter, reclaimIfExpired, reclaimLeaklessDelivering, reportedPollOnly,
   releasableQueuedPrefix, releaseToQueued, resetDeliveringOnStart, resetPushFailures,
   type TmuxQuery, type TmuxSpawn,
 } from "./delivery.ts";
@@ -1121,7 +1121,16 @@ if (import.meta.main) {
     // just ran, and a push that hit the failure cap in it demotes this recipient's whole queued
     // backlog — this row included (#70). The inserted value would then claim a push that has
     // already been taken away, which is the one answer the sender must not be given.
-    return { ok: true, delivery, poll_only: isPollOnly(body.to_id, readPushAfter(db, forwardedRowId, pushAfter)) };
+    //
+    // That read is only conclusive for attempts THIS request drove. If another request owns the
+    // recipient's attempt, our deliverNext returned at the recipientsInFlight guard without
+    // waiting, so the reading predates that attempt's outcome and a demotion may be moments away.
+    // recipientsInFlight can only name a foreign attempt here — our own burst has settled, and
+    // attemptDeliverNext clears the flag in its finally — so it is exactly the "cannot confirm"
+    // signal, and reportedPollOnly turns it into an absent field rather than a confident guess.
+    const contended = recipientsInFlight.has(body.to_id);
+    const pollOnly = isPollOnly(body.to_id, readPushAfter(db, forwardedRowId, pushAfter));
+    return { ok: true, delivery, poll_only: reportedPollOnly(pollOnly, contended) };
   }
 
   function handleGossip(body: GossipRequest): { ok: boolean } {

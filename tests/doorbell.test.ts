@@ -718,6 +718,55 @@ describe("a ring waits for a push that is coming later, not just one already in 
       await fwd.exited;
     }
   }, 20_000);
+
+  const PORT_RACE = 17952;
+  const DB_PATH_RACE = join(work, "race70.db");
+  const CONFIG_PATH_RACE = join(work, "race70-config.json");
+
+  // The read-back above is only conclusive for attempts the forward itself drove. When another
+  // request already owns the recipient, the forward's deliverNext returns at the in-flight guard
+  // without waiting, so its reading predates that attempt's outcome — and that attempt may be the
+  // one that trips the cap and demotes the whole backlog, this row included. Waiting for it is not
+  // the answer (the foreign attempt can hold a probe plus a send, 2s each, while the ORIGINATING
+  // broker aborts the forward fetch at 5s), so the forward reports the uncertainty instead: an
+  // absent poll_only, which the sender-facing wording already handles truthfully either way.
+  it("reports no poll_only when another attempt owns the recipient (issue #70)", async () => {
+    writeFileSync(CONFIG_PATH_RACE, JSON.stringify({
+      machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_RACE,
+      id_prefix: "dbr", siblings: [], allowed_ips: ["127.0.0.1"], db_path: DB_PATH_RACE,
+      push_delay_ms: 0, floor_remote_forwards: false,
+    }));
+    const race = Bun.spawn(["bun", "broker.ts"], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH_RACE, PATH: `${work}:${process.env.PATH}` },
+      stdout: "ignore", stderr: "ignore",
+    });
+    let pending: Promise<unknown> | null = null;
+    try {
+      expect(await waitForHealth(PORT_RACE)).toBe(true);
+      const rcpt = await regRcpt({ cwd: "/tmp/race70", tmux_pane: SLOW_PANE }, PORT_RACE);
+      const sender = await regSender({ cwd: "/tmp/race70-s" }, PORT_RACE);
+
+      // Do not await: this send claims the recipient and holds the lease across the stub's sleep,
+      // which is the window the forward has to answer in.
+      pending = okAt(PORT_RACE, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "slow push", urgency: "normal" }, sender.token);
+      await waitForRowState(DB_PATH_RACE, 1, "delivering"); // the race is genuinely set up
+
+      const res = await okAt(PORT_RACE, "/forward-message", {
+        protocol_version: PROTOCOL_VERSION, from_id: "remote-peer", to_id: rcpt.id,
+        text: "arrives mid-attempt", from_machine: "db-b", urgency: "normal",
+      });
+      expect(res.ok).toBe(true);
+      expect(res.delivery).toBe("queued");
+      // Not false: that would assert a push this broker cannot yet promise. Not true either.
+      expect(res.poll_only).toBeUndefined();
+    } finally {
+      await pending?.catch(() => {});
+      race.kill();
+      await race.exited;
+    }
+  }, 20_000);
 });
 
 // The reconcile runs at startup, so everything it reaches must already be initialized. It calls
