@@ -29,6 +29,11 @@ const MAIN = "/tmp/rsc-repo";
 const WT1 = "/tmp/rsc-repo-wt1";
 const WT2 = "/tmp/rsc-repo-wt2";
 const OTHER = "/tmp/rsc-other";
+// Two pre-v10 peers that share a git_root but carry no repo_key, to exercise the rolling-upgrade
+// fallback: distinct cwds so a git_root match returns both where a directory match would not.
+const LEG_ROOT = "/tmp/rsc-legacy";
+const LEG1 = "/tmp/rsc-legacy/a";
+const LEG2 = "/tmp/rsc-legacy/b";
 
 let proc: any;
 // One live child process per peer: the broker filters rows whose pid is dead, and a same-pid
@@ -46,11 +51,11 @@ async function post(path: string, body: unknown) {
   return JSON.parse(text);
 }
 
-function register(cwd: string, repo_key: string | null) {
+function register(cwd: string, repo_key: string | null, git_root: string = cwd) {
   const holder = Bun.spawn(["sleep", "120"], { stdout: "ignore", stderr: "ignore" });
   holders.push(holder);
   return post("/register", {
-    pid: holder.pid, cwd, git_root: cwd, repo_key, tty: null, summary: "",
+    pid: holder.pid, cwd, git_root, repo_key, tty: null, summary: "",
     machine: config.machine, tailscale_ip: "127.0.0.1", tmux_pane: null, tmux_socket: null,
   });
 }
@@ -71,6 +76,8 @@ describe("repo-scoped discovery across worktrees", () => {
     await register(WT1, REPO_KEY);
     await register(WT2, REPO_KEY);
     await register(OTHER, OTHER_KEY);
+    await register(LEG1, null, LEG_ROOT);
+    await register(LEG2, null, LEG_ROOT);
   });
 
   afterAll(() => {
@@ -101,5 +108,13 @@ describe("repo-scoped discovery across worktrees", () => {
     // every keyless peer together.
     const peers = await post("/list-peers", { scope: "repo", cwd: WT2, repo_key: null }) as any[];
     expect(peers.map((p) => p.cwd)).toEqual([WT2]);
+  });
+
+  it("groups pre-v10 clients by git_root when they send no repo_key", async () => {
+    // Rolling upgrade: a v9 server reaches the v10 broker with git_root and no repo_key. Repo scope
+    // must still group by git_root (its pre-#72 behavior), not narrow to the caller's directory.
+    const peers = await post("/list-peers",
+      { scope: "repo", cwd: LEG1, git_root: LEG_ROOT, repo_key: null }) as any[];
+    expect(peers.map((p) => p.cwd).sort()).toEqual([LEG1, LEG2].sort());
   });
 });

@@ -377,6 +377,8 @@ if (import.meta.main) {
   const selectAllPeers = db.prepare("SELECT * FROM peers");
   const selectPeersByDirectory = db.prepare("SELECT * FROM peers WHERE cwd = ?");
   const selectPeersByRepoKey = db.prepare("SELECT * FROM peers WHERE repo_key = ?");
+  // Kept for pre-v10 callers that send git_root and no repo_key (see the repo scope case).
+  const selectPeersByGitRoot = db.prepare("SELECT * FROM peers WHERE git_root = ?");
   const selectAllRemotePeers = db.prepare("SELECT * FROM remote_peers");
   const insertMessage = db.prepare(
     "INSERT INTO messages (from_id, to_id, text, sent_at, urgency, push_after) VALUES (?, ?, ?, ?, ?, ?)"
@@ -952,11 +954,15 @@ if (import.meta.main) {
         break;
       case "repo":
         // Match on repo_key (the common git dir), so a checkout and all its worktrees group as
-        // one repository. Fall back to the directory match when the caller has no key (outside a
-        // git repo, or an older git that could not report a stable one), preserving prior behavior.
+        // one repository. A pre-v10 client sends git_root and no repo_key, and can still reach a
+        // v10 broker during a rolling upgrade (the handshake accepts a broker protocol >= 9), so
+        // fall back to the legacy git_root match to preserve its repo grouping. Only when the
+        // caller has neither key (outside a git repo) do we narrow to the exact-directory match.
         localPeers = body.repo_key
           ? selectPeersByRepoKey.all(body.repo_key) as Peer[]
-          : selectPeersByDirectory.all(body.cwd) as Peer[];
+          : body.git_root
+            ? selectPeersByGitRoot.all(body.git_root) as Peer[]
+            : selectPeersByDirectory.all(body.cwd) as Peer[];
         break;
       default:
         throw new Error(LIST_PEERS_SCOPE_ERROR);

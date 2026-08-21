@@ -10,7 +10,7 @@ import { afterAll, beforeAll, describe as bunDescribe, expect, it } from "bun:te
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getGitRoot, getRepoKey } from "../shared/repo-key.ts";
+import { getGitRoot, getRepoKey, isAbsoluteRepoPath } from "../shared/repo-key.ts";
 
 // getRepoKey shells out to `git`; skip on native Windows where the test's POSIX assumptions and
 // path handling do not hold (mirrors the integration suite's platform gate, #22/#53).
@@ -90,5 +90,27 @@ describe("getRepoKey groups a repository and its worktrees", () => {
   it("returns null outside a git repository", async () => {
     expect(await getRepoKey(plain)).toBeNull();
     expect(await getGitRoot(plain)).toBeNull();
+  });
+});
+
+describe("isAbsoluteRepoPath accepts every platform's absolute git dir", () => {
+  it("accepts POSIX, Windows drive-letter, and UNC roots", () => {
+    // A native Windows git reports "C:/repo/.git" (or a UNC path), which does not start with "/";
+    // rejecting those here is what broke worktree grouping on Windows (issue #72 review).
+    for (const p of [
+      "/repo/.git", "/home/u/p/.git",
+      "C:/repo/.git", "C:\\repo\\.git", "d:/x/.git",
+      "\\\\server\\share\\.git", "//server/share/.git",
+    ]) {
+      expect(isAbsoluteRepoPath(p)).toBe(true);
+    }
+  });
+
+  it("rejects a pre-2.31 git echo and relative dirs", () => {
+    // "C:relative" and bare "C:" are drive-*relative*, not absolute: the colon must be followed by
+    // a separator. Pinning them keeps the regex from being loosened to "[A-Za-z]:" unnoticed.
+    for (const p of ["--path-format=absolute", ".git", "../../.git", "repo/.git", "C:relative", "C:", ""]) {
+      expect(isAbsoluteRepoPath(p)).toBe(false);
+    }
   });
 });

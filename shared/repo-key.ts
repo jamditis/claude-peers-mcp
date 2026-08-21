@@ -39,6 +39,14 @@ export function canonicalizePath(p: string): string {
   }
 }
 
+// True for an absolute repository path from any platform's git: POSIX "/...", Windows
+// drive-letter "C:\..." or "C:/...", or UNC "\\..." / "//...". A pre-2.31 git that echoes the
+// unknown flag ("--path-format=absolute") or a relative dir (".git", "../../.git") matches none
+// of these, so getRepoKey still rejects those and falls back to the toplevel.
+export function isAbsoluteRepoPath(p: string): boolean {
+  return /^(?:[/\\]|[A-Za-z]:[/\\])/.test(p);
+}
+
 // A stable identity for "the same repository", shared by a main checkout and all its linked
 // worktrees. getGitRoot returns `--show-toplevel`, which differs per worktree, so it cannot
 // group worktrees of one repo. The common git dir is shared across them, so it can. We ask for
@@ -60,7 +68,9 @@ export async function getRepoKey(cwd: string): Promise<string | null> {
     if (code === 0) {
       const raw = text.trim();
       // Absolute only: a pre-2.31 git echoes the unrecognized flag and/or a relative dir here.
-      if (raw.startsWith("/")) return canonicalizePath(raw);
+      // isAbsoluteRepoPath accepts POSIX, Windows drive-letter, and UNC roots, so a native
+      // Windows git ("C:/repo/.git") is trusted too, not just a POSIX "/repo/.git".
+      if (isAbsoluteRepoPath(raw)) return canonicalizePath(raw);
     }
   } catch {
     // fall through to the toplevel fallback
