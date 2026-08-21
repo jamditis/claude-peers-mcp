@@ -46,9 +46,11 @@ export function parseListPeersScope(
 // never silently falls back to the old id-only path and fails as "not found" against a broker
 // that stores names but cannot resolve them); to 9 for the dedicated /heartbeat-probe route
 // (a server that probes before list_peers must retire a broker that only knows the
-// delivery-draining /heartbeat route).
+// delivery-draining /heartbeat route); to 10 for the repo_key field on /register and /list-peers
+// (a server that reports repo_key for worktree-aware repo scope must retire a broker that neither
+// stores nor queries it, or scope "repo" would keep splitting one repository's worktrees).
 // server.ts requires at least this from a running broker.
-export const PROTOCOL_VERSION = 9;
+export const PROTOCOL_VERSION = 10;
 
 // Urgency tiers arrived in protocol 4 (see the history above). A broker older than
 // this ignores the urgency field and keeps the old push-on-send behavior, so a
@@ -62,6 +64,10 @@ export interface Peer {
   tailscale_ip: string;
   cwd: string;
   git_root: string | null;
+  // Stable identity for "the same repository" (the common git dir), shared by a main checkout
+  // and all its linked worktrees, so repo-scoped discovery groups them. git_root stays the
+  // human-facing worktree toplevel; repo_key is the match key. Absent on remote/legacy rows.
+  repo_key?: string | null;
   tty: string | null;
   summary: string;
   registered_at: string;
@@ -99,6 +105,7 @@ export interface RegisterRequest {
   pid: number;
   cwd: string;
   git_root: string | null;
+  repo_key: string | null;
   tty: string | null;
   summary: string;
   machine: string;
@@ -131,6 +138,7 @@ export interface ListPeersRequest {
   scope: ListPeersScope;
   cwd: string;
   git_root: string | null;
+  repo_key: string | null;
   exclude_id?: PeerId;
 }
 

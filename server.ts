@@ -26,6 +26,7 @@ import {
 } from "./shared/broker-fetch.ts";
 import { loadConfig } from "./shared/config.ts";
 import { formatPeerList } from "./shared/format-peers.ts";
+import { getGitRoot, getRepoKey } from "./shared/repo-key.ts";
 import {
   handleSendMessageTool,
   SEND_MESSAGE_TOOL_INPUT_SCHEMA,
@@ -137,24 +138,6 @@ function log(msg: string) {
   console.error(`[claude-peers] ${msg}`);
 }
 
-async function getGitRoot(cwd: string): Promise<string | null> {
-  try {
-    const proc = Bun.spawn(["git", "rev-parse", "--show-toplevel"], {
-      cwd,
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    const text = await new Response(proc.stdout).text();
-    const code = await proc.exited;
-    if (code === 0) {
-      return text.trim();
-    }
-  } catch {
-    // not a git repo
-  }
-  return null;
-}
-
 function getTty(): string | null {
   try {
     // Try to get the parent's tty from the process tree
@@ -181,6 +164,7 @@ let myId: PeerId | null = null;
 let myAuthToken: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+let myRepoKey: string | null = null;
 let myRegistration: RegisterRequest | null = null;
 
 async function registerWithBroker(): Promise<{ previousId: PeerId | null }> {
@@ -346,6 +330,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           scope,
           cwd: myCwd,
           git_root: myGitRoot,
+          repo_key: myRepoKey,
           exclude_id: myId,
         });
 
@@ -507,10 +492,12 @@ async function main() {
   // 2. Gather context
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
+  myRepoKey = await getRepoKey(myCwd);
   const tty = getTty();
 
   log(`CWD: ${myCwd}`);
   log(`Git root: ${myGitRoot ?? "(none)"}`);
+  log(`Repo key: ${myRepoKey ?? "(none)"}`);
   log(`TTY: ${tty ?? "(unknown)"}`);
 
   // 3. Register with broker. The summary starts as a git snapshot so peers can read
@@ -525,6 +512,7 @@ async function main() {
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
+    repo_key: myRepoKey,
     tty,
     summary: config.auto_summary ? await buildAutoSummary(myCwd) : "",
     machine: config.machine,

@@ -135,6 +135,7 @@ switch (cmd) {
         scope: "machine",
         cwd: "/",
         git_root: null,
+        repo_key: null,
       });
 
       if (peers.length === 0) {
@@ -206,6 +207,7 @@ switch (cmd) {
         pid: process.pid,
         cwd: process.cwd(),
         git_root: null,
+        repo_key: null,
         tty: null,
         summary: "",
         machine: config?.machine ?? "cli",

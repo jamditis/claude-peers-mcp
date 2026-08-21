@@ -332,7 +332,7 @@ if (import.meta.main) {
 
   db.run(`CREATE TABLE IF NOT EXISTS peers (
     id TEXT PRIMARY KEY, pid INTEGER NOT NULL, machine TEXT NOT NULL,
-    tailscale_ip TEXT NOT NULL, cwd TEXT NOT NULL, git_root TEXT, tty TEXT,
+    tailscale_ip TEXT NOT NULL, cwd TEXT NOT NULL, git_root TEXT, repo_key TEXT, tty TEXT,
     summary TEXT NOT NULL DEFAULT '', name TEXT, registered_at TEXT NOT NULL, last_seen TEXT NOT NULL,
     tmux_pane TEXT, tmux_socket TEXT, delivery_kind TEXT NOT NULL DEFAULT 'none', token TEXT
   )`);
@@ -341,7 +341,9 @@ if (import.meta.main) {
   // only under CLAUDE_PEERS_ALLOW_UNSIGNED until the session re-registers and is minted one.
   // A NULL name is a row from before the session-name column: it lists as an unnamed peer
   // until the session re-registers and reports its name.
-  for (const [col, type] of [["name","TEXT"],["tmux_pane","TEXT"],["tmux_socket","TEXT"],["delivery_kind","TEXT NOT NULL DEFAULT 'none'"],["token","TEXT"]] as const) {
+  // A NULL repo_key is a row from before repo-scoped worktree grouping: it matches no repo_key
+  // query until the session re-registers, so it simply does not surface under repo scope yet.
+  for (const [col, type] of [["name","TEXT"],["tmux_pane","TEXT"],["tmux_socket","TEXT"],["delivery_kind","TEXT NOT NULL DEFAULT 'none'"],["token","TEXT"],["repo_key","TEXT"]] as const) {
     const present = (db.query("PRAGMA table_info(peers)").all() as { name: string }[]).some((c) => c.name === col);
     if (!present) db.run(`ALTER TABLE peers ADD COLUMN ${col} ${type}`);
   }
@@ -365,8 +367,8 @@ if (import.meta.main) {
 
   // --- Prepared statements ---
   const insertPeer = db.prepare(`
-    INSERT INTO peers (id, pid, machine, tailscale_ip, cwd, git_root, tty, summary, name, registered_at, last_seen, tmux_pane, tmux_socket, delivery_kind, token)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO peers (id, pid, machine, tailscale_ip, cwd, git_root, repo_key, tty, summary, name, registered_at, last_seen, tmux_pane, tmux_socket, delivery_kind, token)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const tokenForPeer = db.prepare("SELECT token FROM peers WHERE id = ?");
   const updateLastSeen = db.prepare("UPDATE peers SET last_seen = ? WHERE id = ?");
@@ -374,7 +376,7 @@ if (import.meta.main) {
   const deletePeer = db.prepare("DELETE FROM peers WHERE id = ?");
   const selectAllPeers = db.prepare("SELECT * FROM peers");
   const selectPeersByDirectory = db.prepare("SELECT * FROM peers WHERE cwd = ?");
-  const selectPeersByGitRoot = db.prepare("SELECT * FROM peers WHERE git_root = ?");
+  const selectPeersByRepoKey = db.prepare("SELECT * FROM peers WHERE repo_key = ?");
   const selectAllRemotePeers = db.prepare("SELECT * FROM remote_peers");
   const insertMessage = db.prepare(
     "INSERT INTO messages (from_id, to_id, text, sent_at, urgency, push_after) VALUES (?, ?, ?, ?, ?, ?)"
@@ -935,7 +937,7 @@ if (import.meta.main) {
     // control-plane call; the gate binds the call's principal (from_id/id) to it.
     const token = generateAuthToken();
     insertPeer.run(id, body.pid, config.machine, config.tailscale_ip,
-      body.cwd, body.git_root, body.tty, body.summary, body.name ?? null, now, now, pane, socket, kind, token);
+      body.cwd, body.git_root, body.repo_key ?? null, body.tty, body.summary, body.name ?? null, now, now, pane, socket, kind, token);
     return { id, token };
   }
 
@@ -949,8 +951,11 @@ if (import.meta.main) {
         localPeers = selectPeersByDirectory.all(body.cwd) as Peer[];
         break;
       case "repo":
-        localPeers = body.git_root
-          ? selectPeersByGitRoot.all(body.git_root) as Peer[]
+        // Match on repo_key (the common git dir), so a checkout and all its worktrees group as
+        // one repository. Fall back to the directory match when the caller has no key (outside a
+        // git repo, or an older git that could not report a stable one), preserving prior behavior.
+        localPeers = body.repo_key
+          ? selectPeersByRepoKey.all(body.repo_key) as Peer[]
           : selectPeersByDirectory.all(body.cwd) as Peer[];
         break;
       default:
