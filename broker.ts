@@ -22,6 +22,7 @@ import {
 import { loadConfig, type SiblingConfig } from "./shared/config.ts";
 import { displaySessionName } from "./shared/format-peers.ts";
 import { removeDoorbell, writeDoorbell } from "./shared/notify.ts";
+import { getRepoKey } from "./shared/repo-key.ts";
 import type {
   ControlPlaneRequest, ForwardMessageRequest, ForwardMessageResponse,
   GossipRequest, ListPeersRequest, Message, Peer,
@@ -332,7 +333,7 @@ if (import.meta.main) {
 
   db.run(`CREATE TABLE IF NOT EXISTS peers (
     id TEXT PRIMARY KEY, pid INTEGER NOT NULL, machine TEXT NOT NULL,
-    tailscale_ip TEXT NOT NULL, cwd TEXT NOT NULL, git_root TEXT, tty TEXT,
+    tailscale_ip TEXT NOT NULL, cwd TEXT NOT NULL, git_root TEXT, repo_key TEXT, tty TEXT,
     summary TEXT NOT NULL DEFAULT '', name TEXT, registered_at TEXT NOT NULL, last_seen TEXT NOT NULL,
     tmux_pane TEXT, tmux_socket TEXT, delivery_kind TEXT NOT NULL DEFAULT 'none', token TEXT
   )`);
@@ -341,7 +342,9 @@ if (import.meta.main) {
   // only under CLAUDE_PEERS_ALLOW_UNSIGNED until the session re-registers and is minted one.
   // A NULL name is a row from before the session-name column: it lists as an unnamed peer
   // until the session re-registers and reports its name.
-  for (const [col, type] of [["name","TEXT"],["tmux_pane","TEXT"],["tmux_socket","TEXT"],["delivery_kind","TEXT NOT NULL DEFAULT 'none'"],["token","TEXT"]] as const) {
+  // A NULL repo_key is a row from before repo-scoped worktree grouping. Backfill live persisted
+  // rows below, and derive the key for keyless legacy registrations in handleRegister.
+  for (const [col, type] of [["name","TEXT"],["tmux_pane","TEXT"],["tmux_socket","TEXT"],["delivery_kind","TEXT NOT NULL DEFAULT 'none'"],["token","TEXT"],["repo_key","TEXT"]] as const) {
     const present = (db.query("PRAGMA table_info(peers)").all() as { name: string }[]).some((c) => c.name === col);
     if (!present) db.run(`ALTER TABLE peers ADD COLUMN ${col} ${type}`);
   }
@@ -365,8 +368,8 @@ if (import.meta.main) {
 
   // --- Prepared statements ---
   const insertPeer = db.prepare(`
-    INSERT INTO peers (id, pid, machine, tailscale_ip, cwd, git_root, tty, summary, name, registered_at, last_seen, tmux_pane, tmux_socket, delivery_kind, token)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO peers (id, pid, machine, tailscale_ip, cwd, git_root, repo_key, tty, summary, name, registered_at, last_seen, tmux_pane, tmux_socket, delivery_kind, token)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const tokenForPeer = db.prepare("SELECT token FROM peers WHERE id = ?");
   const updateLastSeen = db.prepare("UPDATE peers SET last_seen = ? WHERE id = ?");
@@ -374,11 +377,23 @@ if (import.meta.main) {
   const deletePeer = db.prepare("DELETE FROM peers WHERE id = ?");
   const selectAllPeers = db.prepare("SELECT * FROM peers");
   const selectPeersByDirectory = db.prepare("SELECT * FROM peers WHERE cwd = ?");
+  const selectPeersByRepoKey = db.prepare(
+    "SELECT * FROM peers WHERE repo_key = ? OR (repo_key IS NULL AND git_root = ?)",
+  );
+  // Kept for pre-v10 callers that send git_root and no repo_key (see the repo scope case).
   const selectPeersByGitRoot = db.prepare("SELECT * FROM peers WHERE git_root = ?");
   const selectAllRemotePeers = db.prepare("SELECT * FROM remote_peers");
+  const updateRepoKey = db.prepare("UPDATE peers SET repo_key = ? WHERE id = ? AND repo_key IS NULL");
   const insertMessage = db.prepare(
     "INSERT INTO messages (from_id, to_id, text, sent_at, urgency, push_after) VALUES (?, ?, ?, ?, ?, ?)"
   );
+
+  // A protocol-9 server can survive a broker upgrade without re-registering. Derive the common
+  // git dir for those persisted rows now so a v10 peer in another linked worktree can find them.
+  for (const peer of db.query("SELECT id, cwd FROM peers WHERE repo_key IS NULL").all() as { id: string; cwd: string }[]) {
+    const repoKey = await getRepoKey(peer.cwd);
+    if (repoKey) updateRepoKey.run(repoKey, peer.id);
+  }
   // Poll reads pending (queued OR delivering) in id order so it can stop at an in-flight head
   // and never release a younger message ahead of an older one a tmux send still owns.
   // Project the public Message columns explicitly (not SELECT *) so storage-only columns such
@@ -918,7 +933,7 @@ if (import.meta.main) {
   }
 
   // --- Request handlers ---
-  function handleRegister(body: RegisterRequest): RegisterResponse {
+  async function handleRegister(body: RegisterRequest): Promise<RegisterResponse> {
     const id = generatePeerId(config.id_prefix);
     const now = new Date().toISOString();
     const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
@@ -934,8 +949,11 @@ if (import.meta.main) {
     // Mint a per-session capability token. The peer presents it on every mutating
     // control-plane call; the gate binds the call's principal (from_id/id) to it.
     const token = generateAuthToken();
+    // Protocol-9 clients omit repo_key. The broker is local to their cwd, so derive the key here
+    // and preserve mixed-version discovery across linked worktrees during a rolling upgrade.
+    const repoKey = body.repo_key ?? await getRepoKey(body.cwd);
     insertPeer.run(id, body.pid, config.machine, config.tailscale_ip,
-      body.cwd, body.git_root, body.tty, body.summary, body.name ?? null, now, now, pane, socket, kind, token);
+      body.cwd, body.git_root, repoKey, body.tty, body.summary, body.name ?? null, now, now, pane, socket, kind, token);
     return { id, token };
   }
 
@@ -949,9 +967,16 @@ if (import.meta.main) {
         localPeers = selectPeersByDirectory.all(body.cwd) as Peer[];
         break;
       case "repo":
-        localPeers = body.git_root
-          ? selectPeersByGitRoot.all(body.git_root) as Peer[]
-          : selectPeersByDirectory.all(body.cwd) as Peer[];
+        // Match on repo_key (the common git dir), so a checkout and all its worktrees group as
+        // one repository. A pre-v10 client sends git_root and no repo_key, and can still reach a
+        // v10 broker during a rolling upgrade (the handshake accepts a broker protocol >= 9), so
+        // fall back to the legacy git_root match to preserve its repo grouping. Only when the
+        // caller has neither key (outside a git repo) do we narrow to the exact-directory match.
+        localPeers = body.repo_key
+          ? selectPeersByRepoKey.all(body.repo_key, body.git_root) as Peer[]
+          : body.git_root
+            ? selectPeersByGitRoot.all(body.git_root) as Peer[]
+            : selectPeersByDirectory.all(body.cwd) as Peer[];
         break;
       default:
         throw new Error(LIST_PEERS_SCOPE_ERROR);
@@ -1363,7 +1388,7 @@ if (import.meta.main) {
         switch (path) {
           case "/register":
             // Loopback-only (gated above), so the pane/socket coordinates are trusted here.
-            return Response.json(handleRegister(body));
+            return Response.json(await handleRegister(body));
           case "/heartbeat-probe":
             updateLastSeen.run(new Date().toISOString(), body.id);
             return Response.json({ ok: true });
