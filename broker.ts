@@ -376,7 +376,9 @@ if (import.meta.main) {
   const deletePeer = db.prepare("DELETE FROM peers WHERE id = ?");
   const selectAllPeers = db.prepare("SELECT * FROM peers");
   const selectPeersByDirectory = db.prepare("SELECT * FROM peers WHERE cwd = ?");
-  const selectPeersByRepoKey = db.prepare("SELECT * FROM peers WHERE repo_key = ?");
+  const selectPeersByRepoKey = db.prepare(
+    "SELECT * FROM peers WHERE repo_key = ? OR (repo_key IS NULL AND git_root = ?)",
+  );
   // Kept for pre-v10 callers that send git_root and no repo_key (see the repo scope case).
   const selectPeersByGitRoot = db.prepare("SELECT * FROM peers WHERE git_root = ?");
   const selectAllRemotePeers = db.prepare("SELECT * FROM remote_peers");
@@ -959,7 +961,7 @@ if (import.meta.main) {
         // fall back to the legacy git_root match to preserve its repo grouping. Only when the
         // caller has neither key (outside a git repo) do we narrow to the exact-directory match.
         localPeers = body.repo_key
-          ? selectPeersByRepoKey.all(body.repo_key) as Peer[]
+          ? selectPeersByRepoKey.all(body.repo_key, body.git_root) as Peer[]
           : body.git_root
             ? selectPeersByGitRoot.all(body.git_root) as Peer[]
             : selectPeersByDirectory.all(body.cwd) as Peer[];

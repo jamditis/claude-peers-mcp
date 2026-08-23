@@ -8,6 +8,7 @@
 // repository?" across worktrees (issue #72). The common git dir can, so getRepoKey is built on it.
 
 import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 
 // The worktree toplevel, or null outside a git repository. Kept as the display value so a peer
 // row still shows a readable path rather than an internal `.git` directory.
@@ -47,16 +48,21 @@ export function isAbsoluteRepoPath(p: string): boolean {
   return /^(?:[/\\]|[A-Za-z]:[/\\])/.test(p);
 }
 
+// Git versions before 2.31 can return the common dir relative to cwd. Resolve that value before
+// canonicalizing it so linked worktrees still share one key on those versions.
+export function resolveRepoPath(cwd: string, p: string): string | null {
+  if (!p) return null;
+  return canonicalizePath(isAbsoluteRepoPath(p) ? p : resolve(cwd, p));
+}
+
 // A stable identity for "the same repository", shared by a main checkout and all its linked
 // worktrees. getGitRoot returns `--show-toplevel`, which differs per worktree, so it cannot
 // group worktrees of one repo. The common git dir is shared across them, so it can. We ask for
 // it with `--path-format=absolute`; without that flag `--git-common-dir` reports a relative path
 // (".git" at the top, "../../.git" from a subdirectory) that would not compare across cwds.
-// Requires git >= 2.31. An older git does not error on the unknown flag: rev-parse echoes it to
-// stdout and still exits 0, so the output is not an absolute path. We therefore trust the result
-// only when it is absolute, and otherwise fall back to the toplevel, which groups a plain checkout
-// exactly as the previous match did. Null outside a git repository, so repo scope degrades to the
-// directory match.
+// Git 2.31 and newer return an absolute common dir. An older git can echo the unknown flag while
+// exiting 0, so retry without `--path-format` and resolve its relative common dir against cwd.
+// Null outside a git repository, so repo scope degrades to the directory match.
 export async function getRepoKey(cwd: string): Promise<string | null> {
   try {
     const proc = Bun.spawn(
@@ -72,6 +78,18 @@ export async function getRepoKey(cwd: string): Promise<string | null> {
       // Windows git ("C:/repo/.git") is trusted too, not just a POSIX "/repo/.git".
       if (isAbsoluteRepoPath(raw)) return canonicalizePath(raw);
     }
+  } catch {
+    // fall through to the compatible command
+  }
+  try {
+    const proc = Bun.spawn(["git", "rev-parse", "--git-common-dir"], {
+      cwd,
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    const text = await new Response(proc.stdout).text();
+    const code = await proc.exited;
+    if (code === 0) return resolveRepoPath(cwd, text.trim());
   } catch {
     // fall through to the toplevel fallback
   }

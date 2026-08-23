@@ -9,7 +9,7 @@ import { unlinkSync } from "node:fs";
 
 const describe = bunDescribe.skipIf(process.platform === "win32");
 
-const PORT = 17905;
+const PORT = 17942;
 const CONFIG_PATH = "/tmp/config-reposcope.json";
 const DB_PATH = "/tmp/broker-reposcope.db";
 const config = {
@@ -34,6 +34,7 @@ const OTHER = "/tmp/rsc-other";
 const LEG_ROOT = "/tmp/rsc-legacy";
 const LEG1 = "/tmp/rsc-legacy/a";
 const LEG2 = "/tmp/rsc-legacy/b";
+const LEGACY_MAIN = "/tmp/rsc-repo-legacy-client";
 
 let proc: any;
 // One live child process per peer: the broker filters rows whose pid is dead, and a same-pid
@@ -76,6 +77,7 @@ describe("repo-scoped discovery across worktrees", () => {
     await register(WT1, REPO_KEY);
     await register(WT2, REPO_KEY);
     await register(OTHER, OTHER_KEY);
+    await register(LEGACY_MAIN, null, MAIN);
     await register(LEG1, null, LEG_ROOT);
     await register(LEG2, null, LEG_ROOT);
   });
@@ -88,13 +90,15 @@ describe("repo-scoped discovery across worktrees", () => {
   });
 
   it("groups the main checkout and both worktrees under scope repo", async () => {
-    const peers = await post("/list-peers", { scope: "repo", cwd: MAIN, repo_key: REPO_KEY }) as any[];
+    const peers = await post("/list-peers",
+      { scope: "repo", cwd: MAIN, git_root: MAIN, repo_key: REPO_KEY }) as any[];
     const cwds = peers.map((p) => p.cwd).sort();
-    expect(cwds).toEqual([MAIN, WT1, WT2].sort());
+    expect(cwds).toEqual([LEGACY_MAIN, MAIN, WT1, WT2].sort());
   });
 
   it("excludes a peer from a different repository", async () => {
-    const peers = await post("/list-peers", { scope: "repo", cwd: MAIN, repo_key: REPO_KEY }) as any[];
+    const peers = await post("/list-peers",
+      { scope: "repo", cwd: MAIN, git_root: MAIN, repo_key: REPO_KEY }) as any[];
     expect(peers.some((p) => p.cwd === OTHER)).toBe(false);
   });
 
@@ -116,5 +120,11 @@ describe("repo-scoped discovery across worktrees", () => {
     const peers = await post("/list-peers",
       { scope: "repo", cwd: LEG1, git_root: LEG_ROOT, repo_key: null }) as any[];
     expect(peers.map((p) => p.cwd).sort()).toEqual([LEG1, LEG2].sort());
+  });
+
+  it("includes a pre-v10 peer when a v10 caller supplies a repo_key", async () => {
+    const peers = await post("/list-peers",
+      { scope: "repo", cwd: MAIN, git_root: MAIN, repo_key: REPO_KEY }) as any[];
+    expect(peers.some((p) => p.cwd === LEGACY_MAIN)).toBe(true);
   });
 });
