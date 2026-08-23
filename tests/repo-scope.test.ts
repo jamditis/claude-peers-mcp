@@ -5,7 +5,10 @@
 // and leave scope "directory" matching on the exact cwd. Drives a real broker over HTTP.
 
 import { afterAll, beforeAll, describe as bunDescribe, expect, it } from "bun:test";
-import { unlinkSync } from "node:fs";
+import { mkdtempSync, rmSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { getRepoKey } from "../shared/repo-key.ts";
 
 const describe = bunDescribe.skipIf(process.platform === "win32");
 
@@ -37,9 +40,20 @@ const LEG2 = "/tmp/rsc-legacy/b";
 const LEGACY_MAIN = "/tmp/rsc-repo-legacy-client";
 
 let proc: any;
+let legacyRepoBase = "";
+let legacyMain = "";
+let legacyWorktree = "";
+let legacyRepoKey = "";
 // One live child process per peer: the broker filters rows whose pid is dead, and a same-pid
 // re-register supersedes the prior row, so each peer needs its own alive pid. `sleep` holds one.
 const holders: any[] = [];
+
+function git(cwd: string, ...args: string[]): void {
+  const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "ignore", stderr: "pipe" });
+  if (result.exitCode !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${new TextDecoder().decode(result.stderr)}`);
+  }
+}
 
 async function post(path: string, body: unknown) {
   const res = await fetch(`http://127.0.0.1:${PORT}${path}`, {
@@ -65,6 +79,14 @@ describe("repo-scoped discovery across worktrees", () => {
   beforeAll(async () => {
     await Bun.write(CONFIG_PATH, JSON.stringify(config));
     try { unlinkSync(DB_PATH); } catch {}
+    legacyRepoBase = mkdtempSync(join(tmpdir(), "repo-scope-legacy-"));
+    legacyMain = join(legacyRepoBase, "main");
+    legacyWorktree = join(legacyRepoBase, "worktree");
+    git(legacyRepoBase, "init", "-q", "-b", "main", legacyMain);
+    git(legacyMain, "-c", "user.email=t@e", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+      "commit", "--allow-empty", "-m", "init");
+    git(legacyMain, "worktree", "add", "--detach", legacyWorktree, "HEAD");
+    legacyRepoKey = (await getRepoKey(legacyMain)) ?? "";
     proc = Bun.spawn(["bun", "broker.ts"], {
       env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH, CLAUDE_PEERS_DB: DB_PATH },
       stdout: "ignore", stderr: "inherit",
@@ -80,6 +102,9 @@ describe("repo-scoped discovery across worktrees", () => {
     await register(LEGACY_MAIN, null, MAIN);
     await register(LEG1, null, LEG_ROOT);
     await register(LEG2, null, LEG_ROOT);
+    // A protocol-9 peer omits repo_key. The v10 broker must derive it from this worktree cwd.
+    await register(legacyWorktree, null, legacyWorktree);
+    await register(legacyMain, legacyRepoKey, legacyMain);
   });
 
   afterAll(() => {
@@ -87,6 +112,7 @@ describe("repo-scoped discovery across worktrees", () => {
     for (const h of holders) h.kill();
     try { unlinkSync(DB_PATH); } catch {}
     try { unlinkSync(CONFIG_PATH); } catch {}
+    if (legacyRepoBase) rmSync(legacyRepoBase, { recursive: true, force: true });
   });
 
   it("groups the main checkout and both worktrees under scope repo", async () => {
@@ -126,5 +152,11 @@ describe("repo-scoped discovery across worktrees", () => {
     const peers = await post("/list-peers",
       { scope: "repo", cwd: MAIN, git_root: MAIN, repo_key: REPO_KEY }) as any[];
     expect(peers.some((p) => p.cwd === LEGACY_MAIN)).toBe(true);
+  });
+
+  it("derives a repo key for a pre-v10 peer in another worktree", async () => {
+    const peers = await post("/list-peers",
+      { scope: "repo", cwd: legacyMain, git_root: legacyMain, repo_key: legacyRepoKey }) as any[];
+    expect(peers.map((p) => p.cwd).sort()).toEqual([legacyMain, legacyWorktree].sort());
   });
 });

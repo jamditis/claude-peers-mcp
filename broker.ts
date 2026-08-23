@@ -22,6 +22,7 @@ import {
 import { loadConfig, type SiblingConfig } from "./shared/config.ts";
 import { displaySessionName } from "./shared/format-peers.ts";
 import { removeDoorbell, writeDoorbell } from "./shared/notify.ts";
+import { getRepoKey } from "./shared/repo-key.ts";
 import type {
   ControlPlaneRequest, ForwardMessageRequest, ForwardMessageResponse,
   GossipRequest, ListPeersRequest, Message, Peer,
@@ -341,8 +342,8 @@ if (import.meta.main) {
   // only under CLAUDE_PEERS_ALLOW_UNSIGNED until the session re-registers and is minted one.
   // A NULL name is a row from before the session-name column: it lists as an unnamed peer
   // until the session re-registers and reports its name.
-  // A NULL repo_key is a row from before repo-scoped worktree grouping: it matches no repo_key
-  // query until the session re-registers, so it simply does not surface under repo scope yet.
+  // A NULL repo_key is a row from before repo-scoped worktree grouping. Backfill live persisted
+  // rows below, and derive the key for keyless legacy registrations in handleRegister.
   for (const [col, type] of [["name","TEXT"],["tmux_pane","TEXT"],["tmux_socket","TEXT"],["delivery_kind","TEXT NOT NULL DEFAULT 'none'"],["token","TEXT"],["repo_key","TEXT"]] as const) {
     const present = (db.query("PRAGMA table_info(peers)").all() as { name: string }[]).some((c) => c.name === col);
     if (!present) db.run(`ALTER TABLE peers ADD COLUMN ${col} ${type}`);
@@ -382,9 +383,17 @@ if (import.meta.main) {
   // Kept for pre-v10 callers that send git_root and no repo_key (see the repo scope case).
   const selectPeersByGitRoot = db.prepare("SELECT * FROM peers WHERE git_root = ?");
   const selectAllRemotePeers = db.prepare("SELECT * FROM remote_peers");
+  const updateRepoKey = db.prepare("UPDATE peers SET repo_key = ? WHERE id = ? AND repo_key IS NULL");
   const insertMessage = db.prepare(
     "INSERT INTO messages (from_id, to_id, text, sent_at, urgency, push_after) VALUES (?, ?, ?, ?, ?, ?)"
   );
+
+  // A protocol-9 server can survive a broker upgrade without re-registering. Derive the common
+  // git dir for those persisted rows now so a v10 peer in another linked worktree can find them.
+  for (const peer of db.query("SELECT id, cwd FROM peers WHERE repo_key IS NULL").all() as { id: string; cwd: string }[]) {
+    const repoKey = await getRepoKey(peer.cwd);
+    if (repoKey) updateRepoKey.run(repoKey, peer.id);
+  }
   // Poll reads pending (queued OR delivering) in id order so it can stop at an in-flight head
   // and never release a younger message ahead of an older one a tmux send still owns.
   // Project the public Message columns explicitly (not SELECT *) so storage-only columns such
@@ -924,7 +933,7 @@ if (import.meta.main) {
   }
 
   // --- Request handlers ---
-  function handleRegister(body: RegisterRequest): RegisterResponse {
+  async function handleRegister(body: RegisterRequest): Promise<RegisterResponse> {
     const id = generatePeerId(config.id_prefix);
     const now = new Date().toISOString();
     const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
@@ -940,8 +949,11 @@ if (import.meta.main) {
     // Mint a per-session capability token. The peer presents it on every mutating
     // control-plane call; the gate binds the call's principal (from_id/id) to it.
     const token = generateAuthToken();
+    // Protocol-9 clients omit repo_key. The broker is local to their cwd, so derive the key here
+    // and preserve mixed-version discovery across linked worktrees during a rolling upgrade.
+    const repoKey = body.repo_key ?? await getRepoKey(body.cwd);
     insertPeer.run(id, body.pid, config.machine, config.tailscale_ip,
-      body.cwd, body.git_root, body.repo_key ?? null, body.tty, body.summary, body.name ?? null, now, now, pane, socket, kind, token);
+      body.cwd, body.git_root, repoKey, body.tty, body.summary, body.name ?? null, now, now, pane, socket, kind, token);
     return { id, token };
   }
 
@@ -1376,7 +1388,7 @@ if (import.meta.main) {
         switch (path) {
           case "/register":
             // Loopback-only (gated above), so the pane/socket coordinates are trusted here.
-            return Response.json(handleRegister(body));
+            return Response.json(await handleRegister(body));
           case "/heartbeat-probe":
             updateLastSeen.run(new Date().toISOString(), body.id);
             return Response.json({ ok: true });
