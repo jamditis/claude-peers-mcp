@@ -5,7 +5,7 @@ Thanks for working on claude-peers. This is a Bun/TypeScript MCP project: a sing
 ## Requirements
 
 - [Bun](https://bun.sh) (CI pins `latest`).
-- A POSIX environment (Linux or macOS) for the test suite. The broker itself runs on Windows, but `bun test` does not — see [POSIX-only test suite](#posix-only-test-suite-issue-22) below.
+- Ubuntu for the full test suite. Windows runs the platform-independent suites and skips the POSIX integration cases; see [Platform test coverage](#platform-test-coverage-issue-22) below.
 - `tmux`, if you want a broker to type messages straight into a live Claude Code pane. Without it, messages queue and are read with the `check_messages` tool.
 
 ## Local dev setup
@@ -76,9 +76,9 @@ bun test --test-name-pattern "lease"
 
 The delivery logic in `delivery.ts` is written to be pure and testable so the tests can import it directly rather than spinning up a broker for every case. New behavior in `broker.ts`, `delivery.ts`, or `shared/` should land with tests in the matching file.
 
-### POSIX-only test suite (issue #22)
+### Platform test coverage (issue #22)
 
-The test suite is POSIX-only and does not run on native Windows ([#22](https://github.com/jamditis/claude-peers-mcp/issues/22)). `integration.test.ts` writes shell-based `tmux` stub scripts (shebang + executable bit), uses named pipes and Unix temp paths, and the delivery/broker tests rely on signal-based liveness checks with no native-Windows equivalent. On native Windows, `bun test` fails the `integration.test.ts` cases that wait on a marker the `tmux` stub never writes. This is a known limitation, not a regression — the broker daemon runs on Windows; only the harness is POSIX-bound. Develop and run the suite on Linux or macOS (or WSL).
+CI runs typecheck, lint, and `bun test` on Ubuntu and native Windows ([#22](https://github.com/jamditis/claude-peers-mcp/issues/22)). The shell-based `tmux`, named-pipe, and signal integration suites use `skipIf(win32)`; platform-independent units still run on Windows. Ubuntu is the release gate for the full integration suite. macOS remains best effort until it has its own CI leg.
 
 ## CI gate
 

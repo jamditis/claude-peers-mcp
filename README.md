@@ -19,7 +19,7 @@ Let your Claude Code instances find each other and talk. When you're running sev
 
 This repository is the source of truth for the reusable broker, protocol, MCP tools, tests, generic configuration, and the planned `claude-peers-mcp` npm package. Operator-specific machine configuration, service overrides, local policy, and version pins belong in a private deployment layer that consumes the package rather than forks the core. Secret values stay in a credential vault.
 
-The accepted ownership and package-consumer rules are recorded in [Decision 0001](docs/decisions/0001-package-and-personal-deployment-boundary.md). The research-backed release sequence and npm gates are tracked in [roadmap #85](https://github.com/jamditis/claude-peers-mcp/issues/85).
+The accepted ownership and package-consumer rules are recorded in [Decision 0001](docs/decisions/0001-package-and-personal-deployment-boundary.md). The research-backed release sequence and npm gates are tracked in [roadmap #85](https://github.com/jamditis/claude-peers-mcp/issues/85). The [compatibility and support contract](docs/compatibility.md) records the current beta evidence and the rules that 1.0 must freeze.
 
 ## Quick start
 
@@ -126,7 +126,7 @@ The order matters. The watcher's baseline is sampled when it arms, so anything t
 
 `bun cli.ts doorbell` takes `--since <id>` (only wake strictly above a known message id — e.g. the highest id you just consumed), `--timeout <sec>` (give up after N seconds), and `--watch` (stay running and print each new ring instead of exiting on the first).
 
-Delivery is tracked per message with a short-lived lease (`queued` → `delivering` → `delivered`): the broker claims the head-of-line message (FIFO — newer mail never overtakes older), injects it, then re-probes the recipient's liveness before confirming, because a `0` exit from `send-keys` doesn't prove a live Claude consumed it. A failed or interrupted attempt releases the lease back to `queued` rather than dropping the message; expired leases and rows orphaned by a broker restart are reclaimed automatically. Before each inject the broker also probes the pane's foreground process: if it is a bare shell rather than a live Claude session, the message is held queued instead of pasted into the shell, and a pane that stays a shell across several consecutive attempts is escalated to a louder log so a wedged long-running session does not silently stop receiving mail. The broker and MCP server negotiate a protocol version (currently `9`); an MCP server that finds an older broker running asks it to retire and starts a current one.
+Delivery is tracked per message with a short-lived lease (`queued` → `delivering` → `delivered`): the broker claims the head-of-line message (FIFO — newer mail never overtakes older), injects it, then re-probes the recipient's liveness before confirming, because a `0` exit from `send-keys` doesn't prove a live Claude consumed it. A failed or interrupted attempt releases the lease back to `queued` rather than dropping the message; expired leases and rows orphaned by a broker restart are reclaimed automatically. Before each inject the broker also probes the pane's foreground process: if it is a bare shell rather than a live Claude session, the message is held queued instead of pasted into the shell, and a pane that stays a shell across several consecutive attempts is escalated to a louder log so a wedged long-running session does not silently stop receiving mail. The broker and MCP server negotiate a protocol version (currently `10`); an MCP server that finds an older broker running asks it to retire and starts a current one.
 
 ```
                     ┌───────────────────────────┐
@@ -278,7 +278,7 @@ bun run lint        # biome lint --error-on-warnings .
 bun test            # the test suite
 ```
 
-CI runs all three on every push and pull request, plus a CodeQL security scan, and treats them as required checks. The Biome formatter is left off on purpose so adopting the linter doesn't reflow the tree. The test suite is POSIX-only — it shells out to `tmux` — so on Windows `bun test` won't pass even though the broker itself runs there ([issue #22](https://github.com/jamditis/claude-peers-mcp/issues/22)).
+CI runs all three on Ubuntu and Windows for every push and pull request, plus a CodeQL security scan, and treats them as required checks. The Biome formatter is left off on purpose so adopting the linter doesn't reflow the tree. POSIX tmux and shell-stub integration suites skip on Windows; the platform-independent suites run there to protect the native broker path ([issue #22](https://github.com/jamditis/claude-peers-mcp/issues/22)).
 
 ## Credits
 
