@@ -1826,6 +1826,53 @@ describe("cross-broker send reports the remote delivery disposition", () => {
     expect(poll.messages).toHaveLength(1);
     expect(poll.messages[0].text).toBe("hold me for pickup");
   }, FED_TIMEOUT_MS);
+
+  it("keeps an unsigned forged loopback forward out of the pane while the floor is on (#15)", async () => {
+    const recip = await brokerFetch(D_PORT, "/register", {
+      pid: process.pid, cwd: "/tmp/fwd-forged-r", git_root: null, tty: null, summary: "",
+      machine: "fwd-d", tailscale_ip: "127.0.0.1", tmux_pane: "%10", tmux_socket: null,
+    }) as any;
+    const sender = await registerAndGetToken(D_PORT, {
+      cwd: "/tmp/fwd-control-s",
+      machine: "fwd-d",
+    });
+    const controlText = "authenticated local control";
+    const control = await brokerFetch(D_PORT, "/send-message", {
+      from_id: sender.id,
+      to_id: recip.id,
+      text: controlText,
+      urgency: "interrupt",
+    }, sender.token) as any;
+    expect(control.delivery).toBe("accepted");
+    expect(readFileSync(stub.logFile, "utf-8")).toContain(controlText);
+
+    // While federation routes remain unsigned, loopback can reach the token-exempt route and
+    // choose its sender identity. Pin the mitigation that limits this bypass to queued mail
+    // under the secure-by-default floor; the control above proves the pane itself is pushable.
+    const forgedText = "forged loopback forward";
+    const forward = await rawPost(D_PORT, "/forward-message", {
+      protocol_version: PROTOCOL_VERSION,
+      from_id: "forged-local-sender",
+      to_id: recip.id,
+      text: forgedText,
+      from_machine: "forged-machine",
+      urgency: "interrupt",
+    });
+    expect(forward.status).toBe(200);
+    expect(forward.json).toMatchObject({ ok: true, delivery: "queued", poll_only: true });
+
+    // A later heartbeat must not move a floored row into the push channel.
+    await brokerFetch(D_PORT, "/heartbeat", { id: recip.id }, recip.token);
+    const log = existsSync(stub.logFile) ? readFileSync(stub.logFile, "utf-8") : "";
+    expect(log).not.toContain(forgedText);
+
+    const poll = await brokerFetch(D_PORT, "/poll-messages", { id: recip.id }, recip.token) as any;
+    expect(poll.messages).toHaveLength(1);
+    expect(poll.messages[0]).toMatchObject({
+      from_id: "forged-local-sender",
+      text: forgedText,
+    });
+  }, FED_TIMEOUT_MS);
 });
 
 // Urgency tiers: "interrupt" pushes at once (and flushes pending pushable mail with it),
