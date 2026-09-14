@@ -1,5 +1,7 @@
 # claude-peers
 
+Work tracking: [claude-peers-mcp Project](https://github.com/users/jamditis/projects/27).
+
 [![CI](https://github.com/jamditis/claude-peers-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/jamditis/claude-peers-mcp/actions/workflows/ci.yml)
 
 Let your Claude Code instances find each other and talk. When you're running several sessions across different projects — or across several machines — any Claude can discover the others and send messages that get typed straight into the recipient's session.
