@@ -25,21 +25,16 @@ import {
   createRecoveringBrokerFetch,
 } from "./shared/broker-fetch.ts";
 import { loadConfig } from "./shared/config.ts";
-import { formatPeerList } from "./shared/format-peers.ts";
+import { handleTool } from "./shared/tool-results.ts";
 import { MCP_SERVER_INFO, MCP_TOOLS } from "./shared/mcp-contract.ts";
 import { getGitRoot, getRepoKey } from "./shared/repo-key.ts";
-import { handleSendMessageTool } from "./shared/send-message.ts";
 import { buildAutoSummary } from "./shared/summarize.ts";
 import type {
-  Peer,
   PeerId,
-  PeekMessagesResponse,
-  PollMessagesResponse,
   RegisterRequest,
   RegisterResponse,
 } from "./shared/types.ts";
 import {
-  parseListPeersScope,
   PROTOCOL_VERSION as REQUIRED_BROKER_PROTOCOL,
 } from "./shared/types.ts";
 
@@ -248,176 +243,15 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: MCP_TOOLS,
 }));
 
-mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
-  const { name, arguments: args } = req.params;
-
-  switch (name) {
-    case "list_peers": {
-      const parsedScope = parseListPeersScope(args);
-      if ("error" in parsedScope) {
-        return {
-          content: [{ type: "text" as const, text: parsedScope.error }],
-          isError: true,
-        };
-      }
-      const { scope } = parsedScope;
-      try {
-        const peers = await brokerFetch<Peer[]>("/list-peers", {
-          scope,
-          cwd: myCwd,
-          git_root: myGitRoot,
-          repo_key: myRepoKey,
-          exclude_id: myId,
-        });
-
-        if (peers.length === 0) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `No other Claude Code instances found (scope: ${scope}).`,
-              },
-            ],
-          };
-        }
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: formatPeerList(peers, scope, Date.now()),
-            },
-          ],
-        };
-      } catch (e) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error listing peers: ${e instanceof Error ? e.message : String(e)}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-
-    case "send_message": {
-      return handleSendMessageTool(args, myId, brokerFetch);
-    }
-
-    case "set_summary": {
-      const { summary } = args as { summary: string };
-      if (!myId) {
-        return {
-          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
-          isError: true,
-        };
-      }
-      try {
-        await brokerFetch("/set-summary", { id: myId, summary });
-        if (myRegistration) {
-          myRegistration = { ...myRegistration, summary };
-        }
-        // No echo of the summary text: the caller just wrote it, so repeating it back
-        // only adds tokens to their context.
-        return {
-          content: [{ type: "text" as const, text: "Summary updated." }],
-        };
-      } catch (e) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error setting summary: ${e instanceof Error ? e.message : String(e)}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-
-    case "check_messages": {
-      if (!myId) {
-        return {
-          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
-          isError: true,
-        };
-      }
-      try {
-        const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
-        if (result.messages.length === 0) {
-          return {
-            content: [{ type: "text" as const, text: "No new messages." }],
-          };
-        }
-        const lines = result.messages.map(
-          (m) => `From ${m.from_id} (${m.sent_at})${m.urgency === "fyi" ? " [fyi - no reply expected]" : ""}:\n${m.text}`
-        );
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `${result.messages.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
-            },
-          ],
-        };
-      } catch (e) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error checking messages: ${e instanceof Error ? e.message : String(e)}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-
-    case "peek_messages": {
-      if (!myId) {
-        return {
-          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
-          isError: true,
-        };
-      }
-      try {
-        const result = await brokerFetch<PeekMessagesResponse>("/peek", { id: myId });
-        const mail =
-          result.count === 0
-            ? "no pending messages"
-            : `${result.count} pending message(s) (highest id ${result.max_id})`;
-        // peek never consumes: report state and point at the consume + watcher paths.
-        // Absolute path to the CLI: a session's cwd is its own project, not the claude-peers
-        // install, so a bare `bun cli.ts` would not resolve. cli.ts sits next to this server.
-        const doorbellCmd = `bun ${join(import.meta.dir, "cli.ts")} doorbell ${result.id}`;
-        const hint =
-          result.count > 0
-            ? " Call check_messages to read them."
-            : ` Arm the doorbell to be woken on new mail: run \`${doorbellCmd}\` in the background, then call check_messages. When it fires, re-arm it and call check_messages again — always arm before checking so nothing is missed.`;
-        return {
-          content: [
-            { type: "text" as const, text: `You are peer ${result.id}; ${mail}.${hint}` },
-          ],
-        };
-      } catch (e) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error peeking messages: ${e instanceof Error ? e.message : String(e)}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-
-    default:
-      throw new Error(`Unknown tool: ${name}`);
-  }
-});
+mcp.setRequestHandler(CallToolRequestSchema, async (req) =>
+  handleTool(req.params.name, req.params.arguments, {
+    myId, myCwd, myGitRoot, myRepoKey, brokerFetch,
+    cliPath: join(import.meta.dir, "cli.ts"),
+    onSummary(summary) {
+      if (myRegistration) myRegistration = { ...myRegistration, summary };
+    },
+  }),
+);
 
 // --- Startup ---
 

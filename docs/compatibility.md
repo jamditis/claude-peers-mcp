@@ -1,5 +1,7 @@
 # Compatibility and support contract
 
+Work tracking: [claude-peers-mcp Project](https://github.com/users/jamditis/projects/27).
+
 This document records the contract that the public beta must prove before
 version 1.0 can freeze it. It is a beta baseline, not a claim that 1.0 is ready.
 The remaining release gates are tracked in [roadmap #85](https://github.com/jamditis/claude-peers-mcp/issues/85)
@@ -47,6 +49,31 @@ input, changing an enum, adding a required input, changing success versus error
 classification, or changing the result from one text block is breaking after
 1.0.
 
+## Executable result and broker envelopes
+
+[`tests/tool-results.test.ts`](../tests/tool-results.test.ts) exercises the live
+handler in `shared/tool-results.ts` through an injected broker fetch, without
+starting a server. All five tools return exactly one text block. Success omits
+`isError`; failure sets it to `true`. Transport exceptions preserve actionable
+broker guidance. Invalid scope or target fails before dispatch; send, summary,
+poll, and peek also reject an unregistered caller. A send response with `ok:
+false` is a tool error. Other successful HTTP responses use these envelopes:
+
+| Tool | Broker response fields used by the public result |
+| --- | --- |
+| `list_peers` | Array of peers: `id`, `machine`, `cwd`, `git_root`, `last_seen`, `summary`, optional `name` and `is_remote`. Absent/false `is_remote` means no remote marker; absent/null name means unnamed. |
+| `send_message` | `ok`, failure `error`, optional `delivery`, `routed`, `poll_only`. Accepted delivery means pushed transport only. Remote queued `poll_only: true` means poll-only; false means push-eligible; absent means unknown, never false. Missing delivery keeps the legacy queued description. |
+| `set_summary` | No response-body fields are consumed; successful HTTP completion updates the cached registration summary. |
+| `check_messages` | `messages` array, each with `from_id`, `sent_at`, `text`, optional `urgency`. Only `fyi` adds the no-reply hint; absent urgency does not. |
+| `peek_messages` | `id`, `count`, `max_id`; zero count has null max ID; positive count reports the highest pending ID without consuming. |
+
+Exact prose is not a wire format. Adding ignored broker fields is compatible.
+Removing a consumed field, changing its type or optional-field meaning, or
+changing transport classification requires a broker protocol transition with a
+mixed-version test. A public result-shape or success/error classification break
+requires a package major release after 1.0 (during 0.x, a documented minor
+migration), even if the broker protocol also changes.
+
 ## Delivery terms
 
 The transport uses these terms:
@@ -74,6 +101,19 @@ Urgency changes the transport path:
 | Remote peer with the default floor | Queue on the remote broker as poll-only. |
 | Remote peer with remote push enabled | The remote broker can push when due; the sending broker never types into a pane on another host. |
 | Channel or other transport | Experimental until it has its own delivery-state and mixed-version tests. |
+
+### Remote urgency during old-broker upgrades
+
+The CLI warning probes only the local broker. A current local broker cannot
+confirm that a remote sibling predating protocol 4 honors `normal` or `fyi`:
+gossip does not retain each sibling's protocol version. Such a sibling can ignore
+the forwarded urgency and push immediately, without a CLI warning. This is an
+accepted legacy federation degradation ([#60](https://github.com/jamditis/claude-peers-mcp/issues/60)),
+not a promise of quiet delivery. Message acceptance is unaffected by ignoring
+urgency, but recipient interruption timing changes. Upgrade the receiving broker
+before relying on delayed or poll-only remote delivery. The default remote floor
+on current brokers does not establish what an older sibling supports. The client
+does not add a racy per-send health probe or claim remote protocol knowledge.
 
 ## Identity, resume, and retention
 
