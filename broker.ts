@@ -1119,7 +1119,8 @@ if (import.meta.main) {
     const inserted = insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString(), urgency, pushAfter);
     const forwardedRowId = Number(inserted.lastInsertRowid);
     // floor_remote_forwards leaves a forwarded message queued for pull-only retrieval;
-    // by default a forward auto-injects into the recipient's backend like a local send.
+    // when the operator disables that floor, a forward can auto-inject into the recipient's
+    // backend like a local send.
     // Report the honest per-message disposition so the originating broker can tell the
     // sender whether the message was pushed or left for their next check (issue #14).
     let delivery: "accepted" | "queued" = "queued";
