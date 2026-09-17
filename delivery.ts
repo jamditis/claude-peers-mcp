@@ -545,6 +545,11 @@ export function reclaimLeaklessDelivering(db: Database): number {
 export const PASTE_START = "\x1b[200~";
 export const PASTE_END = "\x1b[201~";
 
+export interface CoalescedPeerPaste {
+  text: string;
+  count: number;
+}
+
 /**
  * Validate a session's own $TMUX/$TMUX_PANE into a delivery target, or null.
  * The index signature lets `process.env` (a string-keyed map) be passed directly;
@@ -585,14 +590,45 @@ function stripControl(s: string): string {
  * "fyi" is tagged so the recipient knows no reply is expected. Urgency defaults to
  * "interrupt" for rows that predate the column.
  */
-export function formatPeerMessage(msg: { id: number; from_id: string; text: string; urgency?: Urgency | string }): string {
+function formatPeerMessageBody(msg: { id: number; from_id: string; text: string; urgency?: Urgency | string }): string {
   const from = stripControl(msg.from_id);
   const text = stripControl(msg.text);
   const urgency = msg.urgency ?? "interrupt";
   const tag = urgency === "fyi" ? ` fyi` : "";
   const hint = urgency === "interrupt" ? `  (reply: send_message to_id="${from}")` : "";
-  const body = `[peer ${from} #${msg.id}${tag}] ${text}${hint}`;
-  return `${PASTE_START}${body}${PASTE_END}`;
+  return `[peer ${from} #${msg.id}${tag}] ${text}${hint}`;
+}
+
+export function formatPeerMessage(msg: { id: number; from_id: string; text: string; urgency?: Urgency | string }): string {
+  return `${PASTE_START}${formatPeerMessageBody(msg)}${PASTE_END}`;
+}
+
+/**
+ * Format the largest bounded prefix as one paste while preserving every row's
+ * reply tag. A single oversized first row is still returned: it already needs
+ * delivery in the current one-row path, and leaving it at the head would stall
+ * all younger mail. Callers keep the unselected suffix queued.
+ */
+export function formatCoalescedPeerPaste(
+  messages: { id: number; from_id: string; text: string; urgency?: Urgency | string }[],
+  maxCount: number,
+  maxBytes: number,
+): CoalescedPeerPaste | null {
+  if (messages.length === 0 || maxCount < 1 || maxBytes < 1) return null;
+
+  const bodies: string[] = [];
+  for (const message of messages) {
+    if (bodies.length >= maxCount) break;
+    const body = formatPeerMessageBody(message);
+    const candidate = `${PASTE_START}${[...bodies, body].join("\n")}${PASTE_END}`;
+    if (bodies.length > 0 && Buffer.byteLength(candidate, "utf8") > maxBytes) break;
+    bodies.push(body);
+  }
+
+  return {
+    text: `${PASTE_START}${bodies.join("\n")}${PASTE_END}`,
+    count: bodies.length,
+  };
 }
 
 /**
