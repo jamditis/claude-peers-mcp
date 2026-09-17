@@ -13,7 +13,7 @@ import {
   bumpPushFailures, countsAsPushFailure, decidePushDemotion, demoteQueuedPushable, getPushFailures, resetPushFailures,
   readPushAfter, reportedPollOnly,
   decideChannelPush, decideDeferralEscalation, deliverViaTmux,
-  ensureMessagesTable, findLeaklessDelivering, formatPeerMessage, hasDuePush,
+  ensureMessagesTable, findLeaklessDelivering, formatCoalescedPeerPaste, formatPeerMessage, hasDuePush,
   bumpsIdleWindow, isFederationRoute, isLoopback, isMessageDelivered, isPidDead,
   migrateMessagesSchema, nextDeliverable, PASTE_END, PASTE_START,
   probePaneReadiness, promoteQueuedForFlush, pruneMessages, pushAfterFor, reclaimIfExpired,
@@ -631,6 +631,50 @@ describe("formatPeerMessage", () => {
     expect(out).not.toContain("\x9b");
     expect(out.indexOf(PASTE_END)).toBe(out.lastIndexOf(PASTE_END)); // only the wrapper
     expect(out).toContain("rm -rf safe");
+  });
+});
+
+describe("formatCoalescedPeerPaste", () => {
+  const messages = [
+    { id: 41, from_id: "alice", text: "first", urgency: "normal" },
+    { id: 42, from_id: "alice", text: "second", urgency: "interrupt" },
+    { id: 43, from_id: "bob", text: "third", urgency: "fyi" },
+  ];
+
+  it("preserves each reply tag inside one paste wrapper", () => {
+    const batch = formatCoalescedPeerPaste(messages, 3, 4096);
+    expect(batch?.count).toBe(3);
+    expect(batch?.text.split(PASTE_START).length).toBe(2);
+    expect(batch?.text.split(PASTE_END).length).toBe(2);
+    for (const id of [41, 42, 43]) expect(batch?.text).toContain(`#${id}`);
+    expect(batch?.text).toContain('reply: send_message to_id="alice"');
+  });
+
+  it("stops at the count bound", () => {
+    const batch = formatCoalescedPeerPaste(messages, 2, 4096);
+    expect(batch?.count).toBe(2);
+    expect(batch?.text).toContain("#42");
+    expect(batch?.text).not.toContain("#43");
+  });
+
+  it("stops before the next row exceeds the UTF-8 byte bound", () => {
+    const firstBytes = Buffer.byteLength(formatPeerMessage(messages[0]!), "utf8");
+    const batch = formatCoalescedPeerPaste(messages, 3, firstBytes);
+    expect(batch?.count).toBe(1);
+    expect(batch?.text).toContain("#41");
+    expect(batch?.text).not.toContain("#42");
+  });
+
+  it("returns one oversized head row so it cannot block the queue", () => {
+    const batch = formatCoalescedPeerPaste(messages, 3, 1);
+    expect(batch?.count).toBe(1);
+    expect(batch?.text).toBe(formatPeerMessage(messages[0]!));
+  });
+
+  it("returns null when no batch can be requested", () => {
+    expect(formatCoalescedPeerPaste([], 3, 4096)).toBeNull();
+    expect(formatCoalescedPeerPaste(messages, 0, 4096)).toBeNull();
+    expect(formatCoalescedPeerPaste(messages, 3, 0)).toBeNull();
   });
 });
 
