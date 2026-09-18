@@ -57,7 +57,7 @@ bun cli.ts kill-broker
 
 `bun cli.ts send` registers an ephemeral queued-only peer, authenticates the send with that peer's token, and unregisters in a `finally`. It does not bypass the token gate.
 
-Both the broker and the MCP server read `port`, `machine`, federation `siblings`, and the IP `allowed_ips` from a config file (`~/.claude-peers.json` by default, overridable with `CLAUDE_PEERS_CONFIG`), not from environment variables. A missing or incomplete config file throws on startup, so you need a valid one to run a session locally. The required fields are `machine`, `tailscale_ip`, `port`, `id_prefix`, `siblings`, and `allowed_ips`; `db_path` and `floor_remote_forwards` are optional. See the README and the per-host samples under `deploy/configs/` for the field reference.
+No config file is needed for local single-host development. When `~/.claude-peers.json` is absent and `CLAUDE_PEERS_CONFIG` is unset, the broker uses the loopback-only default from `singleHostDefault()`. Create a config only to customize the host or enable federation. A config that exists must include `machine`, `tailscale_ip`, `port`, `id_prefix`, `siblings`, and `allowed_ips`; an explicitly selected `CLAUDE_PEERS_CONFIG` path must exist. See the README and the per-host samples under `deploy/configs/` for the field reference.
 
 ## Test suite
 
@@ -123,6 +123,6 @@ Linting is [Biome](https://biomejs.dev) `2.4.16` (pinned exact in `devDependenci
 | `delivery.ts` | Pure, testable delivery logic (lease machine, tmux target resolution, bracketed-paste formatting, liveness probe, retention prune, token generation). |
 | `cli.ts` | CLI for inspecting broker state and sending messages. |
 | `shared/` | Shared types (`types.ts`), config loader (`config.ts`), and summary helper (`summarize.ts`). |
-| `tests/` | Bun test suite (POSIX-only). |
+| `tests/` | Bun test suite. POSIX integration tests skip on Windows; platform-independent tests still run. |
 | `deploy/` | Install scripts, the systemd unit, and per-host config samples. |
 | `.github/workflows/` | `ci.yml` (the required gate) and `codeql.yml`. |

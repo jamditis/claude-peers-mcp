@@ -33,7 +33,7 @@ Before package or deployment work, read [Decision 0001](docs/decisions/0001-pack
 
 ## Running
 
-Both the broker and the MCP server read their settings from a config file — `~/.claude-peers.json` by default, overridable with `CLAUDE_PEERS_CONFIG` — not from environment variables. A missing or incomplete config throws on startup, so a valid one is required to run a session. Required fields: `machine`, `tailscale_ip`, `port`, `id_prefix`, `siblings`, `allowed_ips`. Optional: `db_path`, `floor_remote_forwards`, `push_delay_ms` (default 120000 — how long a `normal`-urgency message waits queued before the broker pushes it anyway), `auto_summary` (default true — seed each session's summary from git state at registration; false keeps summaries empty until `set_summary`). Per-host samples live under `deploy/configs/`.
+The broker and MCP server use the loopback-only `singleHostDefault()` when `~/.claude-peers.json` is absent and `CLAUDE_PEERS_CONFIG` is unset. A config file is needed only for custom or federated deployments. A file that exists must include `machine`, `tailscale_ip`, `port`, `id_prefix`, `siblings`, and `allowed_ips`; an explicitly selected path must exist. Optional fields are `db_path`, `floor_remote_forwards`, `push_delay_ms` (default 120000 — how long a `normal`-urgency message waits queued before the broker pushes it anyway), and `auto_summary` (default true — seed each session's summary from git state at registration; false keeps summaries empty until `set_summary`). Per-host samples live under `deploy/configs/`.
 
 ```bash
 # Plain MCP — no channel flags needed. Delivery into a session works when Claude

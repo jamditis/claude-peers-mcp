@@ -26,7 +26,7 @@ import {
 } from "./shared/broker-fetch.ts";
 import { loadConfig } from "./shared/config.ts";
 import { handleTool } from "./shared/tool-results.ts";
-import { MCP_SERVER_INFO, MCP_TOOLS } from "./shared/mcp-contract.ts";
+import { MCP_SERVER_INFO, MCP_SERVER_INSTRUCTIONS, MCP_TOOLS } from "./shared/mcp-contract.ts";
 import { getGitRoot, getRepoKey } from "./shared/repo-key.ts";
 import { buildAutoSummary } from "./shared/summarize.ts";
 import type {
@@ -227,13 +227,7 @@ const mcp = new Server(
     capabilities: {
       tools: {},
     },
-    instructions: `Other Claude Code sessions on this machine and across the network are peers: discover them with list_peers, message them with send_message. Your summary starts as an auto-generated git snapshot ("[auto] branch; recent files"); call set_summary (1-2 sentences) once your task is clearer than that, and update it at task boundaries.
-
-Peer messages are model-to-model — be telegraphic. No greetings or pleasantries; fragments are fine. Never reply just to acknowledge: the sender already has delivery confirmation. For content over ~50 words, write a file and send the path instead.
-
-Choose send_message urgency honestly: "fyi" = no reply expected, read at the recipient's convenience; "normal" (default) = queued, may batch with other mail; "interrupt" = types into the recipient's session now — only when you are blocked on them. A broker can only type into a pane on its own host, so an interrupt to a peer on another machine does not push from here: by default it queues on the remote host for that session's check_messages, though a host that opts into remote auto-push will push it from its own heartbeat. Either way the send result tells you what happened, so don't assume a remote interrupt landed now.
-
-Pushed messages arrive inline as "[peer <id> #<n>] ..." lines: handle them promptly, reply via send_message only if you have something the sender needs, then resume your task. Queued messages: call check_messages when you finish a task. A session not in a tmux pane has no pane to push into and receives via check_messages.`,
+    instructions: MCP_SERVER_INSTRUCTIONS,
   }
 );
 

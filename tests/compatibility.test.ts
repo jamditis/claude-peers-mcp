@@ -1,11 +1,32 @@
 import { describe, expect, it } from "bun:test";
+import { readFileSync } from "node:fs";
 import packageJson from "../package.json";
-import { MCP_SERVER_INFO, MCP_TOOLS } from "../shared/mcp-contract.ts";
+import { formatPeerMessage } from "../delivery.ts";
+import { MCP_SERVER_INFO, MCP_SERVER_INSTRUCTIONS, MCP_TOOLS } from "../shared/mcp-contract.ts";
+import { PROTOCOL_VERSION } from "../shared/types.ts";
 
 describe("MCP compatibility contract", () => {
   it("keeps the server version aligned with the package", () => {
     expect(MCP_SERVER_INFO.name).toBe("claude-peers");
     expect(packageJson.version).toBe(MCP_SERVER_INFO.version);
+  });
+
+  it("keeps current protocol references aligned with the executable constant", () => {
+    const references = [
+      ["../README.md", `currently \`${PROTOCOL_VERSION}\``],
+      ["../CLAUDE.md", `PROTOCOL_VERSION = ${PROTOCOL_VERSION}`],
+      ["../docs/compatibility.md", `current broker protocol is ${PROTOCOL_VERSION}`],
+    ] as const;
+    for (const [path, expected] of references) {
+      expect(readFileSync(new URL(path, import.meta.url), "utf8").toLowerCase()).toContain(expected.toLowerCase());
+    }
+  });
+
+  it("distinguishes peer replies from the built-in team tool", () => {
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("claude-peers MCP `send_message` tool");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("not Claude Code's built-in `SendMessage` team tool");
+    expect(formatPeerMessage({ id: 1, from_id: "peer-a", text: "ping" }))
+      .toContain("reply with claude-peers MCP tool: send_message");
   });
 
   it("pins tool names and input schema shapes", () => {

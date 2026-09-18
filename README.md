@@ -33,24 +33,7 @@ cd ~/claude-peers-mcp
 bun install
 ```
 
-### 2. Create a config file
-
-The broker and MCP server read their settings from a JSON config file, not from environment variables. Without it, the first `claude` session fails at startup with `Config file not found`. Create `~/.claude-peers.json` with a minimal single-host config:
-
-```json
-{
-  "machine": "my-laptop",
-  "tailscale_ip": "127.0.0.1",
-  "port": 7899,
-  "id_prefix": "local",
-  "siblings": [],
-  "allowed_ips": ["127.0.0.1"]
-}
-```
-
-All six fields shown are required. `siblings: []` and `allowed_ips: ["127.0.0.1"]` keep everything on one machine — see [Multi-machine setup](#multi-machine-setup) to federate across hosts. The default path is `~/.claude-peers.json`; override it with `CLAUDE_PEERS_CONFIG`. See [Configuration](#configuration) for the full field reference. (A future single-host default that removes this step is tracked as [issue #21](https://github.com/jamditis/claude-peers-mcp/issues/21).)
-
-### 3. Register the MCP server
+### 2. Register the MCP server
 
 This makes claude-peers available in every Claude Code session, from any directory:
 
@@ -60,9 +43,11 @@ claude mcp add --scope user --transport stdio claude-peers -- bun ~/claude-peers
 
 Replace `~/claude-peers-mcp` with wherever you cloned it.
 
-### 4. Run Claude Code (use tmux for live delivery)
+### 3. Run Claude Code (use tmux for live delivery)
 
-Once a config file exists, start Claude Code normally — the broker daemon launches automatically the first time, and no special channel flags are needed:
+Start Claude Code normally. The first session launches the broker automatically. If `~/.claude-peers.json` does not exist and `CLAUDE_PEERS_CONFIG` is unset, claude-peers uses a loopback-only single-host default on port `7899`, with no remote siblings. No config file or channel flag is needed for this path.
+
+[Claude Code channels](https://code.claude.com/docs/en/channels-reference) are an optional research-preview adapter with organization-level availability controls. They are not required for stdio MCP, tmux push, or polling, and this project does not treat them as a portable delivery guarantee.
 
 ```bash
 claude
@@ -76,7 +61,7 @@ tmux new -s work    # then run `claude` inside it
 
 Outside tmux everything still works; you just read incoming messages with `check_messages` instead of having them pushed.
 
-### 5. Open a second session and try it
+### 4. Open a second session and try it
 
 In another terminal, start Claude Code the same way. Then ask either one:
 
@@ -88,6 +73,8 @@ It'll show every running instance with their working directory, git repo, and a 
 
 The other Claude receives it immediately and responds.
 
+Create a config file only when you need a custom port, identity, database path, or [multi-machine federation](#multi-machine-setup). A config that exists must contain all required fields, and an explicitly selected `CLAUDE_PEERS_CONFIG` path must exist. See [Configuration](#configuration).
+
 ## What Claude can do
 
 | Tool             | What it does                                                                                |
@@ -98,9 +85,11 @@ The other Claude receives it immediately and responds.
 | `check_messages` | Read and clear messages that were queued instead of pushed. A poll marks the returned messages delivered, so a second call won't re-return them. |
 | `peek_messages`  | Report your own peer ID and how much mail is waiting **without consuming it** — the count and highest pending message ID. Use it to learn your ID so you can arm the doorbell watcher (below). `check_messages` stays the only way to read and clear messages. |
 
+These are claude-peers MCP tools. Use `send_message` for a peer reply, not Claude Code's built-in `SendMessage` team tool.
+
 ## How it works
 
-A **broker daemon** runs on port `7899` (set by the config file's `port` field) with a SQLite database. Each Claude Code session spawns an MCP server that registers with the broker, reporting its tmux pane (if any) as a delivery target. When a message is sent, the broker delivers it straight into the recipient's pane by typing it in (a bracketed-paste write via `tmux send-keys`), so the other Claude sees it as if it were typed at the prompt. A session with no tmux pane keeps its messages queued for `check_messages`.
+A **broker daemon** runs on port `7899` by default, or the configured `port`, with a SQLite database. Each Claude Code session spawns an MCP server that registers with the broker, reporting its tmux pane (if any) as a delivery target. When a message is sent, the broker delivers it straight into the recipient's pane by typing it in (a bracketed-paste write via `tmux send-keys`), so the other Claude sees it as if it were typed at the prompt. A session with no tmux pane keeps its messages queued for `check_messages`.
 
 Not every message interrupts the recipient. Each message carries an **urgency tier** that maps to a `push_after` deadline: `interrupt` is push-due immediately; `normal` waits `push_delay_ms` (default 2 minutes) so the recipient can drain it cheaply via `check_messages` at a task boundary first — if the deadline lapses, the recipient's next heartbeat pushes it; `fyi` never auto-pushes (`push_after` NULL) and is only ever returned by a poll. When one row comes due, the broker promotes the recipient's other pending pushable rows so they ride the same flush instead of interrupting again later. Never-push rows sit outside the push channel entirely, so an `fyi` can't jam pushable mail behind it (FIFO holds within each channel, push vs poll, not across them).
 
@@ -238,7 +227,7 @@ It never writes, and it never perturbs: it reads `/health` and `/list-peers` (li
 
 ### Config-file fields
 
-These live in `~/.claude-peers.json` (or the path in `CLAUDE_PEERS_CONFIG`). The first six are required; the broker and MCP server read `port`, `machine`, and the federation settings from here, not from environment variables.
+For a single host, you can omit `~/.claude-peers.json` and leave `CLAUDE_PEERS_CONFIG` unset. The broker then uses the computer's hostname, a derived three-character peer prefix, port `7899`, a local database, no siblings, and a loopback-only allowlist. To customize that default or enable federation, create `~/.claude-peers.json` or select another path with `CLAUDE_PEERS_CONFIG`. When a config file is used, the first six fields are required.
 
 | Field                   | Required | Description                                                                                  |
 | ----------------------- | -------- | -------------------------------------------------------------------------------------------- |
@@ -259,12 +248,12 @@ These live in `~/.claude-peers.json` (or the path in `CLAUDE_PEERS_CONFIG`). The
 
 | Environment variable          | Default              | Description                                                                            |
 | ----------------------------- | -------------------- | -------------------------------------------------------------------------------------- |
-| `CLAUDE_PEERS_CONFIG`         | `~/.claude-peers.json` | Overrides the config-file location.                                                  |
+| `CLAUDE_PEERS_CONFIG`         | unset                | Selects a config-file path. A selected path must exist; when unset, `~/.claude-peers.json` is read if present and the single-host default is used if it is absent. |
 | `CLAUDE_PEERS_SESSION_NAME`   | unset                | Friendly name for this session, shown in `list_peers`. When unset, the server uses the tmux session name of the pane it runs in; a non-tmux session with no override lists unnamed. |
 | `CLAUDE_PEERS_DB`             | `~/.claude-peers.db` | SQLite database path. Overrides the config file's `db_path`.                            |
 | `CLAUDE_PEERS_IDLE_EXIT_MS`   | `0` (disabled)       | If `> 0`, an idle broker with no peers self-exits after this many ms. The auto-launched broker sets 10 min so it reaps itself; a supervised (systemd) broker leaves it `0` so it never restart-loops. |
 | `CLAUDE_PEERS_ALLOW_UNSIGNED` | unset (`0`)          | Upgrade-window grace for rolling a live broker to v3. When `1`, the broker accepts a missing token only for a pre-v3 NULL-token peer row; a wrong token still `401`s. See [Upgrading a live broker to v3](#upgrading-a-live-broker-to-v3). Leave unset on steady-state brokers. |
-| `CLAUDE_PEERS_PORT`           | `7899`               | CLI-only fallback. The broker and MCP server take the port from the config file's `port`; this is read by `cli.ts` only when no config file loads. |
+| `CLAUDE_PEERS_PORT`           | `7899`               | CLI-only fallback when no config file supplies a port. The broker and MCP server use the loaded config, whose zero-config default is `7899`. |
 
 ## Requirements
 
