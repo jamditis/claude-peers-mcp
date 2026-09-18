@@ -404,10 +404,10 @@ original silent-consume bug possible, so no code path acks without a confirmatio
   delivery per the ordering predicate above; claim the row via the lease, deliver
   through the recipient's backend, mark `delivered` only on confirmation, and
   return `{ ok, routed, delivery: "accepted" | "queued" }`.
-- `/heartbeat`: drain the heartbeating recipient's `queued` rows to its backend,
-  **one injection per stored message** (no coalescing in v1 — each stored message
-  becomes one injected user message so the receiver can reply to each), in `id`
-  ASC order, with the serial-per-recipient ordering and in-flight guard above.
+- `/heartbeat`: drain the heartbeating recipient's `queued` rows to its backend in
+  `id` ASC order, with the serial-per-recipient ordering and in-flight guard above.
+  The default is one injection per stored message. An off-by-default broker setting
+  can combine a bounded queued prefix while preserving each row's reply tag.
 - Registration stores `tmux_pane` / `tmux_socket` / `delivery_kind` for **local**
   peers only. Gossip and `/forward-message` do not carry pane, socket, or
   backend data; a recipient broker resolves the recipient's backend from its own DB.
@@ -539,8 +539,9 @@ M2.
 
 - tmux: one tmux process per delivery (chained keystrokes), `proc.exited` always
   awaited, killed on the 2s timeout. No fire-and-forget spawns.
-- One injection per stored message bounds tmux work to the number of `queued`
-  messages per heartbeat; there is no coalescing path to reason about separately.
+- The default one-injection-per-message path bounds tmux work to the number of
+  `queued` messages per heartbeat. Optional push coalescing uses the fixed count
+  and byte bounds below while keeping per-row delivery state.
 - `tmuxAvailable()` is probed once and cached. A machine without tmux (Windows)
   never attempts a tmux spawn; such sessions use `check_messages` (M1) or the
   launcher backend (M2). A missing-binary result is cached, so a peer that wrongly
@@ -732,6 +733,18 @@ must honor, so they are not re-derived.
   changes are allowed with queued rows present, or pin the backend per queued row /
   lease epoch.
 
+## Optional push coalescing
+
+Issue #9 adds an off-by-default `coalesce_pushes` broker setting. When enabled,
+one tmux attempt claims and sends the largest queued prefix within both fixed
+bounds: eight messages and 64 KiB. The paste keeps each `[peer <from> #<id>]`
+line, so reply addressing does not change. Each stored row also keeps its lease,
+confirmation, retry, and delivery state; a failed batch returns every unconfirmed
+row to the queue. The default remains one paste per stored message.
+
+`check_messages` is unchanged. It returns structured MCP response text and does
+not use the tmux bracketed-paste boundary.
+
 ## Future work
 
 - **Cross-machine authentication** (issue #4). Replace or augment the IP allowlist
@@ -749,6 +762,3 @@ must honor, so they are not re-derived.
 - **Launcher reconnect/backoff table.** Specify concrete backoff bounds,
   keepalive interval, and the ack-timeout / lease-timeout relationship in one table
   when M2 is built.
-- **Optional coalescing** of a peer's pending messages into one paste (issue #9),
-  opt-in for backpressure only (v1 sends one injection per stored message so each is
-  individually replyable).

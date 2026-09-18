@@ -132,6 +132,34 @@ describe("push_delay_ms", () => {
   });
 });
 
+describe("coalesce_pushes", () => {
+  it("defaults to false so each stored message keeps its own paste", async () => {
+    const path = join(tmpdir(), "cfg-coalesce-absent.json");
+    await Bun.write(path, JSON.stringify({
+      machine: "m", tailscale_ip: "127.0.0.1", port: 19010,
+      id_prefix: "m", siblings: [], allowed_ips: ["127.0.0.1"],
+    }));
+    expect(loadConfig(path).coalesce_pushes).toBe(false);
+  });
+
+  it("enables batching only for an explicit true value", async () => {
+    const path = join(tmpdir(), "cfg-coalesce-true.json");
+    await Bun.write(path, JSON.stringify({
+      machine: "m", tailscale_ip: "127.0.0.1", port: 19011,
+      id_prefix: "m", siblings: [], allowed_ips: ["127.0.0.1"],
+      coalesce_pushes: true,
+    }));
+    expect(loadConfig(path).coalesce_pushes).toBe(true);
+
+    await Bun.write(path, JSON.stringify({
+      machine: "m", tailscale_ip: "127.0.0.1", port: 19011,
+      id_prefix: "m", siblings: [], allowed_ips: ["127.0.0.1"],
+      coalesce_pushes: "yes",
+    }));
+    expect(loadConfig(path).coalesce_pushes).toBe(false);
+  });
+});
+
 describe("auto_summary", () => {
   // The registration-time git snapshot ("[auto] branch; recent files") gossips to sibling
   // brokers like any summary. Branch and file names are same-class metadata as the cwd and
@@ -178,6 +206,7 @@ describe("single-host default (zero-config fresh install)", () => {
     expect(config.allowed_ips).toContain("127.0.0.1");
     expect(config.tailscale_ip).toBe("127.0.0.1");
     expect(config.floor_remote_forwards).toBe(true);
+    expect(config.coalesce_pushes).toBe(false);
     expect(config.machine.length).toBeGreaterThan(0);
     expect(config.id_prefix).toMatch(/^[a-z0-9]+$/);
     expect(config.id_prefix.length).toBeGreaterThanOrEqual(1);

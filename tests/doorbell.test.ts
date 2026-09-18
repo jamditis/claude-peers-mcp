@@ -7,7 +7,7 @@
 
 import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe as bunDescribe, expect, it } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { doorbellPath, readDoorbell, writeDoorbell } from "../shared/notify.ts";
@@ -28,6 +28,9 @@ const SLOW_PANE = "%77";
 // requeues the row with its push_after intact and retries on every later heartbeat. This is the
 // pane that never recovers -- the case the push-delay bound does not cover.
 const FAIL_PANE = "%78";
+// A pane whose first send stalls and fails, then succeeds. It makes a failed coalesced attempt
+// deterministic without changing the broker's retry schedule.
+const FLAKY_PANE = "%79";
 const work = mkdtempSync(join(tmpdir(), "doorbell-it-"));
 const DB_PATH = join(work, "broker.db");
 const CONFIG_PATH = join(work, "config.json");
@@ -119,13 +122,16 @@ beforeAll(async () => {
   const stub = join(work, "tmux");
   writeFileSync(stub, `#!/usr/bin/env bash
 if [ "$1" = "-V" ]; then echo "tmux 3.4"; exit 0; fi
-_sk=0; _slow=0; _fail=0
+_sk=0; _slow=0; _fail=0; _flaky=0
 for _a in "$@"; do
   case "$_a" in *send-keys*) _sk=1;; esac
   [ "$_a" = "${SLOW_PANE}" ] && _slow=1
   [ "$_a" = "${FAIL_PANE}" ] && _fail=1
+  [ "$_a" = "${FLAKY_PANE}" ] && _flaky=1
 done
+[ "$_sk" = 1 ] && [ -n "$TMUX_LOG" ] && { printf '%q ' "$@" >> "$TMUX_LOG"; printf '\n' >> "$TMUX_LOG"; }
 [ "$_sk" = 1 ] && [ "$_slow" = 1 ] && sleep 1
+[ "$_sk" = 1 ] && [ "$_flaky" = 1 ] && [ -n "$TMUX_FAIL_ONCE" ] && [ ! -e "$TMUX_FAIL_ONCE" ] && { sleep 1; : > "$TMUX_FAIL_ONCE"; exit 1; }
 [ "$_sk" = 1 ] && [ "$_fail" = 1 ] && exit 1
 exit 0
 `);
@@ -194,6 +200,125 @@ describe("doorbell marker", () => {
     expect(send.delivery).toBe("accepted");
     expect(existsSync(doorbellPath(DB_PATH, rcpt.id) as string)).toBe(false);
   });
+});
+
+describe("coalesced push opt-in", () => {
+  const port = 17953;
+  const dbPath = join(work, "coalesce.db");
+  const configPath = join(work, "coalesce-config.json");
+  const tmuxLog = join(work, "coalesce-tmux.log");
+
+  it("sends queued rows in one bounded paste and confirms each row", async () => {
+    writeFileSync(configPath, JSON.stringify({
+      machine: "db-a", tailscale_ip: "127.0.0.1", port,
+      id_prefix: "dbc", siblings: [], allowed_ips: ["127.0.0.1"], db_path: dbPath,
+      push_delay_ms: 0, coalesce_pushes: true,
+    }));
+    const broker = Bun.spawn(["bun", "broker.ts"], {
+      cwd: join(import.meta.dir, ".."),
+      env: {
+        ...process.env,
+        CLAUDE_PEERS_CONFIG: configPath,
+        PATH: `${work}:${process.env.PATH}`,
+        TMUX_LOG: tmuxLog,
+      },
+      stdout: "ignore", stderr: "ignore",
+    });
+    let firstSend: Promise<unknown> | null = null;
+    try {
+      expect(await waitForHealth(port)).toBe(true);
+      const rcpt = await regRcpt({ cwd: "/tmp/coalesce", tmux_pane: SLOW_PANE }, port);
+      const sender = await regSender({ cwd: "/tmp/coalesce-s" }, port);
+
+      firstSend = okAt(port, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "first", urgency: "normal" }, sender.token);
+      await waitForRowState(dbPath, 1, "delivering");
+      await okAt(port, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "second", urgency: "normal" }, sender.token);
+      await okAt(port, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "third", urgency: "normal" }, sender.token);
+      await firstSend;
+
+      const sends = readFileSync(tmuxLog, "utf8").trim().split("\n");
+      expect(sends).toHaveLength(2);
+      expect(sends[1]).toContain("#2");
+      expect(sends[1]).toContain("#3");
+
+      const probe = new Database(dbPath, { readonly: true });
+      const states = probe.query(
+        "SELECT delivery_state FROM messages WHERE to_id = ? ORDER BY id",
+      ).all(rcpt.id) as { delivery_state: string }[];
+      probe.close();
+      expect(states.map((row) => row.delivery_state)).toEqual(["delivered", "delivered", "delivered"]);
+    } finally {
+      await firstSend?.catch(() => {});
+      broker.kill();
+      await broker.exited;
+    }
+  }, 20_000);
+
+  it("releases a failed batch in order and retries every row together", async () => {
+    const retryPort = port + 1;
+    const retryDbPath = join(work, "coalesce-retry.db");
+    const retryConfigPath = join(work, "coalesce-retry-config.json");
+    const retryTmuxLog = join(work, "coalesce-retry-tmux.log");
+    const failOnce = join(work, "coalesce-fail-once.mark");
+    writeFileSync(retryConfigPath, JSON.stringify({
+      machine: "db-a", tailscale_ip: "127.0.0.1", port: retryPort,
+      id_prefix: "dbr", siblings: [], allowed_ips: ["127.0.0.1"], db_path: retryDbPath,
+      push_delay_ms: 0, coalesce_pushes: true,
+    }));
+    const broker = Bun.spawn(["bun", "broker.ts"], {
+      cwd: join(import.meta.dir, ".."),
+      env: {
+        ...process.env,
+        CLAUDE_PEERS_CONFIG: retryConfigPath,
+        PATH: `${work}:${process.env.PATH}`,
+        TMUX_LOG: retryTmuxLog,
+        TMUX_FAIL_ONCE: failOnce,
+      },
+      stdout: "ignore", stderr: "ignore",
+    });
+    let firstSend: Promise<unknown> | null = null;
+    try {
+      expect(await waitForHealth(retryPort)).toBe(true);
+      const rcpt = await regRcpt({ cwd: "/tmp/coalesce-retry", tmux_pane: FLAKY_PANE }, retryPort);
+      const sender = await regSender({ cwd: "/tmp/coalesce-retry-s" }, retryPort);
+
+      firstSend = okAt(retryPort, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "first", urgency: "normal" }, sender.token);
+      await waitForRowState(retryDbPath, 1, "delivering");
+      await okAt(retryPort, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "second", urgency: "normal" }, sender.token);
+      await okAt(retryPort, "/send-message",
+        { from_id: sender.id, to_id: rcpt.id, text: "third", urgency: "normal" }, sender.token);
+      await firstSend;
+
+      const probe = new Database(retryDbPath, { readonly: true });
+      const queryRows = () => probe.query(
+        "SELECT id, delivery_state, lease_expires_at, lease_token, push_failures FROM messages WHERE to_id = ? ORDER BY id",
+      ).all(rcpt.id) as {
+        id: number; delivery_state: string; lease_expires_at: number | null;
+        lease_token: string | null; push_failures: number;
+      }[];
+      expect(queryRows()).toEqual([
+        { id: 1, delivery_state: "queued", lease_expires_at: null, lease_token: null, push_failures: 1 },
+        { id: 2, delivery_state: "queued", lease_expires_at: null, lease_token: null, push_failures: 0 },
+        { id: 3, delivery_state: "queued", lease_expires_at: null, lease_token: null, push_failures: 0 },
+      ]);
+
+      await okAt(retryPort, "/heartbeat", { id: rcpt.id }, rcpt.token);
+      const retry = readFileSync(retryTmuxLog, "utf8").trim().split("\n")[1]!;
+      expect(retry.indexOf("#1")).toBeLessThan(retry.indexOf("#2"));
+      expect(retry.indexOf("#2")).toBeLessThan(retry.indexOf("#3"));
+      expect(queryRows().map((row) => row.delivery_state)).toEqual(["delivered", "delivered", "delivered"]);
+      probe.close();
+    } finally {
+      await firstSend?.catch(() => {});
+      broker.kill();
+      await broker.exited;
+    }
+  }, 20_000);
 });
 
 // The doorbell's question is "will anything ever push this row to this recipient?", and there

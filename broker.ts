@@ -9,14 +9,44 @@
 
 import { Database } from "bun:sqlite";
 import {
-  bumpPushFailures, bumpsIdleWindow, claimForDelivery, confirmDelivered, countsAsPushFailure, DEFAULT_DEFERRAL_ESCALATION_CAP,
-  DEFAULT_PUSH_FAILURE_DEMOTION_CAP, decideDeferralEscalation, decidePushDemotion,
-  demoteQueuedPushable, deliverViaTmux, ensureMessagesTable,
-  formatPeerMessage, generateAuthToken, generateLeaseToken, hasDuePush,
-  isFederationRoute, isLoopback, isMessageDelivered, isPidDead, makeSpawnTmuxQuery,
-  migrateMessagesSchema, nextDeliverable, pidProbe, promoteQueuedForFlush,
-  pruneMessages, pushAfterFor, readPushAfter, reclaimIfExpired, reclaimLeaklessDelivering, reportedPollOnly,
-  releasableQueuedPrefix, releaseToQueued, resetDeliveringOnStart, resetPushFailures,
+  bumpPushFailures,
+  bumpsIdleWindow,
+  claimForDelivery,
+  confirmDelivered,
+  countsAsPushFailure,
+  DEFAULT_COALESCE_MAX_BYTES,
+  DEFAULT_COALESCE_MAX_COUNT,
+  DEFAULT_DEFERRAL_ESCALATION_CAP,
+  DEFAULT_PUSH_FAILURE_DEMOTION_CAP,
+  decideDeferralEscalation,
+  decidePushDemotion,
+  deliverViaTmux,
+  demoteQueuedPushable,
+  ensureMessagesTable,
+  formatCoalescedPeerPaste,
+  formatPeerMessage,
+  generateAuthToken,
+  generateLeaseToken,
+  hasDuePush,
+  isFederationRoute,
+  isLoopback,
+  isMessageDelivered,
+  isPidDead,
+  makeSpawnTmuxQuery,
+  migrateMessagesSchema,
+  nextDeliverable,
+  pidProbe,
+  promoteQueuedForFlush,
+  pruneMessages,
+  pushAfterFor,
+  readPushAfter,
+  reclaimIfExpired,
+  reclaimLeaklessDelivering,
+  releasableQueuedPrefix,
+  releaseToQueued,
+  reportedPollOnly,
+  resetDeliveringOnStart,
+  resetPushFailures,
   type TmuxQuery,
 } from "./delivery.ts";
 import { loadConfig, type SiblingConfig } from "./shared/config.ts";
@@ -24,16 +54,26 @@ import { displaySessionName } from "./shared/format-peers.ts";
 import { removeDoorbell, writeDoorbell } from "./shared/notify.ts";
 import { getRepoKey } from "./shared/repo-key.ts";
 import type {
-  ControlPlaneRequest, ForwardMessageRequest, ForwardMessageResponse,
-  GossipRequest, ListPeersRequest, Message, Peer,
-  PeekMessagesRequest, PeekMessagesResponse,
-  PollMessagesRequest, PollMessagesResponse,
-  RegisterRequest, RegisterResponse, SendMessageRequest, SendResult,
+  ControlPlaneRequest,
+  ForwardMessageRequest,
+  ForwardMessageResponse,
+  GossipRequest,
+  ListPeersRequest,
+  Message,
+  PeekMessagesRequest,
+  PeekMessagesResponse,
+  Peer,
+  PollMessagesRequest,
+  PollMessagesResponse,
+  RegisterRequest,
+  RegisterResponse,
+  SendMessageRequest,
+  SendResult,
 } from "./shared/types.ts";
 import {
   LIST_PEERS_SCOPE_ERROR,
-  parseListPeersScope,
   PROTOCOL_VERSION,
+  parseListPeersScope,
 } from "./shared/types.ts";
 
 const GOSSIP_INTERVAL_MS = 5_000;
@@ -401,6 +441,9 @@ if (import.meta.main) {
   const selectPendingForPoll = db.prepare(
     "SELECT id, from_id, to_id, text, sent_at, delivery_state, lease_expires_at, lease_token, urgency, push_after FROM messages WHERE to_id = ? AND delivery_state IN ('queued','delivering') ORDER BY id ASC"
   );
+  const selectPendingForPush = db.prepare(
+    "SELECT id, from_id, to_id, text, sent_at, delivery_state, lease_expires_at, lease_token, urgency, push_after FROM messages WHERE to_id = ? AND delivery_state IN ('queued','delivering') AND push_after IS NOT NULL ORDER BY id ASC LIMIT ?"
+  );
   const markPolled = db.prepare(
     "UPDATE messages SET delivery_state = 'delivered', lease_expires_at = NULL, lease_token = NULL WHERE id = ? AND delivery_state = 'queued'"
   );
@@ -637,7 +680,7 @@ if (import.meta.main) {
   const LEASE_MS = 5_000;        // > the 2s tmux attempt timeout
   const TMUX_TIMEOUT_MS = 2_000;
   const FORWARD_TIMEOUT_MS = 5_000; // abort bound on an outbound cross-machine forward fetch
-  const MAX_HEARTBEAT_DRAIN = 50; // upper bound on pushes drained per heartbeat
+  const MAX_HEARTBEAT_DRAIN = 50; // upper bound on tmux attempts per heartbeat; one attempt may be a batch
   const DEFERRAL_ESCALATION_CAP = DEFAULT_DEFERRAL_ESCALATION_CAP; // not-ready deferrals before a stuck pane escalates (#42)
   const PUSH_FAILURE_DEMOTION_CAP = DEFAULT_PUSH_FAILURE_DEMOTION_CAP; // failed pushes of one row before it goes poll-only (#70)
   // Deliveries currently being attempted. Read by the retire-drain (Task 9) and the
@@ -837,16 +880,34 @@ if (import.meta.main) {
     if (row.delivery_state === "delivering") {
       if (!reclaimIfExpired(db, row.id, now)) return null; // someone else owns it
     }
+    const candidates = config.coalesce_pushes
+      ? releasableQueuedPrefix(selectPendingForPush.all(toId, DEFAULT_COALESCE_MAX_COUNT) as Message[])
+      : [row];
+    const coalesced = config.coalesce_pushes
+      ? formatCoalescedPeerPaste(candidates, DEFAULT_COALESCE_MAX_COUNT, DEFAULT_COALESCE_MAX_BYTES)
+      : null;
+    const rows = coalesced ? candidates.slice(0, coalesced.count) : [row];
+    const text = coalesced?.text ?? formatPeerMessage(row);
     const token = generateLeaseToken();
-    if (!claimForDelivery(db, row.id, now, LEASE_MS, token)) return null;
+    const claimBatch = db.transaction((batch: Message[]) => {
+      for (const message of batch) {
+        if (!claimForDelivery(db, message.id, now, LEASE_MS, token)) {
+          throw new Error(`message #${message.id} was claimed concurrently`);
+        }
+      }
+    });
+    try {
+      claimBatch(rows);
+    } catch {
+      return null;
+    }
 
     recipientsInFlight.add(toId);
-    activeRowIds.add(row.id);
+    for (const message of rows) activeRowIds.add(message.id);
     inFlightDeliveries++;
     let deferredThisAttempt = false;
     let faultedThisAttempt = false;
     try {
-      const text = formatPeerMessage(row);
       // deliverViaTmux probes the pane before injecting: if its foreground process is a bare
       // shell rather than a live Claude session, it skips the inject and returns false, so the
       // row stays queued instead of pasting into a shell. That catches the outlived-pane case
@@ -880,15 +941,31 @@ if (import.meta.main) {
       // requeuing on mere heartbeat age would redeliver the same message. If the peer is gone,
       // leave the row queued; cleanStalePeers drops it honestly when it reaps the dead pid, and
       // retention prune bounds an orphan.
-      if (ok && peerConfirmable(toId) && confirmDelivered(db, row.id, token)) {
+      const confirmBatch = db.transaction((batch: Message[]) => {
+        for (const message of batch) {
+          if (!confirmDelivered(db, message.id, token)) {
+            throw new Error(`message #${message.id} lost its delivery lease`);
+          }
+        }
+      });
+      let confirmed = false;
+      if (ok && peerConfirmable(toId)) {
+        try {
+          confirmBatch(rows);
+          confirmed = true;
+        } catch {
+          confirmed = false;
+        }
+      }
+      if (confirmed) {
         deferralStreaks.delete(toId);   // delivered: the pane is healthy, clear any streak
-        resetPushFailures(db, row.id);  // and the row's failed-push run ends here (#70)
+        for (const message of rows) resetPushFailures(db, message.id);
         return "accepted";
       }
       // Any non-deferred miss (send failed, peer died mid-send) also breaks the not-ready run:
       // only an unbroken streak of shell deferrals should accrue toward the stuck-pane escalation.
       if (!deferredThisAttempt) deferralStreaks.delete(toId);
-      releaseToQueued(db, row.id, token);
+      for (const message of rows) releaseToQueued(db, message.id, token);
       // A send that RAN and missed (send-keys exited non-zero) is the #70 case: the row returns to
       // queued still pushable, so the next heartbeat retries it and the doorbell's withhold stays
       // shut on the poll-only mail behind it. Count it, and once the run reaches the cap demote the
@@ -899,15 +976,18 @@ if (import.meta.main) {
       // this streak exists to survive), and a peer that died mid-send is handled by the dead-pid
       // sweep, not here.
       if (countsAsPushFailure({ ok, deferred: deferredThisAttempt, faulted: faultedThisAttempt })) {
+        // Charge one failed paste to its head only. Charging every batched row would make the
+        // demotion threshold depend on batch width; notePushFailure already demotes the recipient's
+        // complete queued pushable backlog when that head reaches the cap.
         notePushFailure(row);
       }
       return "queued";
     } catch {
       deferralStreaks.delete(toId);   // a spawn fault is not a readiness deferral
-      releaseToQueued(db, row.id, token);
+      for (const message of rows) releaseToQueued(db, message.id, token);
       return "queued";
     } finally {
-      activeRowIds.delete(row.id);
+      for (const message of rows) activeRowIds.delete(message.id);
       recipientsInFlight.delete(toId);
       inFlightDeliveries--;
       // The lease has resolved (confirmed or requeued above). If a teardown deferred this
@@ -1409,7 +1489,7 @@ if (import.meta.main) {
               }
             });
             if (drained === MAX_HEARTBEAT_DRAIN) {
-              console.error(`[claude-peers broker] heartbeat drain hit the ${MAX_HEARTBEAT_DRAIN}-message cap for ${body.id}; backlog continues next heartbeat`);
+              console.error(`[claude-peers broker] heartbeat drain hit the ${MAX_HEARTBEAT_DRAIN}-attempt cap for ${body.id}; backlog continues next heartbeat`);
             }
             return Response.json({ ok: true });
           }
