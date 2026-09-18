@@ -45,9 +45,9 @@ Replace `~/claude-peers-mcp` with wherever you cloned it.
 
 ### 3. Run Claude Code (use tmux for live delivery)
 
-Start Claude Code normally. The first session launches the broker automatically. If `~/.claude-peers.json` does not exist and `CLAUDE_PEERS_CONFIG` is unset, claude-peers uses a loopback-only single-host default on port `7899`, with no remote siblings. No config file or channel flag is needed for this path.
+Start Claude Code normally. The first session launches the broker automatically. If `~/.claude-peers.json` does not exist and `CLAUDE_PEERS_CONFIG` is unset, claude-peers uses a loopback-only single-host default on port `7899`, with no remote siblings. No config file is needed for this path.
 
-[Claude Code channels](https://code.claude.com/docs/en/channels-reference) are an optional research-preview adapter with organization-level availability controls. They are not required for stdio MCP, tmux push, or polling, and this project does not treat them as a portable delivery guarantee.
+[Claude Code channels](https://code.claude.com/docs/en/channels-reference) are a research-preview Claude Code feature with organization-level availability controls. This package has no channel adapter, so stdio MCP, tmux push, and polling are the delivery paths; channels are unsupported/planned and are not a portable delivery guarantee.
 
 ```bash
 claude
@@ -253,7 +253,7 @@ For a single host, you can omit `~/.claude-peers.json` and leave `CLAUDE_PEERS_C
 | `CLAUDE_PEERS_DB`             | `~/.claude-peers.db` | SQLite database path. Overrides the config file's `db_path`.                            |
 | `CLAUDE_PEERS_IDLE_EXIT_MS`   | `0` (disabled)       | If `> 0`, an idle broker with no peers self-exits after this many ms. The auto-launched broker sets 10 min so it reaps itself; a supervised (systemd) broker leaves it `0` so it never restart-loops. |
 | `CLAUDE_PEERS_ALLOW_UNSIGNED` | unset (`0`)          | Upgrade-window grace for rolling a live broker to v3. When `1`, the broker accepts a missing token only for a pre-v3 NULL-token peer row; a wrong token still `401`s. See [Upgrading a live broker to v3](#upgrading-a-live-broker-to-v3). Leave unset on steady-state brokers. |
-| `CLAUDE_PEERS_PORT`           | `7899`               | CLI-only fallback when no config file supplies a port. The broker and MCP server use the loaded config, whose zero-config default is `7899`. |
+| `CLAUDE_PEERS_PORT`           | `7899`               | CLI-only. `cli.ts` consults it only when config loading throws and config is null. The normal zero-config default remains port `7899`. The broker and MCP server use the loaded config. |
 
 ## Requirements
 

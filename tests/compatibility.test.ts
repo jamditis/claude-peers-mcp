@@ -29,6 +29,23 @@ describe("MCP compatibility contract", () => {
       .toContain("reply with claude-peers MCP tool: send_message");
   });
 
+  it("classifies Claude Code channels as unsupported/planned because no adapter ships", () => {
+    const compatibility = readFileSync(new URL("../docs/compatibility.md", import.meta.url), "utf8");
+    expect(compatibility).toMatch(/Claude Code channels \| Unsupported\/planned/i);
+    expect(compatibility.toLowerCase()).toContain("this package has no channel adapter");
+    const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
+    expect(readme.toLowerCase()).toContain("this package has no channel adapter");
+    expect(readme.toLowerCase()).toContain("unsupported/planned");
+    expect(readme.toLowerCase()).not.toContain("optional research-preview adapter");
+  });
+
+  it("documents CLAUDE_PEERS_PORT as a CLI fallback only after config loading throws", () => {
+    const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
+    expect(readme).toContain("`CLAUDE_PEERS_PORT`");
+    expect(readme).toContain("cli.ts` consults it only when config loading throws and config is null");
+    expect(readme).toContain("The normal zero-config default remains port `7899`");
+  });
+
   it("pins tool names and input schema shapes", () => {
     expect(MCP_TOOLS.map(({ name, inputSchema }) => ({
       name,

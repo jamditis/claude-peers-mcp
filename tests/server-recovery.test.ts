@@ -40,6 +40,26 @@ async function retireBroker(): Promise<void> {
   await waitForBroker(false);
 }
 
+// Bun's rmSync does not honor Node's maxRetries. On Windows the retired
+// broker can keep SQLite handles locked after /health has already failed,
+// so the cleanup has to wait out EBUSY itself.
+async function removeWorkDir(dir: string): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      if (code !== "EBUSY" && code !== "EPERM" && code !== "ENOTEMPTY") throw error;
+      lastError = error;
+      await Bun.sleep(100);
+    }
+  }
+  throw lastError;
+}
+
 test("a live MCP server recovers after its broker exits", async () => {
   const workDir = mkdtempSync(join(tmpdir(), "claude-peers-recovery-"));
   const configPath = join(workDir, "config.json");
@@ -263,11 +283,6 @@ test("a live MCP server recovers after its broker exits", async () => {
   } finally {
     await client.close().catch(() => {});
     await retireBroker().catch(() => {});
-    rmSync(workDir, {
-      recursive: true,
-      force: true,
-      maxRetries: 20,
-      retryDelay: 50,
-    });
+    await removeWorkDir(workDir);
   }
-}, 20_000);
+}, 30_000);
