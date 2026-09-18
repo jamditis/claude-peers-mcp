@@ -595,7 +595,9 @@ function formatPeerMessageBody(msg: { id: number; from_id: string; text: string;
   const text = stripControl(msg.text);
   const urgency = msg.urgency ?? "interrupt";
   const tag = urgency === "fyi" ? ` fyi` : "";
-  const hint = urgency === "interrupt" ? `  (reply: send_message to_id="${from}")` : "";
+  const hint = urgency === "interrupt"
+    ? `  (reply with claude-peers MCP tool: send_message to_id="${from}")`
+    : "";
   return `[peer ${from} #${msg.id}${tag}] ${text}${hint}`;
 }
 

@@ -593,7 +593,7 @@ describe("formatPeerMessage", () => {
     expect(out.startsWith(PASTE_START)).toBe(true);
     expect(out.endsWith(PASTE_END)).toBe(true);
     expect(out).toContain("[peer bet-abc #7] ping");
-    expect(out).toContain('(reply: send_message to_id="bet-abc")');
+    expect(out).toContain('(reply with claude-peers MCP tool: send_message to_id="bet-abc")');
   });
   it("keeps embedded newlines inside the paste wrap", () => {
     const out = formatPeerMessage({ id: 1, from_id: "x", text: "a\nb" });
@@ -617,12 +617,12 @@ describe("formatPeerMessage", () => {
   it("omits the reply hint for normal urgency (the system prompt already explains replying)", () => {
     const out = formatPeerMessage({ id: 9, from_id: "x", text: "hi", urgency: "normal" });
     expect(out).toContain("[peer x #9] hi");
-    expect(out).not.toContain("reply: send_message");
+    expect(out).not.toContain("reply with claude-peers MCP tool");
   });
   it("tags fyi and omits the hint — no reply is expected", () => {
     const out = formatPeerMessage({ id: 9, from_id: "x", text: "hi", urgency: "fyi" });
     expect(out).toContain("[peer x #9 fyi] hi");
-    expect(out).not.toContain("reply: send_message");
+    expect(out).not.toContain("reply with claude-peers MCP tool");
   });
   it("strips the C1 single-byte CSI (0x9b) so it cannot stand in for ESC[ paste-END", () => {
     // 0x9b is CSI; on an 8-bit-clean terminal "\x9b201~" closes bracketed paste just
@@ -647,7 +647,9 @@ describe("formatCoalescedPeerPaste", () => {
     expect(batch?.text.split(PASTE_START).length).toBe(2);
     expect(batch?.text.split(PASTE_END).length).toBe(2);
     for (const id of [41, 42, 43]) expect(batch?.text).toContain(`#${id}`);
-    expect(batch?.text).toContain('reply: send_message to_id="alice"');
+    expect(batch?.text).toContain(
+      'reply with claude-peers MCP tool: send_message to_id="alice"',
+    );
   });
 
   it("stops at the count bound", () => {

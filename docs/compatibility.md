@@ -100,7 +100,7 @@ Urgency changes the transport path:
 | Local peer without tmux | Queue for `check_messages`; the doorbell can wake an attached harness. |
 | Remote peer with the default floor | Queue on the remote broker as poll-only. |
 | Remote peer with remote push enabled | The remote broker can push when due; the sending broker never types into a pane on another host. |
-| Channel or other transport | Experimental until it has its own delivery-state and mixed-version tests. |
+| Channel or other transport | Unsupported/planned. This package has no channel adapter, so there is no channel delivery path to test. |
 
 ### Remote urgency during old-broker upgrades
 
@@ -158,12 +158,14 @@ package release when the tested rolling path preserves existing behavior.
 | Surface | Beta status | Evidence and limit |
 | --- | --- | --- |
 | Bun | Supported on the current stable release used by CI | CI follows `latest`; a minimum version is not yet pinned. |
+| Single-host setup | Supported without a config file | With no default file and no `CLAUDE_PEERS_CONFIG`, startup uses a loopback-only default on port `7899`. A present or explicitly selected config must be valid. |
 | Ubuntu | Supported | Full typecheck, lint, unit, integration, and broker tests run on `ubuntu-latest`. |
 | Windows | Partial | Typecheck, lint, and platform-independent tests run on `windows-latest`. POSIX tmux and shell-stub integration tests skip. |
 | macOS | Best effort | The code uses POSIX paths for tmux delivery, but no macOS CI or release test exists. |
 | tmux | Supported push transport on POSIX systems | Exact minimum and maximum tmux versions are not yet release-pinned. |
 | Headless or non-tmux client | Supported polling transport | Uses `check_messages`; the doorbell is an optional wake signal. |
 | Claude Code over stdio MCP | Supported beta client | This is the client exercised by the repository and deployment. |
+| Claude Code channels | Unsupported/planned | This package has no channel adapter. Channels remain a research-preview Claude Code feature with organization-level availability controls and are not a portable delivery guarantee. |
 | Other MCP clients | Experimental | Tool discovery can work over stdio, but cross-client versions and lifecycle behavior are not yet in the test matrix. |
 | Federation | Experimental security boundary | Source-IP allowlists protect broker routes, but broker-to-broker authentication remains a release gate in issue #80. |
 
