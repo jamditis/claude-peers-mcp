@@ -544,6 +544,8 @@ export function reclaimLeaklessDelivering(db: Database): number {
 
 export const PASTE_START = "\x1b[200~";
 export const PASTE_END = "\x1b[201~";
+export const DEFAULT_COALESCE_MAX_COUNT = 8;
+export const DEFAULT_COALESCE_MAX_BYTES = 64 * 1024;
 
 export interface CoalescedPeerPaste {
   text: string;
@@ -1052,8 +1054,8 @@ export async function deliverViaTmux(
 
 export interface DeliverableRow {
   id: number; from_id: string; to_id: string; text: string; sent_at: string;
-  delivery_state: string; lease_expires_at: number | null; lease_token: string | null;
-  urgency: string; push_after: number | null;
+  delivery_state: DeliveryState; lease_expires_at: number | null; lease_token: string | null;
+  urgency: Urgency; push_after: number | null;
 }
 
 /**
