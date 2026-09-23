@@ -23,6 +23,8 @@ import type { Database } from "bun:sqlite";
 import { HOLDERLESS_DELIVERING, type PaneReadiness } from "../delivery.ts";
 import { displaySessionName } from "./format-peers.ts";
 
+const stopBrokerCommand = "`bunx --no-install claude-peers-mcp cli kill-broker` from the directory whose node_modules contains the pinned package, or `bun cli.ts kill-broker` from a checkout";
+
 /** Severity of a single check. `fail` means broken now; `warn` means degraded or at risk. */
 export type DoctorSeverity = "ok" | "warn" | "fail";
 
@@ -690,7 +692,7 @@ export function checkBroker(b: BrokerProbeFacts, expectedProtocol: number): Doct
     return [check(
       "broker.process", "Broker process", "BROKER_UNREACHABLE", "fail",
       `No broker answered ${b.url}/health${b.error ? ` (${b.error})` : ""}.`,
-      "Start any MCP session (the server auto-launches the broker), or run `bun broker.ts` directly. Queue state below was read from SQLite instead.",
+      "Start any MCP session; its server starts the broker. Queue state below was read from SQLite instead.",
     )];
   }
   const checks: DoctorCheck[] = [];
@@ -702,13 +704,13 @@ export function checkBroker(b: BrokerProbeFacts, expectedProtocol: number): Doct
     checks.push(check(
       "broker.process", "Broker process", "BROKER_HEALTH_ERROR", "fail",
       `A process is answering at ${b.url} but /health did not: ${b.error}.`,
-      "The port is taken by a broken or foreign process. Check the broker log; if the port belongs to something else, free it, otherwise `bun cli.ts kill-broker` and let the next session relaunch.",
+      `The port is taken by a broken or foreign process. Check the broker log; if the port belongs to something else, free it, otherwise run ${stopBrokerCommand} and let the next session relaunch.`,
     ));
   } else if (b.status !== "ok") {
     checks.push(check(
       "broker.process", "Broker process", "BROKER_UNHEALTHY", "warn",
       `Broker answered ${b.url} with status "${b.status ?? "none"}" (${counts}).`,
-      "Check the broker log; restart it with `bun cli.ts kill-broker` and let the next session relaunch it.",
+      `Check the broker log; restart it with ${stopBrokerCommand} and let the next session relaunch it.`,
     ));
   } else {
     checks.push(check(
@@ -721,7 +723,7 @@ export function checkBroker(b: BrokerProbeFacts, expectedProtocol: number): Doct
     checks.push(check(
       "broker.serving", "Peer operations", "BROKER_NOT_SERVING", "fail",
       `The broker process is alive but a peer read failed${b.serve_error ? `: ${b.serve_error}` : ""}.`,
-      "The process is up but cannot serve peers — usually a bad or locked SQLite store. Check store.integrity below, then `bun cli.ts kill-broker`.",
+      `The process is up but cannot serve peers — usually a bad or locked SQLite store. Check store.integrity below, then run ${stopBrokerCommand}.`,
     ));
   } else if (b.serves_peers === true) {
     checks.push(check("broker.serving", "Peer operations", "BROKER_SERVING", "ok", "/list-peers answered."));
@@ -738,13 +740,13 @@ export function checkBroker(b: BrokerProbeFacts, expectedProtocol: number): Doct
     checks.push(check(
       "broker.protocol", "Protocol version", "BROKER_PROTOCOL_OUTDATED", "warn",
       `Broker speaks protocol ${v}; this build expects ${expectedProtocol}. Newer features (urgency tiers, /peek, /heartbeat-probe) may be ignored.`,
-      "Run `bun cli.ts kill-broker`; the next MCP session relaunches the current broker.",
+      `Run ${stopBrokerCommand}; the next MCP session relaunches the current broker.`,
     ));
   } else if (v > expectedProtocol) {
     checks.push(check(
       "broker.protocol", "Protocol version", "BROKER_PROTOCOL_AHEAD", "warn",
       `Broker speaks protocol ${v}; this CLI build expects ${expectedProtocol}.`,
-      "Update this checkout — the running broker is newer than the CLI.",
+      "Update this package or checkout; the running broker is newer than the CLI.",
     ));
   } else {
     checks.push(check("broker.protocol", "Protocol version", "BROKER_PROTOCOL_OK", "ok", `Protocol ${v}.`));
@@ -774,7 +776,7 @@ export function checkStore(s: StoreFacts): DoctorCheck[] {
       return [check(
         "store.integrity", "Message store", "STORE_CORRUPT", "fail",
         `PRAGMA quick_check on ${shown} reported: ${s.integrity_detail}.`,
-        "Stop the broker (`bun cli.ts kill-broker`), back up the file, then recover it with sqlite3 .recover or move it aside to start clean (queued mail is lost).",
+        `Stop the broker with ${stopBrokerCommand}, back up the file, then recover it with sqlite3 .recover or move it aside to start clean (queued mail is lost).`,
       )];
     default:
       return [check("store.integrity", "Message store", "STORE_OK", "ok", `${shown}: quick_check ok.`)];
@@ -1029,7 +1031,7 @@ export function checkQueues(
     checks.push(check(
       "queue.leases", "Delivery leases", "QUEUE_LEASE_STALLED", "fail",
       `${s.stalled_leases.length} row(s) stuck in delivering (${holderless} holderless — a missing lease column, so no attempt owns them; oldest expired ${formatMs(oldest)} ago). They block the recipient's queued prefix.`,
-      "Restart the broker (`bun cli.ts kill-broker`): it requeues orphaned delivering rows on start and its sweep reclaims holderless ones. A holderless row with a future expiry never times out on its own.",
+      `Restart the broker with ${stopBrokerCommand}: it requeues orphaned delivering rows on start and its sweep reclaims holderless ones. A holderless row with a future expiry never times out on its own.`,
     ));
   } else {
     checks.push(check("queue.leases", "Delivery leases", "QUEUE_LEASE_OK", "ok", "No stalled leases."));

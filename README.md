@@ -6,6 +6,8 @@ Work tracking: [claude-peers-mcp Project](https://github.com/users/jamditis/proj
 
 Let your Claude Code instances find each other and talk. When you're running several sessions across different projects — or across several machines — any Claude can discover the others and send messages that get typed straight into the recipient's session.
 
+Requires Bun. Node.js cannot run the broker or MCP server. The npm package is still private; use the source checkout until the public beta is released.
+
 ```
   Terminal 1 (poker-engine)          Terminal 2 (eel)
   ┌───────────────────────┐          ┌──────────────────────┐

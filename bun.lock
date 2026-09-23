@@ -3,15 +3,13 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "claude-peers",
+      "name": "claude-peers-mcp",
       "dependencies": {
         "@modelcontextprotocol/sdk": "^1.27.1",
       },
       "devDependencies": {
         "@biomejs/biome": "2.4.16",
         "@types/bun": "latest",
-      },
-      "peerDependencies": {
         "typescript": "^5",
       },
     },

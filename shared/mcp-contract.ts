@@ -65,7 +65,7 @@ export const MCP_TOOLS = [
   {
     name: "peek_messages",
     description:
-      "Report your own peer ID and how much mail is waiting, without consuming it (check_messages stays the only way to read and clear messages). Returns your id, the count of pending messages, and the highest pending message id. Use it to learn your id so you can arm the background doorbell watcher (`bun cli.ts doorbell <your-id>`), which wakes a non-tmux session within seconds of new mail instead of waiting for a manual check.",
+      "Report your own peer ID and how much mail is waiting, without consuming it (check_messages stays the only way to read and clear messages). Returns your id, the count of pending messages, and the highest pending message id. Use it to learn your id so you can arm the background doorbell watcher (`bunx --no-install claude-peers-mcp cli doorbell <your-id>` from the directory whose node_modules contains the package, as shown in your MCP configuration, or `bun cli.ts doorbell <your-id>` from a checkout), which wakes a non-tmux session within seconds of new mail instead of waiting for a manual check.",
     inputSchema: {
       type: "object" as const,
       properties: {},
