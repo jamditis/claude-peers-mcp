@@ -88,14 +88,14 @@ async function ensureBroker(): Promise<void> {
       if (!res.ok) retireRefused = true;
     } catch { /* it may exit before responding; confirm via the wait loop below */ }
     if (retireRefused) {
-      throw new Error("The running claude-peers broker predates this version and cannot self-retire; run `bunx claude-peers-mcp@<version> cli kill-broker` with the configured version (or `bun cli.ts kill-broker` from a checkout) and retry.");
+      throw new Error("The running claude-peers broker predates this version and cannot self-retire; run `bunx --no-install claude-peers-mcp cli kill-broker` from the directory whose node_modules contains the pinned package (or `bun cli.ts kill-broker` from a checkout) and retry.");
     }
     let freed = false;
     for (let i = 0; i < 25; i++) {
       await new Promise((r) => setTimeout(r, 200));
       if (!(await isBrokerAlive())) { freed = true; break; }
     }
-    if (!freed) throw new Error("A stale claude-peers broker is running; run `bunx claude-peers-mcp@<version> cli kill-broker` with the configured version (or `bun cli.ts kill-broker` from a checkout) and retry.");
+    if (!freed) throw new Error("A stale claude-peers broker is running; run `bunx --no-install claude-peers-mcp cli kill-broker` from the directory whose node_modules contains the pinned package (or `bun cli.ts kill-broker` from a checkout) and retry.");
   }
 
   log("Starting broker daemon...");

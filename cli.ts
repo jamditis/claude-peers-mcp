@@ -8,12 +8,12 @@
  * Use `bun cli.ts <command>` from a source checkout.
  *
  * Usage:
- *   bunx claude-peers-mcp@<version> cli status          — Show broker status and all peers
- *   bunx claude-peers-mcp@<version> cli peers           — List all peers
- *   bunx claude-peers-mcp@<version> cli send <id> [--urgency <tier>] <msg> — Send a message to a peer
- *   bunx claude-peers-mcp@<version> cli doctor [--json] — Diagnose broker, backend, and queue health
- *   bunx claude-peers-mcp@<version> cli ping-siblings   — Ping all sibling brokers and report latency
- *   bunx claude-peers-mcp@<version> cli kill-broker     — Stop the broker daemon
+ *   bunx --no-install claude-peers-mcp cli status          — Show broker status and all peers
+ *   bunx --no-install claude-peers-mcp cli peers           — List all peers
+ *   bunx --no-install claude-peers-mcp cli send <id> [--urgency <tier>] <msg> — Send a message to a peer
+ *   bunx --no-install claude-peers-mcp cli doctor [--json] — Diagnose broker, backend, and queue health
+ *   bunx --no-install claude-peers-mcp cli ping-siblings   — Ping all sibling brokers and report latency
+ *   bunx --no-install claude-peers-mcp cli kill-broker     — Stop the broker daemon
  */
 
 import { Database } from "bun:sqlite";
@@ -175,7 +175,7 @@ switch (cmd) {
     }
     const msg = rest.join(" ");
     if (!toId || !msg) {
-      console.error("Usage: bunx claude-peers-mcp@<version> cli send <peer-id> [--urgency interrupt|normal|fyi] <message> (or bun cli.ts send from a checkout)");
+      console.error("Usage: bunx --no-install claude-peers-mcp cli send <peer-id> [--urgency interrupt|normal|fyi] <message> (or bun cli.ts send from a checkout)");
       process.exit(1);
     }
     // A broker older than the urgency tiers ignores the field and keeps its old
@@ -497,7 +497,7 @@ switch (cmd) {
       else if (!id && a) id = a;
     }
     if (!id) {
-      console.error("Usage: bunx claude-peers-mcp@<version> cli doorbell <peer-id> [--since <id>] [--poll-ms <ms>] [--timeout <sec>] [--watch] (or bun cli.ts doorbell from a checkout)");
+      console.error("Usage: bunx --no-install claude-peers-mcp cli doorbell <peer-id> [--since <id>] [--poll-ms <ms>] [--timeout <sec>] [--watch] (or bun cli.ts doorbell from a checkout)");
       process.exit(1);
     }
     if (!config) {
@@ -573,9 +573,9 @@ switch (cmd) {
     console.log(`claude-peers CLI
 
 Usage:
-  Installed package: bunx claude-peers-mcp@<version> cli <command>
+  Installed package: bunx --no-install claude-peers-mcp cli <command>
   Source checkout: bun cli.ts <command>
-  Use the version pinned in your MCP configuration.
+  Run from the directory whose node_modules contains the pinned package.
 
 Commands:
   status          Show broker status and all peers

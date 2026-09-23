@@ -23,7 +23,7 @@ import type { Database } from "bun:sqlite";
 import { HOLDERLESS_DELIVERING, type PaneReadiness } from "../delivery.ts";
 import { displaySessionName } from "./format-peers.ts";
 
-const stopBrokerCommand = "`bunx claude-peers-mcp@<version> cli kill-broker` with the configured version, or `bun cli.ts kill-broker` from a checkout";
+const stopBrokerCommand = "`bunx --no-install claude-peers-mcp cli kill-broker` from the directory whose node_modules contains the pinned package, or `bun cli.ts kill-broker` from a checkout";
 
 /** Severity of a single check. `fail` means broken now; `warn` means degraded or at risk. */
 export type DoctorSeverity = "ok" | "warn" | "fail";
