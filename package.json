@@ -1,11 +1,31 @@
 {
-  "name": "claude-peers",
+  "name": "claude-peers-mcp",
   "version": "0.3.0",
   "description": "Peer discovery and messaging for Claude Code instances",
   "license": "MIT",
   "module": "index.ts",
   "type": "module",
   "private": true,
+  "bin": {
+    "claude-peers-mcp": "bin/claude-peers-mcp.ts"
+  },
+  "files": [
+    "bin/",
+    "broker.ts",
+    "cli.ts",
+    "delivery.ts",
+    "index.ts",
+    "server.ts",
+    "shared/",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jamditis/claude-peers-mcp.git"
+  },
   "scripts": {
     "broker": "bun broker.ts",
     "server": "bun server.ts",
@@ -15,9 +35,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.16",
-    "@types/bun": "latest"
-  },
-  "peerDependencies": {
+    "@types/bun": "latest",
     "typescript": "^5"
   },
   "dependencies": {

@@ -5,13 +5,15 @@
  *
  * Utility commands for managing the broker and inspecting peers.
  *
+ * Use `bun cli.ts <command>` from a source checkout.
+ *
  * Usage:
- *   bun cli.ts status          — Show broker status and all peers
- *   bun cli.ts peers           — List all peers
- *   bun cli.ts send <id> [--urgency <tier>] <msg> — Send a message to a peer
- *   bun cli.ts doctor [--json] — Diagnose broker, backend, and queue health
- *   bun cli.ts ping-siblings   — Ping all sibling brokers and report latency
- *   bun cli.ts kill-broker     — Stop the broker daemon
+ *   bunx claude-peers-mcp@<version> cli status          — Show broker status and all peers
+ *   bunx claude-peers-mcp@<version> cli peers           — List all peers
+ *   bunx claude-peers-mcp@<version> cli send <id> [--urgency <tier>] <msg> — Send a message to a peer
+ *   bunx claude-peers-mcp@<version> cli doctor [--json] — Diagnose broker, backend, and queue health
+ *   bunx claude-peers-mcp@<version> cli ping-siblings   — Ping all sibling brokers and report latency
+ *   bunx claude-peers-mcp@<version> cli kill-broker     — Stop the broker daemon
  */
 
 import { Database } from "bun:sqlite";
@@ -173,7 +175,7 @@ switch (cmd) {
     }
     const msg = rest.join(" ");
     if (!toId || !msg) {
-      console.error("Usage: bun cli.ts send <peer-id> [--urgency interrupt|normal|fyi] <message>");
+      console.error("Usage: bunx claude-peers-mcp@<version> cli send <peer-id> [--urgency interrupt|normal|fyi] <message> (or bun cli.ts send from a checkout)");
       process.exit(1);
     }
     // A broker older than the urgency tiers ignores the field and keeps its old
@@ -495,7 +497,7 @@ switch (cmd) {
       else if (!id && a) id = a;
     }
     if (!id) {
-      console.error("Usage: bun cli.ts doorbell <peer-id> [--since <id>] [--poll-ms <ms>] [--timeout <sec>] [--watch]");
+      console.error("Usage: bunx claude-peers-mcp@<version> cli doorbell <peer-id> [--since <id>] [--poll-ms <ms>] [--timeout <sec>] [--watch] (or bun cli.ts doorbell from a checkout)");
       process.exit(1);
     }
     if (!config) {
@@ -571,11 +573,16 @@ switch (cmd) {
     console.log(`claude-peers CLI
 
 Usage:
-  bun cli.ts status          Show broker status and all peers
-  bun cli.ts peers           List all peers
-  bun cli.ts send <id> [--urgency interrupt|normal|fyi] <msg> Send a message to a peer
-  bun cli.ts doorbell <id> [--since <id>] [--timeout <sec>] [--watch] Wait until <id> has mail, then exit (near-real-time wake for non-tmux sessions)
-  bun cli.ts doctor [--json]  Diagnose broker, backend, and queue health (exit 0 ok, 1 warnings, 2 failures)
-  bun cli.ts ping-siblings   Ping all sibling brokers and report latency
-  bun cli.ts kill-broker     Stop the broker daemon`);
+  Installed package: bunx claude-peers-mcp@<version> cli <command>
+  Source checkout: bun cli.ts <command>
+  Use the version pinned in your MCP configuration.
+
+Commands:
+  status          Show broker status and all peers
+  peers           List peers
+  send <id> [--urgency interrupt|normal|fyi] <msg>  Send a message to a peer
+  doorbell <id> [--since <id>] [--timeout <sec>] [--watch]  Wait for mail that will not push
+  doctor [--json]  Diagnose broker, backend, and queue health (exit 0 ok, 1 warnings, 2 failures)
+  ping-siblings   Ping each sibling broker and report latency
+  kill-broker     Stop the broker daemon`);
 }
