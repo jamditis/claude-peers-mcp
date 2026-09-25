@@ -165,7 +165,7 @@ package release when the tested rolling path preserves existing behavior.
 | tmux | Supported push transport on POSIX systems | Exact minimum and maximum tmux versions are not yet release-pinned. |
 | Headless or non-tmux client | Supported polling transport | Uses `check_messages`; the doorbell is an optional wake signal. |
 | Claude Code over stdio MCP | Supported beta client | This is the client exercised by the repository and deployment. |
-| Codex CLI over stdio MCP | Supported by manual Linux use | A live Codex CLI session exercised peer discovery on 2026-09-25; no Codex harness test runs in CI. |
+| Codex CLI over stdio MCP | Peer discovery exercised on Linux | A live Codex CLI session exercised peer discovery on 2026-09-25; send and poll were not exercised in that harness. |
 | Claude Code channels | Unsupported/planned | This package has no channel adapter. Channels remain a research-preview Claude Code feature with organization-level availability controls and are not a portable delivery guarantee. |
 | Other MCP clients | Generic stdio client tested on Ubuntu | The round trip in `tests/stdio-client.test.ts` covers two SDK clients; named non-Claude harnesses still need their own tests. |
 | Federation | Experimental security boundary | Source-IP allowlists protect broker routes, but broker-to-broker authentication remains a release gate in issue #80. |
@@ -175,12 +175,12 @@ row with a supported tier or an explicit out-of-scope statement.
 
 ## Client and delivery matrix
 
-**Supported** means exercised on the named platform, either in CI or in a live session as stated in the row. **Expected to work** means the protocol path exists but the client or platform has not been exercised. **Unsupported** names a known missing path. The platform rows above summarize beta evidence; this matrix separates client and delivery paths. Federation has the separate limits above.
+**Supported** means the named path was exercised on that client and platform, either in CI or in a live session as stated in the row. **Expected to work** means the protocol path exists but that client and delivery path have not been exercised together. **Unsupported** names a known missing path. The platform rows above summarize beta evidence; this matrix separates client and delivery paths. Federation has the separate limits above.
 
 | Client | Platform | Status | Tmux push | Doorbell watcher | `check_messages` | Limit |
 | --- | --- | --- | --- | --- | --- | --- |
 | Claude Code | Linux | Supported | Supported in a live tmux pane | Manual watcher supported | Supported | `fyi` and default-floored remote mail require polling. |
-| Codex CLI | Linux | Supported (manual) | Expected to work in tmux | Manual watcher expected to work | Supported | Peer discovery was exercised in a live Linux session on 2026-09-25; no Codex-specific wake hook or tmux test. |
+| Codex CLI | Linux | Expected to work for messaging | Expected to work in tmux | Manual watcher expected to work | Expected to work | Peer discovery was exercised in a live Linux session on 2026-09-25; Codex send, poll, and tmux delivery were not tested. |
 | Generic MCP stdio client | Ubuntu CI | Supported | Expected to work in tmux | Manual watcher expected to work | Supported | CI exercises two SDK clients without tmux. |
 | Gemini CLI | Linux | Expected to work | Expected to work in tmux | Manual watcher expected to work | Expected to work | No Gemini session has been exercised. |
 | Any client above | macOS | Expected to work | Expected to work in tmux | Manual watcher expected to work | Expected to work | No macOS CI run. |
