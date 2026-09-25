@@ -8,7 +8,7 @@ export const SEND_MESSAGE_TOOL_INPUT_SCHEMA = {
     to_id: {
       type: "string" as const,
       description:
-        "The target Claude Code instance: its peer ID, or the session name shown in list_peers (the handle in parentheses). A name that matches no visible peer, or matches more than one, is rejected with guidance to address by peer ID.",
+        "The target MCP client session: its peer ID, or the session name shown in list_peers (the handle in parentheses). A name that matches no visible peer, or matches more than one, is rejected with guidance to address by peer ID.",
     },
     message: {
       type: "string" as const,
