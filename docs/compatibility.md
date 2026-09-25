@@ -165,12 +165,39 @@ package release when the tested rolling path preserves existing behavior.
 | tmux | Supported push transport on POSIX systems | Exact minimum and maximum tmux versions are not yet release-pinned. |
 | Headless or non-tmux client | Supported polling transport | Uses `check_messages`; the doorbell is an optional wake signal. |
 | Claude Code over stdio MCP | Supported beta client | This is the client exercised by the repository and deployment. |
+| Codex CLI over stdio MCP | Supported by manual Linux use | A live Codex CLI session exercised peer discovery on 2026-09-25; no Codex harness test runs in CI. |
 | Claude Code channels | Unsupported/planned | This package has no channel adapter. Channels remain a research-preview Claude Code feature with organization-level availability controls and are not a portable delivery guarantee. |
-| Other MCP clients | Experimental | Tool discovery can work over stdio, but cross-client versions and lifecycle behavior are not yet in the test matrix. |
+| Other MCP clients | Generic stdio client tested on Ubuntu | The round trip in `tests/stdio-client.test.ts` covers two SDK clients; named non-Claude harnesses still need their own tests. |
 | Federation | Experimental security boundary | Source-IP allowlists protect broker routes, but broker-to-broker authentication remains a release gate in issue #80. |
 
 The 1.0 release notes must replace every partial, best-effort, or experimental
 row with a supported tier or an explicit out-of-scope statement.
+
+## Client and delivery matrix
+
+**Supported** means exercised on the named platform, either in CI or in a live session as stated in the row. **Expected to work** means the protocol path exists but the client or platform has not been exercised. **Unsupported** names a known missing path. The platform rows above summarize beta evidence; this matrix separates client and delivery paths. Federation has the separate limits above.
+
+| Client | Platform | Status | Tmux push | Doorbell watcher | `check_messages` | Limit |
+| --- | --- | --- | --- | --- | --- | --- |
+| Claude Code | Linux | Supported | Supported in a live tmux pane | Manual watcher supported | Supported | `fyi` and default-floored remote mail require polling. |
+| Codex CLI | Linux | Supported (manual) | Expected to work in tmux | Manual watcher expected to work | Supported | Peer discovery was exercised in a live Linux session on 2026-09-25; no Codex-specific wake hook or tmux test. |
+| Generic MCP stdio client | Ubuntu CI | Supported | Expected to work in tmux | Manual watcher expected to work | Supported | CI exercises two SDK clients without tmux. |
+| Gemini CLI | Linux | Expected to work | Expected to work in tmux | Manual watcher expected to work | Expected to work | No Gemini session has been exercised. |
+| Any client above | macOS | Expected to work | Expected to work in tmux | Manual watcher expected to work | Expected to work | No macOS CI run. |
+| Any client above | Native Windows | Expected to work for polling | Unsupported without tmux | Not exercised | Expected to work | Native broker tests run in CI, but [#57](https://github.com/jamditis/claude-peers-mcp/issues/57) records an unresolved Bun SQLite prune fault. The stdio smoke test does not run there. |
+
+The Ubuntu smoke test starts an isolated broker and two minimal MCP SDK clients. It verifies tool and peer discovery, a queued `fyi` send, one read by `check_messages`, and an empty second read. It does not start Claude Code, Codex CLI, or Gemini CLI. Other spec-conforming stdio clients are expected to use the same tools; their lifecycle behavior is unverified.
+
+### Delivery and fallback
+
+- **Tmux push:** A valid `TMUX_PANE` selects the pane; `TMUX` supplies an optional socket path. Without a valid pane ID, the server registers without a push target. The broker checks that the pane foreground is not a bare shell before injecting `[peer …]` text. That check cannot prove a given client's prompt is ready. `interrupt` is due immediately, `normal` waits for its configured deadline, and `fyi` never pushes.
+- **Doorbell watcher:** `bun cli.ts doorbell <peer-id>` signals pending mail that will not push. Learn the ID with `peek_messages`, arm the watcher, then call `check_messages`. Re-arm before the next check. The watcher does not read or clear mail; the client must run it or poll at task boundaries.
+- **No tmux or watcher:** Messages stay queued. `check_messages` reads and clears them; `peek_messages` reports a count without clearing it. There is no automatic wake for a client with neither a pushable pane nor a watcher.
+- **No config file:** With no `CLAUDE_PEERS_CONFIG` and no `~/.claude-peers.json`, the server uses a loopback-only single-host default. An explicitly named missing config file fails at startup. A config file is needed for a different port, identity, or federation setup.
+
+### Client assumptions
+
+The MCP handshake, tools, broker registration, urgency, and polling are client-neutral. Pane discovery and injected text depend on the host terminal and a prompt that accepts pasted text. A friendly session name comes from `CLAUDE_PEERS_SESSION_NAME` or tmux; a client outside tmux can remain unnamed. The server instructions describe peer etiquette, but each client decides whether to follow them, arm a watcher, and poll. There is no MCP notification path that forces an idle client to wake.
 
 ## Security, data, and incidents
 

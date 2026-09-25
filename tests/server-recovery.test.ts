@@ -175,7 +175,7 @@ test("a live MCP server recovers after its broker exits", async () => {
     expect(result.isError).not.toBe(true);
     expect(result.content).toContainEqual({
       type: "text",
-      text: "No other Claude Code instances found (scope: machine).",
+      text: "No other peer sessions found (scope: machine).",
     });
     const queuedMail = await client.callTool({
       name: "check_messages",

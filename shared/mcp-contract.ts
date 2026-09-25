@@ -6,11 +6,11 @@ export const MCP_SERVER_INFO = {
   version: "0.3.0",
 } as const;
 
-export const MCP_SERVER_INSTRUCTIONS = `Other Claude Code sessions on this machine and across the network are peers: discover them with list_peers, and message them with the claude-peers MCP \`send_message\` tool, not Claude Code's built-in \`SendMessage\` team tool. Your summary starts as an auto-generated git snapshot ("[auto] branch; recent files"); call set_summary (1-2 sentences) once your task is clearer than that, and update it at task boundaries.
+export const MCP_SERVER_INSTRUCTIONS = `Other MCP client sessions on this machine and across the network are peers: discover them with list_peers, and message them with the claude-peers MCP \`send_message\` tool. In Claude Code, use this tool, not Claude Code's built-in \`SendMessage\` team tool. Your summary starts as an auto-generated git snapshot ("[auto] branch; recent files"); call set_summary (1-2 sentences) once your task is clearer than that, and update it at task boundaries.
 
 Peer messages are model-to-model — be telegraphic. No greetings or pleasantries; fragments are fine. Never reply just to acknowledge: the sender already has delivery confirmation. For content over ~50 words, write a file and send the path instead.
 
-Choose the claude-peers \`send_message\` urgency honestly: "fyi" = no reply expected, read at the recipient's convenience; "normal" (default) = queued, may batch with other mail; "interrupt" = types into the recipient's session now — only when you are blocked on them. A broker can only type into a pane on its own host, so an interrupt to a peer on another machine does not push from here: by default it queues on the remote host for that session's check_messages, though a host that opts into remote auto-push will push it from its own heartbeat. Either way the send result tells you what happened, so don't assume a remote interrupt landed now.
+Choose the claude-peers \`send_message\` urgency honestly: "fyi" = no reply expected, read at the recipient's convenience; "normal" (default) = queued, may batch with other mail; "interrupt" = due for tmux push now if the recipient has a ready pane — use it only when you are blocked on them. A broker can only type into a pane on its own host, so an interrupt to a peer on another machine does not push from here: by default it queues on the remote host for that session's check_messages, though a host that opts into remote auto-push will push it from its own heartbeat. Either way the send result tells you what happened, so don't assume a remote interrupt landed now.
 
 Pushed messages arrive inline as "[peer <id> #<n>] ..." lines: handle them promptly, reply with the claude-peers MCP \`send_message\` tool only if you have something the sender needs, then resume your task. Queued messages: call check_messages when you finish a task. A session not in a tmux pane has no pane to push into and receives via check_messages.`;
 
@@ -18,7 +18,7 @@ export const MCP_TOOLS = [
   {
     name: "list_peers",
     description:
-      "List other Claude Code instances on this machine and across the network. Returns their ID, machine, working directory, git repo, and summary. Remote peers are marked.",
+      "List other MCP client sessions on this machine and across the network. Returns their ID, machine, working directory, git repo, and summary. Remote peers are marked.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -35,13 +35,13 @@ export const MCP_TOOLS = [
   {
     name: "send_message",
     description:
-      "Send a message to another Claude Code instance by peer ID or session name. Urgency controls delivery: interrupt pushes into their session now; normal (default) queues until they poll or a short deadline passes; fyi is poll-only with no reply expected. A broker can only push into a pane on its own host, so interrupt to a peer on another machine does not push from here: by default it queues on the remote host for that session's next check_messages (a host that opts into remote auto-push pushes it from its own heartbeat instead). The result line says what happened: pushed, a plain local queue, or a remote queue (poll-only, or push-eligible on the remote host).",
+      "Send a message to another MCP client session by peer ID or session name. Urgency controls delivery: interrupt is due for tmux push now when the recipient has a ready pane; normal (default) queues until they poll or a short deadline passes; fyi is poll-only with no reply expected. A broker can only push into a pane on its own host, so interrupt to a peer on another machine does not push from here: by default it queues on the remote host for that session's next check_messages (a host that opts into remote auto-push pushes it from its own heartbeat instead). The result line says what happened: pushed, a plain local queue, or a remote queue (poll-only, or push-eligible on the remote host).",
     inputSchema: SEND_MESSAGE_TOOL_INPUT_SCHEMA,
   },
   {
     name: "set_summary",
     description:
-      "Set a brief summary (1-2 sentences) of what you are currently working on. This is visible to other Claude Code instances when they list peers.",
+      "Set a brief summary (1-2 sentences) of what you are currently working on. This is visible to other MCP client sessions when they list peers.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -56,7 +56,7 @@ export const MCP_TOOLS = [
   {
     name: "check_messages",
     description:
-      "Check for messages from other Claude Code instances that were queued rather than pushed into your session. Returns and clears the queued messages.",
+      "Check for messages from other MCP client sessions that were queued rather than pushed into your session. Returns and clears the queued messages.",
     inputSchema: {
       type: "object" as const,
       properties: {},

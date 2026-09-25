@@ -4,7 +4,7 @@ Work tracking: [claude-peers-mcp Project](https://github.com/users/jamditis/proj
 
 [![CI](https://github.com/jamditis/claude-peers-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/jamditis/claude-peers-mcp/actions/workflows/ci.yml)
 
-Let your Claude Code instances find each other and talk. When you're running several sessions across different projects — or across several machines — any Claude can discover the others and send messages that get typed straight into the recipient's session.
+Let your MCP client sessions find each other and talk. When you run several sessions across projects or machines, each can discover the others and send messages. A tmux session can receive pushed text; other sessions read queued mail through `check_messages`.
 
 Requires Bun. Node.js cannot run the broker or MCP server. The npm package is still private; use the source checkout until the public beta is released.
 
@@ -24,6 +24,8 @@ Requires Bun. Node.js cannot run the broker or MCP server. The npm package is st
 This repository is the source of truth for the reusable broker, protocol, MCP tools, tests, generic configuration, and the planned `claude-peers-mcp` npm package. Operator-specific machine configuration, service overrides, local policy, and version pins belong in a private deployment layer that consumes the package rather than forks the core. Secret values stay in a credential vault.
 
 The accepted ownership and package-consumer rules are recorded in [Decision 0001](docs/decisions/0001-package-and-personal-deployment-boundary.md). The research-backed release sequence and npm gates are tracked in [roadmap #85](https://github.com/jamditis/claude-peers-mcp/issues/85). The [compatibility and support contract](docs/compatibility.md) records the current beta evidence and the rules that 1.0 must freeze.
+
+The [client and delivery matrix](docs/compatibility.md#client-and-delivery-matrix) shows which MCP clients and message paths have been exercised.
 
 ## Quick start
 
@@ -81,7 +83,7 @@ Create a config file only when you need a custom port, identity, database path, 
 
 | Tool             | What it does                                                                                |
 | ---------------- | ------------------------------------------------------------------------------------------- |
-| `list_peers`     | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo`. Repo scope groups the main checkout and all linked worktrees from one Git repository. With `machine` scope, remote peers from federated nodes are included and tagged `[remote]`. A peer's friendly session name, when known, shows as a parenthetical handle on its ID (`bra-abc123 (newsroom)`) so a name a human uses maps to the ID routing needs. |
+| `list_peers`     | Find other MCP client sessions — scoped to `machine`, `directory`, or `repo`. Repo scope groups the main checkout and all linked worktrees from one Git repository. With `machine` scope, remote peers from federated nodes are included and tagged `[remote]`. A peer's friendly session name, when known, shows as a parenthetical handle on its ID (`bra-abc123 (newsroom)`) so a name a human uses maps to the ID routing needs. |
 | `send_message`   | Send a message to another instance by peer ID or session name (a name shared by several peers is rejected with a hint to use the ID). `urgency` picks the delivery tier: `interrupt` pushes into their tmux session now; `normal` (the tool default) queues until they poll or the push deadline passes; `fyi` is poll-only, no reply expected. Cross-machine targets route automatically to the owning broker, but a broker only pushes into panes on its own host, so `interrupt` to a remote peer does not push from the sender: by default it queues on the remote host for that session's `check_messages` (a host that opts into remote auto-push pushes it from its heartbeat instead). The result line distinguishes pushed, a plain local queue, and a remote queue (poll-only vs push-eligible) rather than a bare "queued" (#39). |
 | `set_summary`    | Describe what you're working on (visible to other peers). The summary starts as an auto-generated git snapshot (`[auto] <branch>; recent: <files>`) seeded at registration; this tool overwrites it. |
 | `check_messages` | Read and clear messages that were queued instead of pushed. A poll marks the returned messages delivered, so a second call won't re-return them. |
@@ -261,7 +263,7 @@ For a single host, you can omit `~/.claude-peers.json` and leave `CLAUDE_PEERS_C
 ## Requirements
 
 - [Bun](https://bun.sh)
-- Claude Code
+- An MCP stdio client such as Claude Code or Codex CLI
 - `tmux` — only needed for live push delivery into a session. Without it, messaging still works through `check_messages`.
 
 ## Development

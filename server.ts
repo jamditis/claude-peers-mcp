@@ -2,7 +2,7 @@
 /**
  * claude-peers MCP server
  *
- * Spawned by Claude Code as a stdio MCP server (one per instance).
+ * Spawned by an MCP client as a stdio server (one per client session).
  * Connects to the shared broker daemon for peer discovery and messaging.
  * Reports its own tmux pane at registration so the broker can deliver messages
  * straight into the session; non-tmux sessions read theirs via check_messages.

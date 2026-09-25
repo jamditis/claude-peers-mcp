@@ -40,7 +40,7 @@ export async function handleTool(name: string, args: unknown, context: ToolConte
             content: [
               {
                 type: "text" as const,
-                text: `No other Claude Code instances found (scope: ${scope}).`,
+                text: `No other peer sessions found (scope: ${scope}).`,
               },
             ],
           };
