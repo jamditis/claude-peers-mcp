@@ -217,8 +217,9 @@ The MCP handshake, tools, broker registration, urgency, and polling are client-n
   credentials, upgrade or repair the broker, and verify with `doctor` before
   reconnecting peers.
 
-The 1.0 contract must add a public security-reporting address, supported-version
-window, signed federation-key rotation, and tested recovery procedure.
+Security reports now follow the [private reporting policy](../SECURITY.md).
+The 1.0 contract must still define a supported-version window, signed
+federation-key rotation, and a tested recovery procedure.
 
 ## Deprecation policy for 1.0
 

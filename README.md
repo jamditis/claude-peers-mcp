@@ -27,6 +27,8 @@ The accepted ownership and package-consumer rules are recorded in [Decision 0001
 
 The [client and delivery matrix](docs/compatibility.md#client-and-delivery-matrix) shows which MCP clients and message paths have been exercised.
 
+Beta testers can use the [install, delivery, and federation issue forms](https://github.com/jamditis/claude-peers-mcp/issues/new/choose). Report security flaws through the [private security route](SECURITY.md).
+
 ## Quick start
 
 ### 1. Install
