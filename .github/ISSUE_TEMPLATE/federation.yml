@@ -5,7 +5,10 @@ labels: ["public-beta"]
 body:
   - type: markdown
     attributes:
-      value: Do not post tokens, credentials, private addresses, full config files, or message contents. Existing authentication limits are tracked in #4 and #15. Report new exploit details through the private security route.
+      value: >-
+        Do not post tokens, credentials, private addresses, full config files, or message contents.
+        Existing authentication limits are tracked in #4 and #15.
+        Report new exploit details through the private security route.
   - type: textarea
     id: task
     attributes:
