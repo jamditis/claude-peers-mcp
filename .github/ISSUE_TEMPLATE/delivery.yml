@@ -1,0 +1,45 @@
+name: Delivery report
+description: Report a missing, late, duplicate, or unclear message delivery.
+title: "Delivery: "
+labels: ["public-beta"]
+body:
+  - type: markdown
+    attributes:
+      value: Do not post message contents, tokens, private addresses, config files, or unredacted logs. If you suspect a security flaw, use the private security report link instead.
+  - type: textarea
+    id: task
+    attributes:
+      label: What were you trying to do?
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Clients, platform, and versions
+      placeholder: "Claude Code to Codex CLI, Ubuntu 24.04, Bun 1.3, source commit or exact package version"
+    validations:
+      required: true
+  - type: dropdown
+    id: path
+    attributes:
+      label: Intended delivery path
+      options:
+        - Tmux push
+        - Doorbell then check_messages
+        - Manual check_messages
+        - Remote federation
+        - Unsure
+    validations:
+      required: true
+  - type: textarea
+    id: timeline
+    attributes:
+      label: Steps and timeline
+      description: Include urgency, send disposition, poll or push result, elapsed time, and whether a restart changed the outcome.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Include doctor output or errors only after removing tokens, private addresses, names, and message text.

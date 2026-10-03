@@ -1,0 +1,45 @@
+name: Install report
+description: Report an install, upgrade, restart, or uninstall result.
+title: "Install: "
+labels: ["public-beta"]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include tokens, private addresses, config files, or message contents. Identify a source install as a source install so it is not counted as npm beta evidence.
+  - type: textarea
+    id: task
+    attributes:
+      label: What were you trying to do?
+      description: Describe the first message you wanted to send or receive, without its contents.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Platform and versions
+      placeholder: "Ubuntu 24.04, Bun 1.3, source commit or exact package version"
+    validations:
+      required: true
+  - type: dropdown
+    id: operation
+    attributes:
+      label: Operation
+      options:
+        - Clean install
+        - Upgrade
+        - Restart after install
+        - Uninstall
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Commands and result
+      description: Give reproducible commands, expected and observed results, and the time to first message if reached.
+    validations:
+      required: true
+  - type: textarea
+    id: recovery
+    attributes:
+      label: Recovery and documentation
+      description: What fixed the problem, and where did the instructions help or fail?

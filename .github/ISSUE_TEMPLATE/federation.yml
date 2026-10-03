@@ -1,0 +1,43 @@
+name: Federation report
+description: Report setup or message routing across two hosts.
+title: "Federation: "
+labels: ["public-beta"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Do not post tokens, credentials, private addresses, full config files, or message contents.
+        Existing authentication limits are tracked in #4 and #15.
+        Report new exploit details through the private security route.
+  - type: textarea
+    id: task
+    attributes:
+      label: What were you trying to do?
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Both platforms and versions
+      placeholder: "Host A: Ubuntu, Bun 1.3, commit; host B: macOS, Bun 1.3, commit"
+    validations:
+      required: true
+  - type: textarea
+    id: topology
+    attributes:
+      label: Safe topology summary
+      description: Describe the client and broker on each host, the intended route, and redacted allowlist and remote push settings. Use host A and host B in place of real names or addresses.
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Steps and result
+      description: Include the send command or tool call, expected result, observed disposition, elapsed time, and restart recovery. Redact secrets and message text.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Include doctor output or errors only after removing tokens, private addresses, names, and message text.
