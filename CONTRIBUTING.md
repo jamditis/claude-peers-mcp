@@ -78,19 +78,20 @@ The delivery logic in `delivery.ts` is written to be pure and testable so the te
 
 ### Platform test coverage (issue #22)
 
-CI runs typecheck, lint, and `bun test` on Ubuntu and native Windows ([#22](https://github.com/jamditis/claude-peers-mcp/issues/22)). The shell-based `tmux`, named-pipe, and signal integration suites use `skipIf(win32)`; platform-independent units still run on Windows. Ubuntu is the release gate for the full integration suite. macOS remains best effort until it has its own CI leg.
+CI runs typecheck, lint, the docs privacy check, and `bun test` on Ubuntu and native Windows ([#22](https://github.com/jamditis/claude-peers-mcp/issues/22)). The shell-based `tmux`, named-pipe, and signal integration suites use `skipIf(win32)`; platform-independent units still run on Windows. Ubuntu is the release gate for the full integration suite. macOS remains best effort until it has its own CI leg.
 
 ## CI gate
 
-CI (`.github/workflows/ci.yml`) runs on every pull request and on pushes to `main` as a single `test` job. Branch protection requires the `test` check to pass before merge, so run all three steps locally before you push:
+CI (`.github/workflows/ci.yml`) runs on every pull request and on pushes to `main` as a single `test` job. Branch protection requires the `test` check to pass before merge, so run these checks locally before you push:
 
 ```bash
 bun run typecheck   # = tsc --noEmit
 bun run lint        # = biome lint --error-on-warnings .
+bun run check:docs:privacy
 bun test
 ```
 
-All three must pass. `--error-on-warnings` means any Biome warning fails the lint step, so treat warnings as errors locally too.
+All four must pass. `--error-on-warnings` means any Biome warning fails the lint step, so treat warnings as errors locally too. Run the docs privacy check before committing a documentation change: CI can block a merge, but it cannot hide an address already pushed to a public branch. Use `192.0.2.x` addresses in new examples, and review machine names separately.
 
 A second workflow, `.github/workflows/codeql.yml`, runs CodeQL `javascript-typescript` security analysis on pull requests, on `main`, and on a weekly cron. It is not a required merge check, but address anything it flags.
 
@@ -111,7 +112,7 @@ Linting is [Biome](https://biomejs.dev) `2.4.16` (pinned exact in `devDependenci
 - **No AI attribution** anywhere — no "Generated with" lines, no `Co-Authored-By` trailers for an assistant, no model or tool credit in commits, PR bodies, code comments, or docs.
 - **One logical change per PR.** Land a feature with its tests; file unrelated findings as separate issues instead of widening the PR.
 - **Reference the issue** a PR closes (`Closes #N`) when there is one.
-- **Make CI green before requesting review.** Run `bun run typecheck`, `bun run lint`, and `bun test` locally first; the `test` check is required for merge.
+- **Make CI green before requesting review.** Run the four checks listed above locally first; the `test` check is required for merge.
 - Update the README, `CLAUDE.md`, and `CHANGELOG.md` when a change affects setup, behavior, or the public surface. Stale docs are worse than no docs.
 
 ## Project layout

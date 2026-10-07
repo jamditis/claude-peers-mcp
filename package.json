@@ -31,7 +31,8 @@
     "server": "bun server.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "lint": "biome lint --error-on-warnings ."
+    "lint": "biome lint --error-on-warnings .",
+    "check:docs:privacy": "bun scripts/check-docs-privacy.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.16",
