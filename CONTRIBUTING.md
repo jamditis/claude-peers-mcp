@@ -1,10 +1,10 @@
 # Contributing
 
-Thanks for working on claude-peers. This is a Bun/TypeScript MCP project: a singleton broker daemon (`broker.ts`), one MCP stdio server per Claude Code instance (`server.ts`), the pure delivery logic both share (`delivery.ts`), and a CLI (`cli.ts`). This guide covers local setup, running a session, the test suite, the CI gate, and the conventions a PR has to follow.
+This is a Bun/TypeScript MCP project: a singleton broker daemon (`broker.ts`), one MCP stdio server per client session (`server.ts`), delivery logic (`delivery.ts`), and a CLI (`cli.ts`). For installation and operation, start with the [user guides](docs/README.md). This guide covers development, checks, and repository conventions.
 
 ## Requirements
 
-- [Bun](https://bun.sh) (CI pins `latest`).
+- [Bun](https://bun.sh) (CI follows `latest`; it does not pin an exact version).
 - Ubuntu for the full test suite. Windows runs the platform-independent suites and skips the POSIX integration cases; see [Platform test coverage](#platform-test-coverage-issue-22) below.
 - `tmux`, if you want a broker to type messages straight into a live Claude Code pane. Without it, messages queue and are read with the `check_messages` tool.
 
@@ -18,11 +18,11 @@ bun install
 
 CI installs with `bun install --frozen-lockfile`, so commit `bun.lock` changes alongside any dependency change and make sure your local install matches the lockfile before you push.
 
-The broker stores per-session capability tokens in its SQLite database, so `*.db`, `*.sqlite`, `*.sqlite3`, and `.claude-peers.json` are gitignored. Never commit a broker database or a config file — they hold secrets.
+The broker stores per-session capability tokens and message text in its SQLite database. Keep databases, SQLite sidecars, and private machine configs out of commits. Generic configs with documentation placeholders belong in `deploy/configs/`; real deployment values belong outside this repository.
 
 ## Running the broker and an MCP session
 
-The broker is a singleton HTTP daemon on `localhost:7899`. You normally don't start it by hand: the MCP server auto-launches one the first time a Claude Code instance registers. The two ways to run things:
+Local clients reach the broker at `127.0.0.1:7899` by default. Its socket binds to all interfaces, with request allowlists and loopback-only control-plane POST routes enforcing access. The MCP server normally auto-launches it. The two ways to run things:
 
 ```bash
 # Run the MCP stdio server directly (this is what Claude Code spawns).
@@ -40,24 +40,25 @@ To wire the MCP server into a Claude Code instance, add it to `.mcp.json`:
   "mcpServers": {
     "claude-peers": {
       "command": "bun",
-      "args": ["./server.ts"]
+      "args": ["/absolute/path/to/claude-peers-mcp/server.ts"]
     }
   }
 }
 ```
 
-Inspect or drive a running broker with the CLI:
+Replace the absolute path with your checkout. Inspect or drive a running broker with the CLI:
 
 ```bash
 bun cli.ts status
 bun cli.ts peers
-bun cli.ts send <peer-id> <message>
+bun cli.ts send <peer-id> --urgency fyi "Review notes are ready."
+bun cli.ts doctor
 bun cli.ts kill-broker
 ```
 
 `bun cli.ts send` registers an ephemeral queued-only peer, authenticates the send with that peer's token, and unregisters in a `finally`. It does not bypass the token gate.
 
-No config file is needed for local single-host development. When `~/.claude-peers.json` is absent and `CLAUDE_PEERS_CONFIG` is unset, the broker uses the loopback-only default from `singleHostDefault()`. Create a config only to customize the host or enable federation. A config that exists must include `machine`, `tailscale_ip`, `port`, `id_prefix`, `siblings`, and `allowed_ips`; an explicitly selected `CLAUDE_PEERS_CONFIG` path must exist. See the README and the per-host samples under `deploy/configs/` for the field reference.
+No config file is needed for local single-host development. When `~/.claude-peers.json` is absent and `CLAUDE_PEERS_CONFIG` is unset, the broker uses the loopback-only allowlist from `singleHostDefault()`. Create a config only to customize the host or enable federation. A config that exists must include `machine`, `tailscale_ip`, `port`, `id_prefix`, `siblings`, and `allowed_ips`; an explicitly selected `CLAUDE_PEERS_CONFIG` path must exist. See the [configuration reference](docs/configuration.md) and generic samples under `deploy/configs/`.
 
 ## Test suite
 
@@ -67,7 +68,7 @@ Run the full suite with:
 bun test
 ```
 
-Tests live under `tests/`: `broker.test.ts`, `config.test.ts`, `delivery.test.ts`, and `integration.test.ts`. To run a single file or filter by name:
+Tests live under `tests/`, including broker, configuration, delivery, integration, tool-contract, privacy, recovery, and generic stdio-client cases. To run a single file or filter by name:
 
 ```bash
 bun test tests/delivery.test.ts
@@ -82,7 +83,7 @@ CI runs typecheck, lint, the docs privacy check, and `bun test` on Ubuntu and na
 
 ## CI gate
 
-CI (`.github/workflows/ci.yml`) runs on every pull request and on pushes to `main` as a single `test` job. Branch protection requires the `test` check to pass before merge, so run these checks locally before you push:
+CI (`.github/workflows/ci.yml`) runs on pull requests and pushes to `main`. Its matrix produces `test (ubuntu-latest)` and `test (windows-latest)` jobs. Branch-protection requirements are repository settings, separate from the workflow file. Run these checks locally before you push:
 
 ```bash
 bun run typecheck   # = tsc --noEmit
@@ -93,7 +94,7 @@ bun test
 
 All four must pass. `--error-on-warnings` means any Biome warning fails the lint step, so treat warnings as errors locally too. Run the docs privacy check before committing a documentation change: CI can block a merge, but it cannot hide an address already pushed to a public branch. Use `192.0.2.x` addresses in new examples, and review machine names separately.
 
-A second workflow, `.github/workflows/codeql.yml`, runs CodeQL `javascript-typescript` security analysis on pull requests, on `main`, and on a weekly cron. It is not a required merge check, but address anything it flags.
+A second workflow, `.github/workflows/codeql.yml`, runs CodeQL `javascript-typescript` security analysis on pull requests, on `main`, and on a weekly schedule. Address actionable findings and check the current repository rules for merge requirements.
 
 ## Biome conventions
 
@@ -112,7 +113,7 @@ Linting is [Biome](https://biomejs.dev) `2.4.16` (pinned exact in `devDependenci
 - **No AI attribution** anywhere — no "Generated with" lines, no `Co-Authored-By` trailers for an assistant, no model or tool credit in commits, PR bodies, code comments, or docs.
 - **One logical change per PR.** Land a feature with its tests; file unrelated findings as separate issues instead of widening the PR.
 - **Reference the issue** a PR closes (`Closes #N`) when there is one.
-- **Make CI green before requesting review.** Run the four checks listed above locally first; the `test` check is required for merge.
+- **Make CI green before requesting review.** Run the four checks listed above locally first and satisfy the repository's current merge requirements.
 - Update the README, `CLAUDE.md`, and `CHANGELOG.md` when a change affects setup, behavior, or the public surface. Stale docs are worse than no docs.
 
 ## Project layout
@@ -120,10 +121,12 @@ Linting is [Biome](https://biomejs.dev) `2.4.16` (pinned exact in `devDependenci
 | Path | Purpose |
 | --- | --- |
 | `broker.ts` | Singleton HTTP broker daemon: routing, delivery, the lease state machine, capability-token auth, federation routes. |
-| `server.ts` | MCP stdio server, one per Claude Code instance; registers with the broker and exposes the tools. |
+| `server.ts` | MCP stdio server, one per client session; registers with the broker and exposes the tools. |
 | `delivery.ts` | Pure, testable delivery logic (lease machine, tmux target resolution, bracketed-paste formatting, liveness probe, retention prune, token generation). |
 | `cli.ts` | CLI for inspecting broker state and sending messages. |
-| `shared/` | Shared types (`types.ts`), config loader (`config.ts`), and summary helper (`summarize.ts`). |
+| `shared/` | Config, types, tool contracts/results, recovery, diagnostics, repository identity, summaries, and doorbell helpers. |
+| `bin/claude-peers-mcp.ts` | Package entry point: starts stdio MCP by default or dispatches `cli` commands. |
+| `docs/` | Current user guides, compatibility contract, decisions, and dated design records. |
 | `tests/` | Bun test suite. POSIX integration tests skip on Windows; platform-independent tests still run. |
 | `deploy/` | Install scripts, the systemd unit, and per-host config samples. |
-| `.github/workflows/` | `ci.yml` (the required gate) and `codeql.yml`. |
+| `.github/workflows/` | Ubuntu/Windows checks in `ci.yml` and separate security analysis in `codeql.yml`. |

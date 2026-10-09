@@ -6,7 +6,7 @@ alwaysApply: false
 
 # claude-peers
 
-Peer discovery and messaging MCP channel for Claude Code instances.
+Peer discovery and messaging over stdio MCP for client sessions. There is no channel adapter. Current user guides start at [docs/README.md](docs/README.md); the [compatibility contract](docs/compatibility.md) records client and platform evidence.
 
 ## Product and deployment boundary
 
@@ -26,7 +26,7 @@ Public beta install, delivery, and federation reports use the GitHub issue forms
 - `delivery.ts` — Pure, testable delivery logic (lease state machine, tmux target resolution, bracketed-paste formatting + C0 stripping (urgency-aware: reply hint only on `interrupt`, `fyi` tag), ordered next-deliverable selection over the pushable channel, the urgency helpers (`pushAfterFor`, `hasDuePush`, `promoteQueuedForFlush`), the failed-push demotion rule (`decidePushDemotion`/`countsAsPushFailure` plus the `push_failures` storage helpers and `demoteQueuedPushable`), the timeout-reporting tmux seam (`makeSpawnTmuxQuery`), liveness probe, retention prune, `generateAuthToken` for the capability token). Delivery into a pane is two stages against that one stdout-capturing seam: `probePaneReadiness` (the defer signal — a clean probe that identifies a shell requeues the row and fires `onDefer`), then the atomic inject `buildGuardedTmuxArgs` builds — one `tmux if-shell -F -t <pane> <buildPaneReadyFormat predicate> '<send-keys ...>'` process that re-checks the pane and types in the same uninterrupted server callback (tmux's `-F` branch is synchronous: format, `args_make_commands_now`, `cmdq_insert_after`, no `CMD_RETURN_WAIT`), so the window in which a session exiting between probe and send is pasted into shrinks from two client round-trips to microseconds — the floor tmux offers, since there is no compare-and-swap send (#44). Each branch prints a marker `classifyGuardedSend` reads (`if-shell` will not report the predicate in its exit code, and a `run-shell` else branch poisons the tmux server); a guard suppression is a defer, not a failed push, and a marker-less or non-shell answer still delivers, keeping the denylist fail-open. `broker.ts` composes these; tests import them directly.
 - `shared/types.ts` — Shared types for the broker API, including `PROTOCOL_VERSION`, the `delivery_state` schema, and the per-session capability `token` field on `RegisterResponse`.
 - `shared/repo-key.ts` — Derives the worktree display root and a canonical common-git-dir key. Repo-scoped discovery uses that key to group one repository's main checkout and linked worktrees, with compatible fallbacks for older Git. During a protocol-9-to-10 upgrade, the broker derives keys for keyless registrations and persisted rows so long-lived legacy sessions remain discoverable across worktrees.
-- `shared/config.ts` — Config loader. Notable: `floor_remote_forwards` (default true, secure-by-default) leaves cross-machine forwards queued for `check_messages` instead of pushing them into the local pane; set it `false` to opt in to cross-node push. Local same-machine peers always push. `coalesce_pushes` defaults false and enables bounded tmux paste batching when true.
+- `shared/config.ts` — Config loader. `floor_remote_forwards` defaults true and leaves cross-machine forwards queued for `check_messages`; set it `false` to enable remote push eligibility. Local messages follow urgency and backend readiness. `coalesce_pushes` defaults false and enables bounded tmux paste batching when true. See [configuration](docs/configuration.md) and [delivery](docs/delivery.md).
 - `shared/summarize.ts` — Git-context helpers (`getGitBranch`, `getRecentFiles`) and `buildAutoSummary`, which seeds a peer's summary at registration from git state (`[auto] <branch>; recent: <files>`, ≤140 chars, empty outside a git repo, never throws). `set_summary` overwrites the seed once the session knows its task.
 - `shared/format-peers.ts` — Compact `list_peers` rendering: `formatPeerList` (one head line per peer + indented summary, 200-char display cap that keeps the head of the summary, newlines collapsed) and `formatAge` (relative ages, clock-skew clamp, null on unparseable).
 - `shared/mcp-contract.ts` — The advertised MCP server identity and five public tool definitions. `tests/compatibility.test.ts` pins tool names, input schema shapes, enums, and server/package version alignment so an accidental public-contract change fails CI.
@@ -41,7 +41,7 @@ The broker and MCP server use the loopback-only `singleHostDefault()` when `~/.c
 # Plain MCP. Delivery into a session works when Claude
 # runs inside a tmux pane; otherwise messages queue for check_messages.
 # Add to .mcp.json:
-# { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }
+# { "mcpServers": { "claude-peers": { "command": "bun", "args": ["/absolute/path/to/server.ts"] } } }
 
 # CLI:
 bun cli.ts status
