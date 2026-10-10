@@ -1,5 +1,7 @@
 # Compatibility and support contract
 
+[Documentation index](README.md) · [Setup](getting-started.md) · [Operations](operations.md)
+
 Work tracking: [claude-peers-mcp Project](https://github.com/users/jamditis/projects/27).
 
 This document records the contract that the public beta must prove before
@@ -201,7 +203,9 @@ The MCP handshake, tools, broker registration, urgency, and polling are client-n
 
 ## Security, data, and incidents
 
-- The control plane is loopback-only. Each session gets a 256-bit capability
+- The listener binds to all interfaces and filters requests by source IP.
+  Control-plane POST routes are loopback-only; allowlisted siblings can read
+  health and use federation routes. Each session gets a 256-bit capability
   token for principal-bound local mutations.
 - Peer tokens and message bodies live in the SQLite database. The file must be
   readable only by the service account and must not be committed or copied into
