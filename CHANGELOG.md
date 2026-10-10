@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-09
+
+This release supersedes v0.3.1 with a minor version number that reflects the capabilities and upgrade requirements introduced since v0.3.0. The v0.3.1 tag and release remain available. Runtime behavior is unchanged from v0.3.1; only version metadata and documentation change.
+
+The changes since v0.3.0 include delivery recovery and failed-push demotion, poll-only doorbells and `peek_messages`, friendly peer names, `doctor` diagnostics, worktree discovery, optional push coalescing, and expanded setup and operations guides. See the [v0.3.1 notes](#031---2026-10-09) below for the full change list.
+
+### Compatibility and upgrading
+
+- The broker protocol remains `10`, as in v0.3.1. Upgrading from v0.3.1 adds no schema or protocol migration; update the checkout to `v0.4.0`, run `bun install --frozen-lockfile`, and restart clients to report the new version.
+- Users upgrading from v0.3.0 (protocol `4`) must follow the coordinated stopped-upgrade procedure below, checking out `v0.4.0` in step 3. Only protocol 9-to-10 mixed-version rolling upgrades have been tested.
+- Federation authentication is still pending. This release does not complete that roadmap gate, and the npm package remains private.
+
 ## [0.3.1] - 2026-10-09
 
 This source release includes the completed reliability milestone from [roadmap #85](https://github.com/jamditis/claude-peers-mcp/issues/85), plus discovery, diagnostics, and documentation improvements since v0.3.0. The npm package remains private. Federation authentication and the public npm beta are still pending.
@@ -108,7 +120,8 @@ This release turns claude-peers from a single-machine discovery tool into a fede
 - Drain an in-flight remote forward before a retire or idle-exit so cross-machine mail is not dropped on shutdown (#16).
 - Strip C0/C1 control characters (including ESC and the C1 CSI byte) before injection to neutralize bracketed-paste escape injection (#16).
 
-[Unreleased]: https://github.com/jamditis/claude-peers-mcp/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/jamditis/claude-peers-mcp/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamditis/claude-peers-mcp/releases/tag/v0.4.0
 [0.3.1]: https://github.com/jamditis/claude-peers-mcp/releases/tag/v0.3.1
 [0.3.0]: https://github.com/jamditis/claude-peers-mcp/releases/tag/v0.3.0
 [0.2.0]: https://github.com/jamditis/claude-peers-mcp/releases/tag/v0.2.0
