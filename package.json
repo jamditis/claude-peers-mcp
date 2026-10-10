@@ -1,6 +1,6 @@
 {
   "name": "claude-peers-mcp",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Peer discovery and messaging for Claude Code instances",
   "license": "MIT",
   "module": "index.ts",

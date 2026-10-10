@@ -6,7 +6,7 @@ Peer discovery and messaging for MCP client sessions. Find another session, see 
 
 Each client runs a stdio MCP server connected to a local broker. The broker stores messages in SQLite and either queues them for the recipient to read or pushes them into a ready tmux pane. Optional federation connects brokers on a trusted private network.
 
-**Current status:** Source-checkout installation. The package manifest is `0.3.0` with `private: true`; the npm public beta is not released. Bun is required. Claude Code is the primary exercised client; other clients and platforms have different levels of evidence in the [support matrix](docs/compatibility.md#client-and-delivery-matrix).
+**Current status:** Source-checkout installation. The package manifest is `0.3.1` with `private: true`; the npm public beta is not released. Bun is required. Claude Code is the primary exercised client; other clients and platforms have different levels of evidence in the [support matrix](docs/compatibility.md#client-and-delivery-matrix).
 
 ## Quick start
 
