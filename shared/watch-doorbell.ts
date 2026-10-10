@@ -1,6 +1,21 @@
-import { existsSync, type FSWatcher, mkdirSync, unlinkSync, watch, writeFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, type FSWatcher, mkdirSync, openSync, readFileSync, unlinkSync, watch, writeFileSync } from "node:fs";
 import { isPidDead, pidProbe } from "../delivery.ts";
-import { doorbellDir, doorbellPath, readDoorbell } from "./notify.ts";
+import { doorbellDir, doorbellPath } from "./notify.ts";
+
+// Unlike the broker's best-effort marker read, readiness cannot treat an I/O
+// error as "unchanged". Validate and read the same descriptor; O_NONBLOCK keeps
+// a substituted FIFO from hanging startup before the regular-file check.
+function readWatchMarker(path: string): number {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > 64) throw new Error("Doorbell marker must be a regular counter file");
+    const raw = readFileSync(fd, "utf8").trim();
+    const value = /^\d+$/.test(raw) ? Number(raw) : NaN;
+    if (!Number.isSafeInteger(value)) throw new Error("Doorbell marker has no valid counter");
+    return value;
+  } finally { closeSync(fd); }
+}
 
 export interface WatchDoorbellOptions {
   dbPath: string;
@@ -40,11 +55,14 @@ export async function watchDoorbell(options: WatchDoorbellOptions): Promise<numb
     try { writeFileSync(markPath, "0", { flag: "wx" }); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
-    let baseline = since ?? readDoorbell(dbPath, id, 0);
+    const initial = readWatchMarker(markPath); // Validate even when --since was supplied.
+    let baseline = since ?? initial;
     return await new Promise<number>((resolve) => {
       let watcher: FSWatcher | null = null;
       let debounce: ReturnType<typeof setTimeout> | null = null;
       let done = false;
+      let ready = false;
+      let readFailedAt: number | null = null;
       const poll = setInterval(check, pollMs);
       const timeout = timeoutSec && timeoutSec > 0
         ? setTimeout(() => finish(2, `no mail for ${id} within ${timeoutSec}s`), timeoutSec * 1000) : null;
@@ -65,11 +83,35 @@ export async function watchDoorbell(options: WatchDoorbellOptions): Promise<numb
       }
       function check() {
         if (done) return;
-        if (ownerPid && (isPidDead(pidProbe(ownerPid)) || !existsSync(markPath as string))) {
-          finish(4, `doorbell stopped for ${id}: owner exited or peer marker removed`);
+        if (ownerPid && isPidDead(pidProbe(ownerPid))) {
+          finish(4, `doorbell stopped for ${id}: owner exited`);
           return;
         }
-        const cur = readDoorbell(dbPath, id, baseline);
+        let cur: number;
+        try {
+          cur = readWatchMarker(markPath as string);
+          if (readFailedAt !== null) console.log(`doorbell recovered for ${id}: marker readable`);
+          readFailedAt = null;
+        } catch (error) {
+          if (ownerPid && (error as NodeJS.ErrnoException).code === "ENOENT") {
+            finish(4, `doorbell stopped for ${id}: peer marker removed`);
+            return;
+          }
+          // In-place broker writes can briefly expose an empty counter. Report
+          // degradation immediately, but allow two poll intervals to recover.
+          const now = performance.now();
+          if (readFailedAt === null) {
+            readFailedAt = now;
+            console.log(`doorbell degraded for ${id}: marker unreadable; retrying`);
+          } else if (now - readFailedAt >= 2 * pollMs) {
+            finish(1, `doorbell failed for ${id}: marker unreadable across multiple polls`);
+          }
+          return;
+        }
+        if (!ready) {
+          ready = true;
+          console.log(`doorbell armed for ${id} (since=${baseline}; backend=${watcher ? "watch+poll" : "poll"}; consumed=false)`);
+        }
         if (cur <= baseline) return;
         if (persistent) {
           console.log(`mail for ${id} (mark=${cur})`);
@@ -88,7 +130,6 @@ export async function watchDoorbell(options: WatchDoorbellOptions): Promise<numb
         watcher = watch(markPath, { persistent: true }, onEvent);
         watcher.on("error", () => { watcher?.close(); watcher = null; });
       } catch { /* fallback poll still observes the level */ }
-      console.log(`doorbell armed for ${id} (since=${baseline}; backend=${watcher ? "watch+poll" : "poll"}; consumed=false)`);
       check(); // Catch advances between the supplied snapshot and actual child startup.
     });
   } finally {

@@ -157,7 +157,7 @@ export async function handleTool(name: string, args: unknown, context: ToolConte
         // Absolute path to the CLI: a session's cwd is its own project, not the claude-peers
         // install, so a bare `bun cli.ts` would not resolve. cli.ts sits next to this server.
         const recipe = context.doorbell
-          ? doorbellRecipe(cliPath, context.doorbell.dbPath, result.id, context.doorbell.ownerPid)
+          ? doorbellRecipe(cliPath, context.doorbell.dbPath, result.id, context.doorbell.ownerPid, myCwd)
           : null;
         const hint = recipe
           ? ` Doorbell requires host launch; this response has not armed a watcher or consumed mail. Start this argv through your session-owned background-task facility, preserving each argument (quote for your shell if needed): ${JSON.stringify(recipe.argv)}. Reuse the live task handle if already armed for this peer; do not launch a duplicate. After launch, call check_messages even when the pending count is zero. On mail completion, get a fresh recipe with peek_messages, re-arm, then check_messages. If the host cannot schedule a turn on task completion, report doorbell unsupported and poll manually.`

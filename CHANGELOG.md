@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Bind relative database overrides in doorbell recipes to the MCP working directory. Validate marker readability and file type before reporting armed, and stop visibly on persistent read failures instead of silently polling an unreadable counter.
+
 - Ask clients to arm the doorbell at session startup and after each signal, including when `peek_messages` finds queued mail. Return a peer-bound, explicit-path launch recipe with a pre-launch baseline; the host must start and own the background task and schedule a turn on completion. Add watcher readiness, exclusive managed-watcher guards, owner-exit cleanup, and documented unsupported-host and adoption behavior. This does not hot-reload or repair existing sessions.
 
 ## [0.4.0] - 2026-10-09

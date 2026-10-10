@@ -1,10 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { doorbellPath, readDoorbell, removeDoorbell, writeDoorbell } from "../shared/notify.ts";
 import { handleTool, type ToolContext } from "../shared/tool-results.ts";
 import type { doorbellRecipe } from "../shared/doorbell-session.ts";
+import { singleHostDefault } from "../shared/config.ts";
 
 const root = resolve(import.meta.dir, "..");
 const children: ReturnType<typeof Bun.spawn>[] = [];
@@ -31,9 +32,9 @@ function fixture() {
     // Network seam models authenticated recovery returning the replacement peer.
     async brokerFetch<T>() { return { id: "test-peer", count: 3, max_id: 9 } as T; },
   };
-  function launch(argv: string[], timeout = 4) {
+  function launch(argv: string[], timeout = 4, cwd = work) {
     const child = Bun.spawn([...argv, "--poll-ms", "250", "--timeout", String(timeout)], {
-      cwd: work, env: { ...process.env, CLAUDE_PEERS_CONFIG: configPath }, stdout: "pipe", stderr: "pipe",
+      cwd, env: { ...process.env, CLAUDE_PEERS_CONFIG: configPath }, stdout: "pipe", stderr: "pipe",
     });
     children.push(child);
     return child;
@@ -61,18 +62,20 @@ async function remaining(child: ReturnType<ReturnType<typeof fixture>["launch"]>
   } finally { reader.releaseLock(); }
 }
 
-async function armed(child: ReturnType<ReturnType<typeof fixture>["launch"]>) {
+async function outputUntil(child: ReturnType<ReturnType<typeof fixture>["launch"]>, needle: string) {
   const reader = child.stdout.getReader();
   let output = "";
   try {
-    while (!output.includes("doorbell armed")) {
+    while (!output.includes(needle)) {
       const item = await reader.read();
-      if (item.done) throw new Error(`Watcher exited before arming: ${output}`);
+      if (item.done) throw new Error(`Watcher exited before ${needle}: ${output}`);
       output += new TextDecoder().decode(item.value);
     }
   } finally { reader.releaseLock(); }
   return output;
 }
+
+const armed = (child: ReturnType<ReturnType<typeof fixture>["launch"]>) => outputUntil(child, "doorbell armed");
 
 test("startup with queued mail binds the recovered peer and catches mail before child launch", async () => {
   const f = fixture();
@@ -157,4 +160,71 @@ test("missing host integration returns no armed claim; malformed baseline fails"
   const child = f.launch(argv);
   expect(await child.exited).toBe(1);
   expect(await new Response(child.stdout).text()).not.toContain("doorbell armed");
+});
+
+test("relative no-config database override stays bound to the MCP cwd", async () => {
+  const f = fixture();
+  const previous = process.env.CLAUDE_PEERS_DB;
+  try {
+    process.env.CLAUDE_PEERS_DB = "store with spaces.db";
+    f.context.doorbell = { dbPath: singleHostDefault().db_path, ownerPid: process.pid };
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_PEERS_DB;
+    else process.env.CLAUDE_PEERS_DB = previous;
+  }
+  writeDoorbell(f.dbPath, "test-peer", 9);
+  const argv = await recipe(f.context);
+  expect(argv[argv.indexOf("--db-path") + 1]).toBe(f.dbPath);
+  expect(argv[argv.indexOf("--since") + 1]).toBe("9");
+  const otherCwd = join(f.work, "host task");
+  mkdirSync(otherCwd);
+  writeDoorbell(f.dbPath, "test-peer", 10);
+  const child = f.launch(argv, 4, otherCwd);
+  expect(await child.exited).toBe(0);
+  expect(await new Response(child.stdout).text()).toContain("mark=10");
+  expect(existsSync(join(otherCwd, "store with spaces.db.doorbells"))).toBe(false);
+});
+
+test("an existing directory at the marker path never reports armed", async () => {
+  const f = fixture();
+  const argv = await recipe(f.context);
+  mkdirSync(doorbellPath(f.dbPath, "test-peer") as string, { recursive: true });
+  const child = f.launch(argv, 1);
+  expect(await child.exited).toBe(1);
+  expect(await new Response(child.stdout).text()).not.toContain("doorbell armed");
+  expect(existsSync(`${doorbellPath(f.dbPath, "test-peer")}.watcher`)).toBe(false);
+});
+
+test("persistent marker read failures stop an armed task visibly", async () => {
+  const f = fixture();
+  const child = f.launch(await recipe(f.context));
+  await armed(child);
+  writeFileSync(doorbellPath(f.dbPath, "test-peer") as string, "invalid counter");
+  expect(await child.exited).toBe(1);
+  expect(await remaining(child)).toContain("marker unreadable");
+  expect(existsSync(`${doorbellPath(f.dbPath, "test-peer")}.watcher`)).toBe(false);
+});
+
+test("a corrupt startup counter never reports armed even with an explicit baseline", async () => {
+  const f = fixture();
+  writeDoorbell(f.dbPath, "test-peer", 9);
+  const argv = await recipe(f.context);
+  writeFileSync(doorbellPath(f.dbPath, "test-peer") as string, "invalid counter");
+  const child = f.launch(argv);
+  expect(await child.exited).toBe(1);
+  expect(await new Response(child.stdout).text()).not.toContain("doorbell armed");
+  expect(existsSync(`${doorbellPath(f.dbPath, "test-peer")}.watcher`)).toBe(false);
+});
+
+test("a transient empty read recovers and still signals the next counter", async () => {
+  const f = fixture();
+  const child = f.launch(await recipe(f.context));
+  await armed(child);
+  writeFileSync(doorbellPath(f.dbPath, "test-peer") as string, "");
+  await outputUntil(child, "marker unreadable; retrying");
+  writeDoorbell(f.dbPath, "test-peer", 7);
+  expect(await child.exited).toBe(0);
+  const output = await remaining(child);
+  expect(output).toContain("marker readable");
+  expect(output).toContain("mark=7");
 });
