@@ -50,6 +50,33 @@ The broker writes a content-free counter to `<db_path>.doorbells/<peer-id>.mark`
 
 A client harness must notice the watcher's completion or output and schedule a turn. Running the command in an unrelated terminal only prints a signal; it does not automatically wake an idle model.
 
+### Session startup handoff
+
+The MCP initialization instructions now ask the session to call `peek_messages` before ordinary work. That response always includes a launch recipe, including when mail is already queued. It is a host-assisted startup instruction, **not an automatic MCP-to-host task API**. A client may ignore server instructions, disable background commands, or fail to wake an idle turn. In those cases the doorbell remains unsupported/unarmed and the client must poll explicitly.
+
+`peek_messages.structuredContent.doorbell` contains `peer_id`, `state: "requires_host_launch"`, and an `argv` array. The array pins the server's executable, absolute CLI path, resolved database path, authenticated peer ID, marker baseline, and owning MCP server PID. Pass those arguments unchanged to a process API. For a shell tool, quote every argument using that shell's rules; do not join the array into an unquoted command. The same recipe is included in text for clients that do not expose structured results. It contains no capability token or message body. The task must run on the same host/filesystem as the MCP server; a remote or sandboxed host that cannot access these paths must report the integration unsupported.
+
+The host integration contract is:
+
+1. On startup/resume, obtain the recipe through this session's `peek_messages`. Retain one background task handle per peer; if that task is still live, reuse it. In Claude Code, launch through Bash with `run_in_background: true`. Other clients need an equivalent task whose completion schedules a session turn; a detached process or a command running in an unrelated terminal is insufficient.
+2. Launch the recipe, then call `check_messages`, including for a zero pending count. The recipe snapshots the marker before launch and drain. If the host starts the child late, the explicit `--since` still catches any intervening advance. Wait for `doorbell armed` when the host supports reading task output. Do not report armed from the recipe or a task handle alone.
+3. On exit `0` (mail signal), call `peek_messages` for a fresh baseline, launch the next watcher, then call `check_messages`. A signal can race a drain and produce an empty check; it does not prove mail is still queued. Do not blindly reuse an old baseline, which can repeatedly wake for already-consumed mail.
+4. On a changed peer ID, cancel the old task and use the new recipe. Cancel the task on session end or MCP disconnect. The watcher additionally stops when its MCP owner PID is gone or the peer's marker is removed; PID liveness is a fallback, not a replacement for host cancellation (PIDs can be reused).
+
+Managed recipes use `--exclusive`: a file created with exclusive-create at `<marker>.watcher` prevents two cooperating managed watchers for the same peer/database. Exit `3` means blocked, **not armed**. Retain the original host-owned task. This does not adopt or wake through an existing unrelated task, and legacy watchers without `--exclusive` are outside the guard; cancel them before adopting the managed recipe. A crash/hard kill may leave a stale lock. Verify the recorded watcher PID and the host task have both stopped before removing that exact `.watcher` file. Never delete the `.mark` file to reset a watcher. Ordinary completion, timeout and handled cancellation remove the lock.
+
+Watcher exit codes: `0` mail signal, `1` invalid arguments or filesystem failure, `2` timeout, `3` duplicate/stale lock, `4` cancellation/owner exit/peer removal. Only mail completion should trigger the normal rearm-and-drain loop. Investigate other exits rather than repeatedly relaunching. The readiness line names `watch+poll` or the polling fallback; both only observe a counter. Registration is the MCP peer identity, pending counts are queued mail, readiness is an armed local watcher, and consumption happens only through `check_messages`. The server does not claim to observe host task ownership or successful model wake-up.
+
+### Adoption and existing sessions
+
+The launch recipe resolves even a relative no-config `CLAUDE_PEERS_DB` override against the MCP working directory, so a host task started elsewhere reads the same marker. Readiness requires a readable regular file containing a valid counter, including when `--since` supplies the baseline. Startup validation failures exit `1` without reporting armed. During startup and after arming, a read failure reports degraded immediately; a successful read reports recovery. Startup retries withhold armed until a valid counter is read, preserving an explicit baseline or establishing the default from the first valid read. Failure lasting at least two polling intervals exits `1` and releases the guard. This grace handles brief empty reads during in-place broker writes; filesystem-watch failure alone still falls back to polling if the counter is readable.
+
+This change does not install a host hook or restart a session. After adopting the updated checkout/package, a new MCP server process must load it. The shipped source and package launchers run ordinary Bun processes; neither uses `--hot`/`--watch` or implements a release updater. Publishing a release, fetching Git changes, or replacing files therefore does not hot-reload an already-running MCP process. A host may offer its own reconnect/restart feature, but that behavior is outside this fork and must be verified for that host. Future sessions also need the background-completion facility and must follow the startup handoff. This does not promise to repair an already-idle session.
+
+For deterministic startup without relying on model-followed instructions, the missing host hook must run **after MCP registration**, invoke `peek_messages`, launch/retain/cancel a session-owned background task, and enqueue a turn on completion. A shell-only SessionStart hook does not supply those operations. No such Grok-specific adapter ships in this repository; the subprocess tests verify the launch contract, not a live Grok wake.
+
+### Manual watcher
+
 Use this order:
 
 1. Call `peek_messages` to learn your peer ID.
@@ -73,6 +100,9 @@ Arming before checking closes the gap where mail could arrive between a poll and
 | `--timeout <sec>` | Stop waiting after the specified interval. |
 | `--watch` | Stay running and print each advance instead of exiting after the first. The harness must watch output rather than process completion. |
 | `--poll-ms <ms>` | Set the fallback poll interval; default `3000`. |
+| `--db-path <path>` | Use the server's resolved store path, independently of the watcher's config or cwd. |
+| `--owner-pid <pid>` | Stop when this MCP server exits or the marker is removed. The host still owns cancellation. |
+| `--exclusive` | Refuse a second managed watcher for the same peer/database; exit `3` on an existing lock. |
 
 The broker withholds a bell while a delivery attempt prevents the pending prefix from being read, then reevaluates it when that attempt settles. A watcher is a notification aid, not a second delivery channel.
 

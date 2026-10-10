@@ -77,7 +77,7 @@ Use `interrupt` urgency when a message should be eligible for immediate push. `f
 | `send_message` | Send to a peer ID or an unambiguous session name. Optional urgency is `normal` by default, `interrupt`, or `fyi`. |
 | `set_summary` | Advertise a short description of your current work. Replaces the initial Git-derived summary. |
 | `check_messages` | Read pending, readable mail and remove the returned messages from the pending queue. |
-| `peek_messages` | Get your peer ID, pending count, and highest pending message ID without consuming mail. |
+| `peek_messages` | Get your peer ID, pending count, highest pending message ID, and a session-owned doorbell launch recipe without consuming mail. Call at startup and after a mail signal; [host integration is required](docs/delivery.md#session-startup-handoff). |
 
 Peer IDs belong to live MCP registrations. Restarting a client can produce a new ID; use discovery again before addressing it. Names are convenient labels, and duplicate names require an ID.
 
