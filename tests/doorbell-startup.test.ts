@@ -228,3 +228,29 @@ test("a transient empty read recovers and still signals the next counter", async
   expect(output).toContain("marker readable");
   expect(output).toContain("mark=7");
 });
+
+for (const explicitBaseline of [true, false]) {
+  test(`startup empty marker recovers before readiness (${explicitBaseline ? "explicit" : "default"} baseline)`, async () => {
+    const f = fixture();
+    writeDoorbell(f.dbPath, "test-peer", 0);
+    const argv = await recipe(f.context);
+    if (!explicitBaseline) argv.splice(argv.indexOf("--since"), 2);
+    writeFileSync(doorbellPath(f.dbPath, "test-peer") as string, "");
+    const child = f.launch(argv);
+    const waiting = await outputUntil(child, "marker unreadable; retrying");
+    expect(waiting).not.toContain("doorbell armed");
+    expect(child.exitCode).toBeNull();
+    writeDoorbell(f.dbPath, "test-peer", 7);
+    let output = "";
+    if (!explicitBaseline) {
+      output = await armed(child);
+      expect(output).toContain("since=7");
+      writeDoorbell(f.dbPath, "test-peer", 8);
+    }
+    expect(await child.exited).toBe(0);
+    output += await remaining(child);
+    expect(output).toContain("doorbell armed");
+    expect(output).toContain(`mark=${explicitBaseline ? 7 : 8}`);
+    expect(existsSync(`${doorbellPath(f.dbPath, "test-peer")}.watcher`)).toBe(false);
+  });
+}

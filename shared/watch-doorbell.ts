@@ -55,8 +55,9 @@ export async function watchDoorbell(options: WatchDoorbellOptions): Promise<numb
     try { writeFileSync(markPath, "0", { flag: "wx" }); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
-    const initial = readWatchMarker(markPath); // Validate even when --since was supplied.
-    let baseline = since ?? initial;
+    // Initial validation shares check()'s bounded read-failure grace. A broker
+    // may be mid-write before the very first read, not only after readiness.
+    let baseline = since;
     return await new Promise<number>((resolve) => {
       let watcher: FSWatcher | null = null;
       let debounce: ReturnType<typeof setTimeout> | null = null;
@@ -108,6 +109,9 @@ export async function watchDoorbell(options: WatchDoorbellOptions): Promise<numb
           }
           return;
         }
+        // Without --since, the first valid counter establishes the baseline.
+        // An explicit pre-launch baseline must survive startup read failures.
+        baseline ??= cur;
         if (!ready) {
           ready = true;
           console.log(`doorbell armed for ${id} (since=${baseline}; backend=${watcher ? "watch+poll" : "poll"}; consumed=false)`);
