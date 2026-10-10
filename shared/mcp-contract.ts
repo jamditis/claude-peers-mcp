@@ -3,7 +3,7 @@ import { LIST_PEERS_SCOPES } from "./types.ts";
 
 export const MCP_SERVER_INFO = {
   name: "claude-peers",
-  version: "0.3.1",
+  version: "0.4.0",
 } as const;
 
 export const MCP_SERVER_INSTRUCTIONS = `Other MCP client sessions on this machine and across the network are peers: discover them with list_peers, and message them with the claude-peers MCP \`send_message\` tool. In Claude Code, use this tool, not Claude Code's built-in \`SendMessage\` team tool. Your summary starts as an auto-generated git snapshot ("[auto] branch; recent files"); call set_summary (1-2 sentences) once your task is clearer than that, and update it at task boundaries.
