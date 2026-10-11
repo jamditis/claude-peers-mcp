@@ -17,8 +17,9 @@
  */
 
 import { Database } from "bun:sqlite";
-import { existsSync, type FSWatcher, mkdirSync, watch, writeFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
+import { watchDoorbell } from "./shared/watch-doorbell.ts";
 import {
   buildPaneCommandArgs, classifyPaneReadiness, 
   isPidDead, makeSpawnTmuxQuery,pidProbe, resolveChannelPushCap,
@@ -30,7 +31,6 @@ import {
   partitionSiblings, probeBroker, probeSiblings, readStoredPeers, readStoreFacts, resolveDoctorDbPath, resolvePeerFacts,
   type StoreFacts,
 } from "./shared/doctor.ts";
-import { doorbellDir, doorbellPath, readDoorbell } from "./shared/notify.ts";
 import { PROTOCOL_VERSION } from "./shared/types.ts";
 import { urgencyDegradesWarning } from "./shared/urgency.ts";
 
@@ -477,12 +477,15 @@ switch (cmd) {
     let pollMs = 3000;
     let timeoutSec: number | null = null;
     let persistent = false;
+    let dbOverride: string | undefined;
+    let ownerPid: number | undefined;
+    let exclusive = false;
     // Parse a numeric flag value, erroring out on a missing/non-numeric arg rather than letting
     // a silent NaN fall through to a default — a mistyped --since would otherwise behave as "no
     // baseline", the opposite of the intent (and could reintroduce a missed wake).
     const numArg = (flag: string, raw: string | undefined): number => {
-      const n = parseInt(raw ?? "", 10);
-      if (!Number.isFinite(n)) {
+      const n = raw && /^\d+$/.test(raw) ? Number(raw) : NaN;
+      if (!Number.isSafeInteger(n)) {
         console.error(`${flag} requires a number (got ${raw === undefined ? "nothing" : `"${raw}"`})`);
         process.exit(1);
       }
@@ -494,78 +497,29 @@ switch (cmd) {
       else if (a === "--poll-ms") pollMs = numArg("--poll-ms", rest[++i]);
       else if (a === "--timeout") timeoutSec = numArg("--timeout", rest[++i]);
       else if (a === "--watch") persistent = true;
+      else if (a === "--exclusive") exclusive = true;
+      else if (a === "--owner-pid") ownerPid = numArg(a, rest[++i]);
+      else if (a === "--db-path") {
+        dbOverride = rest[++i];
+        if (!dbOverride || dbOverride.startsWith("--")) { console.error("--db-path requires a path"); process.exit(1); }
+      }
       else if (!id && a) id = a;
     }
     if (!id) {
-      console.error("Usage: bunx --no-install claude-peers-mcp cli doorbell <peer-id> [--since <id>] [--poll-ms <ms>] [--timeout <sec>] [--watch] (or bun cli.ts doorbell from a checkout)");
+      console.error("Usage: bunx --no-install claude-peers-mcp cli doorbell <peer-id> [--since <id>] [--poll-ms <ms>] [--timeout <sec>] [--watch] [--db-path <path>] [--owner-pid <pid>] [--exclusive] (or bun cli.ts doorbell from a checkout)");
       process.exit(1);
     }
-    if (!config) {
-      console.error("doorbell needs a config to locate the broker store (see ~/.claude-peers.json)");
+    const dbPath = dbOverride ?? config?.db_path;
+    if (!dbPath || (ownerPid !== undefined && ownerPid <= 0)) {
+      console.error("doorbell requires a database path and a positive owner PID when supplied");
       process.exit(1);
     }
-    const dbPath = config.db_path;
-    const markPath = doorbellPath(dbPath, id);
-    if (markPath === null) {
-      console.error(`Invalid peer id: ${id}`);
-      process.exit(1);
+    try {
+      process.exitCode = await watchDoorbell({ dbPath, id, since, pollMs, timeoutSec, persistent, ownerPid, exclusive });
+    } catch (error) {
+      console.error(`doorbell failed: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
     }
-    if (pollMs < 250) pollMs = 250; // floor the poll so a typo can't busy-spin; default stays 3000
-    // The watched file must exist before fs.watch is armed. When a session arms the doorbell
-    // before it has ever received mail the doorbell dir does not exist yet, so create it first
-    // (as the broker's writeDoorbell does) — otherwise the marker create ENOENTs, the watch
-    // never arms, and the first message is caught only by the slow poll instead of fs.watch.
-    try { mkdirSync(doorbellDir(dbPath), { recursive: true }); } catch { /* best-effort */ }
-    // Create the marker without clobbering an existing one (wx fails if present), so we never
-    // reset a live counter.
-    try { writeFileSync(markPath, "0", { flag: "wx" }); } catch { /* already exists */ }
-    // Baseline: only rings strictly above this fire. Default to the marker's current value so we
-    // only wake on mail that arrives after arming — the session has just drained via
-    // check_messages, so anything already counted is consumed. --since pins an explicit baseline.
-    let baseline = since !== null && Number.isFinite(since) ? since : readDoorbell(dbPath, id, 0);
-
-    await new Promise<void>((resolve) => {
-      let watcher: FSWatcher | null = null;
-      let debounce: ReturnType<typeof setTimeout> | null = null;
-      const poll = setInterval(check, pollMs);
-      const timeout =
-        timeoutSec && timeoutSec > 0
-          ? setTimeout(() => { cleanup(); console.log(`no mail for ${id} within ${timeoutSec}s`); process.exit(2); }, timeoutSec * 1000)
-          : null;
-
-      function cleanup() {
-        if (debounce) clearTimeout(debounce);
-        clearInterval(poll);
-        if (timeout) clearTimeout(timeout);
-        watcher?.close();
-      }
-      // Level-triggered: compare the marker's current value to the baseline. fs.watch and the
-      // poll both just call this; correctness depends on the value, not on catching every event.
-      function check() {
-        const cur = readDoorbell(dbPath, id, baseline);
-        if (cur <= baseline) return;
-        if (persistent) {
-          // Tail mode: report each advance and keep watching (advance the baseline).
-          console.log(`mail for ${id} (mark=${cur})`);
-          baseline = cur;
-          return;
-        }
-        cleanup();
-        console.log(`mail for ${id} (mark=${cur}) — run check_messages`);
-        resolve();
-      }
-      function onEvent() {
-        if (debounce) clearTimeout(debounce);
-        debounce = setTimeout(check, 50); // collapse fs.watch's fires-twice + write bursts
-      }
-      try {
-        watcher = watch(markPath, { persistent: true }, onEvent);
-        watcher.on("error", () => { watcher?.close(); watcher = null; }); // degrade to poll-only
-      } catch {
-        watcher = null; // fs.watch unavailable — the poll carries it
-      }
-      check(); // read-after-arm: catch a write that landed during startup
-    });
     break;
   }
 
@@ -581,7 +535,7 @@ Commands:
   status          Show broker status and all peers
   peers           List peers
   send <id> [--urgency interrupt|normal|fyi] <msg>  Send a message to a peer
-  doorbell <id> [--since <id>] [--timeout <sec>] [--watch]  Wait for mail that will not push
+  doorbell <id> [--since <id>] [--timeout <sec>] [--watch] [--db-path <path>] [--owner-pid <pid>] [--exclusive]  Wait for mail that will not push
   doctor [--json]  Diagnose broker, backend, and queue health (exit 0 ok, 1 warnings, 2 failures)
   ping-siblings   Ping each sibling broker and report latency
   kill-broker     Stop the broker daemon`);

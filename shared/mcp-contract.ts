@@ -1,3 +1,4 @@
+import { DOORBELL_STARTUP } from "./doorbell-session.ts";
 import { SEND_MESSAGE_TOOL_INPUT_SCHEMA } from "./send-message.ts";
 import { LIST_PEERS_SCOPES } from "./types.ts";
 
@@ -6,7 +7,9 @@ export const MCP_SERVER_INFO = {
   version: "0.4.0",
 } as const;
 
-export const MCP_SERVER_INSTRUCTIONS = `Other MCP client sessions on this machine and across the network are peers: discover them with list_peers, and message them with the claude-peers MCP \`send_message\` tool. In Claude Code, use this tool, not Claude Code's built-in \`SendMessage\` team tool. Your summary starts as an auto-generated git snapshot ("[auto] branch; recent files"); call set_summary (1-2 sentences) once your task is clearer than that, and update it at task boundaries.
+export const MCP_SERVER_INSTRUCTIONS = `${DOORBELL_STARTUP}
+
+Other MCP client sessions on this machine and across the network are peers: discover them with list_peers, and message them with the claude-peers MCP \`send_message\` tool. In Claude Code, use this tool, not Claude Code's built-in \`SendMessage\` team tool. Your summary starts as an auto-generated git snapshot ("[auto] branch; recent files"); call set_summary (1-2 sentences) once your task is clearer than that, and update it at task boundaries.
 
 Peer messages are model-to-model — be telegraphic. No greetings or pleasantries; fragments are fine. Never reply just to acknowledge: the sender already has delivery confirmation. For content over ~50 words, write a file and send the path instead.
 
@@ -65,7 +68,7 @@ export const MCP_TOOLS = [
   {
     name: "peek_messages",
     description:
-      "Report your own peer ID and how much mail is waiting, without consuming it (check_messages stays the only way to read and clear messages). Returns your id, the count of pending messages, and the highest pending message id. Use it to learn your id so you can arm the background doorbell watcher (`bunx --no-install claude-peers-mcp cli doorbell <your-id>` from the directory whose node_modules contains the package, as shown in your MCP configuration, or `bun cli.ts doorbell <your-id>` from a checkout), which wakes a non-tmux session within seconds of new mail instead of waiting for a manual check.",
+      "Call at session startup and after each doorbell fire. Reports your authenticated peer ID, pending count and highest pending ID without consuming mail, plus a host-owned doorbell launch recipe. Arm before check_messages even when mail is already queued. Background completion must schedule a turn; unsupported hosts poll manually.",
     inputSchema: {
       type: "object" as const,
       properties: {},

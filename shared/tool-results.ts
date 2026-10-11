@@ -1,4 +1,5 @@
 import { formatPeerList } from "./format-peers.ts";
+import { doorbellRecipe } from "./doorbell-session.ts";
 import { handleSendMessageTool } from "./send-message.ts";
 import { parseListPeersScope } from "./types.ts";
 import type { Peer, PollMessagesResponse, PeekMessagesResponse } from "./types.ts";
@@ -10,6 +11,7 @@ export interface ToolContext {
   myGitRoot: string | null;
   myRepoKey: string | null;
   cliPath: string;
+  doorbell?: { dbPath: string; ownerPid: number };
   brokerFetch: <T>(path: string, body: unknown) => Promise<T>;
   onSummary: (summary: string) => void;
 }
@@ -154,12 +156,14 @@ export async function handleTool(name: string, args: unknown, context: ToolConte
         // peek never consumes: report state and point at the consume + watcher paths.
         // Absolute path to the CLI: a session's cwd is its own project, not the claude-peers
         // install, so a bare `bun cli.ts` would not resolve. cli.ts sits next to this server.
-        const doorbellCmd = `bun ${cliPath} doorbell ${result.id}`;
-        const hint =
-          result.count > 0
-            ? " Call check_messages to read them."
-            : ` Arm the doorbell to be woken on new mail: run \`${doorbellCmd}\` in the background, then call check_messages. When it fires, re-arm it and call check_messages again — always arm before checking so nothing is missed.`;
+        const recipe = context.doorbell
+          ? doorbellRecipe(cliPath, context.doorbell.dbPath, result.id, context.doorbell.ownerPid, myCwd)
+          : null;
+        const hint = recipe
+          ? ` Doorbell requires host launch; this response has not armed a watcher or consumed mail. Start this argv through your session-owned background-task facility, preserving each argument (quote for your shell if needed): ${JSON.stringify(recipe.argv)}. Reuse the live task handle if already armed for this peer; do not launch a duplicate. After launch, call check_messages even when the pending count is zero. On mail completion, get a fresh recipe with peek_messages, re-arm, then check_messages. If the host cannot schedule a turn on task completion, report doorbell unsupported and poll manually.`
+          : " Doorbell launch context unavailable; use check_messages to read queued mail. No watcher has been armed.";
         return {
+          ...(recipe ? { structuredContent: { id: result.id, count: result.count, max_id: result.max_id, doorbell: recipe } } : {}),
           content: [
             { type: "text" as const, text: `You are peer ${result.id}; ${mail}.${hint}` },
           ],

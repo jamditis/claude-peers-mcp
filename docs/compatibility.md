@@ -67,7 +67,7 @@ false` is a tool error. Other successful HTTP responses use these envelopes:
 | `send_message` | `ok`, failure `error`, optional `delivery`, `routed`, `poll_only`. Accepted delivery means pushed transport only. Remote queued `poll_only: true` means poll-only; false means push-eligible; absent means unknown, never false. Missing delivery keeps the legacy queued description. |
 | `set_summary` | No response-body fields are consumed; successful HTTP completion updates the cached registration summary. |
 | `check_messages` | `messages` array, each with `from_id`, `sent_at`, `text`, optional `urgency`. Only `fyi` adds the no-reply hint; absent urgency does not. |
-| `peek_messages` | `id`, `count`, `max_id`; zero count has null max ID; positive count reports the highest pending ID without consuming. |
+| `peek_messages` | `id`, `count`, `max_id`; zero count has null max ID; positive count reports the highest pending ID without consuming. MCP results also expose these fields in `structuredContent` with `doorbell: {peer_id, state: "requires_host_launch", argv}`. The recipe is a startup handoff, not proof of arming or delivery; see [host integration](delivery.md#session-startup-handoff). |
 
 Exact prose is not a wire format. Adding ignored broker fields is compatible.
 Removing a consumed field, changing its type or optional-field meaning, or

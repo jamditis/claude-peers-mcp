@@ -241,6 +241,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) =>
   handleTool(req.params.name, req.params.arguments, {
     myId, myCwd, myGitRoot, myRepoKey, brokerFetch,
     cliPath: join(import.meta.dir, "cli.ts"),
+    doorbell: { dbPath: config.db_path, ownerPid: process.pid },
     onSummary(summary) {
       if (myRegistration) myRegistration = { ...myRegistration, summary };
     },
