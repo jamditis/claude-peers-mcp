@@ -93,6 +93,54 @@ test("startup with queued mail binds the recovered peer and catches mail before 
   expect(existsSync(`${doorbellPath(f.dbPath, "test-peer")}.watcher`)).toBe(false);
 });
 
+test("empty-mail recipes establish a marker before the host launches a watcher", async () => {
+  const f = fixture();
+  f.context.brokerFetch = async <T>() => ({ id: "test-peer", count: 0, max_id: null }) as T;
+  const argv = await recipe(f.context);
+  expect(readDoorbell(f.dbPath, "test-peer")).toBe(0);
+  expect(existsSync(doorbellPath(f.dbPath, "old-peer") as string)).toBe(false);
+  expect(argv[argv.indexOf("--since") + 1]).toBe("0");
+  const child = f.launch(argv);
+  await armed(child);
+  writeDoorbell(f.dbPath, "test-peer", 1);
+  expect(await child.exited).toBe(0);
+});
+
+for (const exclusive of [true, false]) {
+  test(`a managed launch never recreates a peer marker removed after peek (exclusive=${exclusive})`, async () => {
+    const f = fixture();
+    writeDoorbell(f.dbPath, "test-peer", 9);
+    const argv = await recipe(f.context);
+    if (!exclusive) argv.splice(argv.indexOf("--exclusive"), 1);
+    // Unregister/rebinding removes the old marker even while the MCP owner lives.
+    removeDoorbell(f.dbPath, "test-peer");
+    writeDoorbell(f.dbPath, "replacement-peer", 10);
+    const child = f.launch(argv, 1);
+    expect(await child.exited).toBe(4);
+    const output = await new Response(child.stdout).text();
+    expect(output).toContain("peer marker removed");
+    expect(output).not.toContain("doorbell armed");
+    expect(output).not.toContain("mail for");
+    expect(existsSync(doorbellPath(f.dbPath, "test-peer") as string)).toBe(false);
+    expect(existsSync(`${doorbellPath(f.dbPath, "test-peer")}.watcher`)).toBe(false);
+    expect(readDoorbell(f.dbPath, "replacement-peer")).toBe(10);
+    f.context.brokerFetch = async <T>() => ({ id: "replacement-peer", count: 0, max_id: null }) as T;
+    const replacement = f.launch(await recipe(f.context));
+    await armed(replacement);
+    writeDoorbell(f.dbPath, "replacement-peer", 11);
+    expect(await replacement.exited).toBe(0);
+  });
+}
+
+test("legacy manual watchers still create an absent marker", async () => {
+  const f = fixture();
+  const child = f.launch([process.execPath, join(root, "cli.ts"), "doorbell", "test-peer", "--db-path", f.dbPath]);
+  expect(await armed(child)).toContain("since=0");
+  expect(readDoorbell(f.dbPath, "test-peer")).toBe(0);
+  writeDoorbell(f.dbPath, "test-peer", 1);
+  expect(await child.exited).toBe(0);
+});
+
 test("one host task per peer, arm-before-drain, and rearm after each fire", async () => {
   const f = fixture();
   f.context.brokerFetch = async <T>() => ({ id: "test-peer", count: 0, max_id: null }) as T;
@@ -188,6 +236,7 @@ test("relative no-config database override stays bound to the MCP cwd", async ()
 test("an existing directory at the marker path never reports armed", async () => {
   const f = fixture();
   const argv = await recipe(f.context);
+  removeDoorbell(f.dbPath, "test-peer");
   mkdirSync(doorbellPath(f.dbPath, "test-peer") as string, { recursive: true });
   const child = f.launch(argv, 1);
   expect(await child.exited).toBe(1);

@@ -51,9 +51,13 @@ export async function watchDoorbell(options: WatchDoorbellOptions): Promise<numb
   }
 
   try {
-    // Never truncate a broker counter. Fail visibly on an inaccessible marker.
-    try { writeFileSync(markPath, "0", { flag: "wx" }); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    // Only legacy/manual watchers create markers. Managed recipes establish one
+    // before handoff; an absent marker means the peer was removed or rebound.
+    // Recreating it here would silently arm an obsolete ID while its owner lives.
+    if (ownerPid === undefined) {
+      try { writeFileSync(markPath, "0", { flag: "wx" }); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
     }
     // Initial validation shares check()'s bounded read-failure grace. A broker
     // may be mid-write before the very first read, not only after readiness.
