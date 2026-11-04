@@ -711,13 +711,13 @@ export function classifyPaneDialog(paneText: string): PaneReadiness {
   const footer = lines.at(-1)?.trim() ?? "";
   // Ink can write hard line breaks inside hints; capture-pane -J cannot join those.
   const tail = lines.slice(-4).map((line) => line.trim()).join(" ");
-  const question = /(?:^| )Enter to select · (?:↑\/↓|Tab\/Arrow keys) to navigate(?: · ctrl\+g to edit in [^·]+)?(?: · Esc to cancel)?$/;
+  const question = /(?:^| )Enter to select · (?:↑\/↓|Tab\/Arrow keys) to navigate(?: · [^·]+)*$/;
   // The multi-question review screen has no footer, but has these exact final controls.
   const submit = /\nReady to submit your answers\?\n\n\s*(?:❯\s*)?1\. Submit answers\n\s*(?:❯\s*)?2\. Cancel\s*$/;
   if (question.test(tail) || submit.test(screen)) {
     return { ready: false, reason: "pane shows a question dialog" };
   }
-  const permission = /^Esc to cancel(?: · Tab to amend)?$/;
+  const permission = /^Esc to cancel(?: · .*)?$/;
   // WebFetch has no keyboard footer; its last control is this explicit rejection option.
   const reject = /(?:^| )(?:❯\s*)?(?:\d+\.\s*)?No, and tell Claude what to do differently \(esc\)$/;
   const yes = /^\s*(?:❯\s*)?(?:\d+\.\s*)?Yes\b/m;

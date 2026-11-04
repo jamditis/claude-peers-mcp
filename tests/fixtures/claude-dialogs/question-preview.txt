@@ -1,0 +1,15 @@
+────────────────────────────────────────────────────────────────────────────────
+ ☐ Sample color 
+
+Which sample color do you want?                                               
+
+❯ 1. Blue                         ┌──────────────────────────────────────────┐
+  2. Orange                       │ color: #0000ff;                          │
+                                  └──────────────────────────────────────────┘
+                                                                              
+                                  Notes: press n to add notes                   
+
+────────────────────────────────────────────────────────────────────────────────
+  Chat about this                                                               
+                         
+Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel

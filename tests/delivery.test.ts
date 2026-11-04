@@ -817,7 +817,7 @@ function dialogFixture(name: string): string {
 }
 
 describe("dialog-safe tmux delivery (#118)", () => {
-  for (const fixture of ["question-select", "question-text", "question-80", "question-multi", "question-two", "question-two-text-80", "question-submit", "permission", "permission-amend", "permission-edit", "permission-edit-amend", "permission-fetch"]) {
+  for (const fixture of ["question-select", "question-text", "question-80", "question-multi", "question-two", "question-two-text-80", "question-preview", "question-notes", "question-submit", "permission", "permission-amend", "permission-edit", "permission-edit-amend", "permission-fetch"]) {
     it(`defers the captured ${fixture} dialog without typing or counting a push failure`, async () => {
       const tmux = fakeTmux({ paneText: dialogFixture(fixture) });
       const reasons: string[] = [];
@@ -841,7 +841,7 @@ describe("dialog-safe tmux delivery (#118)", () => {
   }
 
   it("does not treat quoted dialog text above a normal prompt as an active dialog", () => {
-    for (const fixture of ["question-text", "question-submit", "permission-fetch"]) {
+    for (const fixture of ["question-text", "question-preview", "question-notes", "question-submit", "permission-fetch"]) {
       const transcript = `${dialogFixture(fixture)}\n${dialogFixture("question-closed")}`;
       expect(classifyPaneDialog(transcript).ready).toBe(true);
     }
@@ -871,6 +871,15 @@ describe("dialog-safe tmux delivery (#118)", () => {
       expect(tmux.injected()).toBe(false);
       expect(classifyPaneDialog(`${paneText}\n${dialogFixture("question-closed")}`).ready).toBe(true);
     }
+  });
+
+  it("defers background-agent permission hints without widening transcript matches", async () => {
+    const paneText = dialogFixture("permission").trimEnd()
+      + " · ctrl+x ctrl+k twice to stop background agents\n";
+    const tmux = fakeTmux({ paneText });
+    expect(await deliverViaTmux("%1", null, "peer message", tmux.run)).toBe(false);
+    expect(tmux.injected()).toBe(false);
+    expect(classifyPaneDialog(`${paneText}\n${dialogFixture("question-closed")}`).ready).toBe(true);
   });
 
   for (const capture of [{ captureExit: 1 }, { captureExit: 143, captureTimedOut: true }]) {

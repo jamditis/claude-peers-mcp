@@ -1,0 +1,16 @@
+────────────────────────────────────────────────────────────────────────────────
+ ☐ Sample color                                                                 
+
+Which sample color do you want?
+
+❯ 1. Blue                         ┌──────────────────────────────────────────┐
+  2. Orange                       │ color: #0000ff;                          │
+                                  └──────────────────────────────────────────┘
+                                                                              
+                                  Notes: Add notes on this design…            
+                                                                                
+────────────────────────────────────────────────────────────────────────────────
+  Chat about this                                                               
+                                                                                
+Enter to select · ↑/↓ to navigate · n to add notes · ctrl+g to edit in Vim · Esc
+to cancel
