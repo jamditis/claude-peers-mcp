@@ -1,0 +1,14 @@
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Color
+
+Which sample color should be used?
+
+❯ 1. Blue
+     A cool, calm sample color.
+  2. Orange
+     A warm, bright sample color.
+  3. Type something.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

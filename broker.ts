@@ -859,7 +859,7 @@ if (import.meta.main) {
     const lost = interrupts > 0
       ? ` ${interrupts} of them ${interrupts === 1 ? "was an interrupt, whose sender is blocked on this peer; it loses" : "were interrupts, whose senders are blocked on this peer; they lose"} push urgency and now wait for check_messages/the doorbell`
       : " they stay queued for check_messages and the doorbell now announces them";
-    console.error(`[claude-peers broker] demoting ${demoted} queued message(s) for peer ${row.to_id} to poll-only: message #${row.id} hit ${decision.reason} consecutive failed pushes (send-keys ran and missed), so this pane is not accepting keystrokes;${lost}`);
+    console.error(`[claude-peers broker] demoting ${demoted} queued message(s) for peer ${row.to_id} to poll-only: message #${row.id} hit ${decision.reason} consecutive failed pushes (tmux could not reach or type into the pane);${lost}`);
   }
 
   async function attemptDeliverNext(toId: string): Promise<"accepted" | "queued" | null> {
@@ -925,10 +925,10 @@ if (import.meta.main) {
           const streak = (deferralStreaks.get(toId) ?? 0) + 1;
           deferralStreaks.set(toId, streak);
           if (decideDeferralEscalation(streak, DEFERRAL_ESCALATION_CAP).escalate) {
-            console.error(`[claude-peers broker] escalation: pane ${target.pane} (peer ${toId}) deferred ${streak}x in a row (${reason}); no live Claude foreground seen, so its peer mail is not being delivered — if the session exited to a shell under a still-live pid the dead-pid sweep will not reap it`);
+            console.error(`[claude-peers broker] escalation: pane ${target.pane} (peer ${toId}) deferred ${streak}x in a row (${reason}); mail stays queued while the pane is not ready for push; check for an open dialog or a session that exited to a shell under a still-live pid`);
           }
         },
-        // onFault: the spawn never ran, so this attempt is evidence about the host, not the pane.
+        // onFault: spawn rejection or capture/send timeout is host evidence, not pane evidence.
         // It must not accrue toward the #70 demotion streak — an environment outage lasting a few
         // heartbeats would otherwise strip a row (worst, an interrupt) of its push channel.
         () => { faultedThisAttempt = true; });
@@ -966,7 +966,7 @@ if (import.meta.main) {
       // only an unbroken streak of shell deferrals should accrue toward the stuck-pane escalation.
       if (!deferredThisAttempt) deferralStreaks.delete(toId);
       for (const message of rows) releaseToQueued(db, message.id, token);
-      // A send that RAN and missed (send-keys exited non-zero) is the #70 case: the row returns to
+      // A capture or send that ran and exited non-zero is the #70 case: the row returns to
       // queued still pushable, so the next heartbeat retries it and the doorbell's withhold stays
       // shut on the poll-only mail behind it. Count it, and once the run reaches the cap demote the
       // row out of the push channel. The three other ways to reach this line are excluded on

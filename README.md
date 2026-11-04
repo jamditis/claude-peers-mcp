@@ -69,6 +69,8 @@ claude
 
 Use `interrupt` urgency when a message should be eligible for immediate push. `fyi` and default-floored remote messages remain poll-only even in tmux. See [delivery and the doorbell](docs/delivery.md).
 
+Push delivery waits while the visible pane shows a recognized question or permission dialog. The message stays queued for retry after the dialog closes; polling can still read it.
+
 ## Tools
 
 | Tool | Purpose |

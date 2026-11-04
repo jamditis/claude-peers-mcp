@@ -1,0 +1,14 @@
+────────────────────────────────────────────────────────────────────────────────
+ Edit file                                                                      
+ sample.txt      
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ 1 -Sample color: Blue                                                          
+ 1 +Sample color: Orange                                                        
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to make this edit to sample.txt?                                 
+ ❯ 1. Yes, and tell Claude what to do next                                      
+   2. Yes, and switch to accept edits (auto-approve file edits and common file  
+      commands) for this session (shift+tab)                                    
+   3. No                                                                        
+                         
+ Esc to cancel

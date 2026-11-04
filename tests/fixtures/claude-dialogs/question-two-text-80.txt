@@ -1,0 +1,15 @@
+────────────────────────────────────────────────────────────────────────────────
+←  ☐ Color  ☐ Size  ✔ Submit  →                                                 
+
+Which sample color do you want?
+
+  1. Blue                                                                     
+     Use blue as the sample color.                                              
+  2. Orange                                                            
+     Use orange as the sample color.                                          
+❯ 3. Type something.                                                            
+────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this                                                            
+                                                                                
+Enter to select · Tab/Arrow keys to navigate · ctrl+g to edit in Vim · Esc to 
+cancel

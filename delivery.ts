@@ -22,7 +22,7 @@ export function ensureMessagesTable(db: Database): void {
   // this row. NOT NULL DEFAULT 0 so every row carries a real count; the cap in
   // decideChannelPush reads it, and persisting it in the row (not an in-memory map) keeps
   // the cap honest across a broker restart. Never touched by the acked backends.
-  // push_failures: consecutive FAILED acked pushes of this row (the tmux send ran and missed).
+  // push_failures: consecutive failures reaching or typing into the pane (capture/send exited non-zero).
   // Per-row and persisted for the same reason: a restart must not hand a pane that cannot
   // accept keystrokes a fresh run of attempts. decidePushDemotion reads it (issue #70).
   db.run(`CREATE TABLE IF NOT EXISTS messages (
@@ -269,7 +269,7 @@ export const DEFAULT_PUSH_FAILURE_DEMOTION_CAP = 5;
  *
  * Pure and storage-agnostic like its siblings: the caller owns where the count lives (a per-row
  * push_failures column, so a restart cannot reset it) and what a "failure" is. Only one outcome
- * qualifies: a send that RAN and missed (send-keys exited non-zero). A readiness deferral never
+ * qualifies: tmux ran but could not reach or type into the pane (capture or send exited non-zero). A readiness deferral never
  * sent anything and keeps its own #42 counter, and a spawn FAULT (deliverViaTmux's onFault: the
  * process could not be created at all) is evidence about the host, not the pane — counting it
  * would let a transient tmux outage demote a row, which is the failure mode the streak exists to
@@ -286,15 +286,15 @@ export function decidePushDemotion(
 }
 
 /**
- * Whether one finished tmux attempt is the kind of failure the #70 demotion streak counts: a send
- * that RAN and missed. All three exclusions are attempts that also return false and also leave the
+ * Whether one finished tmux attempt is the kind of failure the #70 demotion streak counts: tmux
+ * ran but could not reach or type into the pane. All three exclusions also return false and leave the
  * row queued, so the boolean alone cannot separate them — the caller passes what deliverViaTmux's
  * callbacks told it.
  *
  *  - `ok`: the send landed. Nothing to count (the caller resets the streak instead).
- *  - `deferred`: the readiness probe positively identified a shell, so nothing was sent. It has
+ *  - `deferred`: a probe positively identified a shell or active dialog, so nothing was sent. It has
  *    its own consecutive-deferral counter and escalation (#42).
- *  - `faulted`: the attempt never reached the pane — the spawn rejected, or the send outlived its
+ *  - `faulted`: the attempt never reached the pane — the spawn rejected, or capture/send outlived its
  *    deadline and was killed. This is evidence about the host, not the pane, and counting it would
  *    let a transient outage lasting `cap` heartbeats demote a healthy pane's mail, which is
  *    precisely what requiring a streak was meant to prevent. It does not clear the streak either:
@@ -637,8 +637,8 @@ export function formatCoalescedPeerPaste(
 
 /**
  * One tmux invocation, with its stdout — the single seam every tmux process in the delivery path
- * goes through, because both stages need output: the readiness probe reads the pane's foreground
- * command, and the guarded inject reads which branch tmux took.
+ * goes through: the probes read the pane's foreground command and visible dialog footer,
+ * and the guarded inject reads which branch tmux took.
  *
  * `exitCode` 0 is the only success. `timedOut` says the caller's own kill-timer fired, i.e. the
  * process was still running when its deadline passed and was killed — NOT that tmux decided to
@@ -691,9 +691,8 @@ export interface PaneReadiness {
  * Anything else (node or bun running Claude, or an unrecognized command) is treated as
  * ready, so an unknown foreground never blocks a legitimate delivery. This check only
  * suppresses the one case it can positively identify as wrong, and fails open otherwise.
- * Detecting a modal or permission prompt inside a live Claude pane needs capture-pane
- * signature matching and is out of scope (issue #5): the foreground process is still node
- * in that state, so this check passes it through.
+ * Dialogs keep the same foreground process; classifyPaneDialog checks captured pane text
+ * separately before the guarded send.
  *
  * See buildPaneReadyFormat for the atomic-guard twin of this check: the same denylist
  * expressed as a tmux `-F` predicate, for closing the probe-to-send TOCTOU in issue #44.
@@ -703,6 +702,33 @@ export function classifyPaneReadiness(currentCommand: string): PaneReadiness {
   if (cmd === "") return { ready: true, reason: "no foreground command reported; injecting" };
   if (SHELL_COMMANDS.has(cmd)) return { ready: false, reason: `pane foreground is a shell (${cmd})` };
   return { ready: true, reason: `pane foreground is ${cmd}` };
+}
+
+/** Match active dialog controls at the screen bottom, not questions in the transcript. */
+export function classifyPaneDialog(paneText: string): PaneReadiness {
+  const screen = paneText.split("\n").map((line) => line.trimEnd()).join("\n").trimEnd();
+  const lines = screen.split("\n");
+  const footer = lines.at(-1)?.trim() ?? "";
+  // Ink can write hard line breaks inside hints; capture-pane -J cannot join those.
+  const tail = lines.slice(-4).map((line) => line.trim()).join(" ");
+  const question = /(?:^| )Enter to select · (?:↑\/↓|Tab\/Arrow keys) to navigate(?: · [^·]+)*$/;
+  // The multi-question review screen has no footer, but has these exact final controls.
+  const submit = /\nReady to submit your answers\?\n\n\s*(?:❯\s*)?1\. Submit answers\n\s*(?:❯\s*)?2\. Cancel\s*$/;
+  if (question.test(tail) || submit.test(screen)) {
+    return { ready: false, reason: "pane shows a question dialog" };
+  }
+  const permission = /^Esc to cancel(?: · .*)?$/;
+  // WebFetch has no keyboard footer; its last control is this explicit rejection option.
+  const reject = /(?:^| )(?:❯\s*)?(?:\d+\.\s*)?No, and tell Claude what to do differently \(esc\)$/;
+  const yes = /^\s*(?:❯\s*)?(?:\d+\.\s*)?Yes\b/m;
+  // Auto-mode fallbacks hide indexes, put No first, and end with a plain Yes control.
+  const noFirst = /(?:^| )(?:❯\s*)?Yes$/.test(tail)
+    && /^\s*(?:❯\s*)?No\b/m.test(screen)
+    && /^\s*❯\s*(?:Yes|No)\b/m.test(screen);
+  if ((permission.test(footer) || reject.test(tail) || noFirst) && yes.test(screen)) {
+    return { ready: false, reason: "pane shows a permission dialog" };
+  }
+  return { ready: true, reason: "no active dialog footer found" };
 }
 
 /**
@@ -866,6 +892,14 @@ export function buildPaneCommandArgs(pane: string, socket: string | null): strin
   return args;
 }
 
+/** Read only the visible pane, joining soft wraps without including scrollback or ANSI escapes. */
+export function buildPaneCaptureArgs(pane: string, socket: string | null): string[] {
+  const args = ["tmux"];
+  if (socket) args.push("-S", socket);
+  args.push("capture-pane", "-p", "-J", "-t", pane);
+  return args;
+}
+
 /** Build the argv that asks tmux for a pane's session name (#S), the human-facing handle. */
 export function buildSessionNameArgs(pane: string, socket: string | null): string[] {
   const args = ["tmux"];
@@ -966,11 +1000,14 @@ export async function probePaneReadiness(
 }
 
 /**
- * Inject text into a pane, in two stages that answer two different questions.
+ * Check the foreground and visible dialog state, then inject with the atomic shell guard.
  *
  * First the pre-send probe (probePaneReadiness): a separate tmux process reads the pane's
  * foreground command, and a clean probe that positively identifies a shell defers the whole
- * attempt — no send is issued, false is returned, and the row stays queued. Then the guarded
+ * attempt — no send is issued, false is returned, and the row stays queued. Next capture-pane
+ * reads the visible screen: an active question or permission footer defers the attempt, and an
+ * unreadable capture leaves mail queued without typing. The captured screen is a point-in-time observation;
+ * a dialog can still open after capture, unlike the atomic foreground guard. Then the guarded
  * send (buildGuardedTmuxArgs): one tmux process that re-evaluates the same readiness predicate
  * and types the text in the same invocation, which narrows the window in which a session that
  * exits right after a clean probe can still be pasted into — from two client round-trips (~10ms
@@ -979,28 +1016,24 @@ export async function probePaneReadiness(
  * what residual remains). The guard is a backstop for that window, not a replacement for the
  * probe.
  *
- * One seam (`run`) spawns every tmux process here, because both stages need stdout: the probe
- * reads the pane command, the send reads the branch marker classifyGuardedSend reads back.
+ * One seam (`run`) spawns every tmux process here and captures each process's stdout.
  *
  * Three outcomes leave the message queued, and the callbacks exist so a caller can tell them
  * apart — because only ONE of them is evidence that a push ran and missed, the single thing the
  * #70 demotion streak counts (countsAsPushFailure):
  *
- *  - DEFER (`onDefer`): a shell was positively identified, either by the pre-send probe or by
- *    the guard's else branch when the pane changed under a probe that had cleared it. Both are
- *    the same identification, one just later, so both fire the callback; the broker counts them
- *    toward the stuck-pane escalation (issue #42) and not toward the demotion streak. Nothing
- *    was typed, and the pane — not the send — is what failed.
- *  - FAULT (`onFault`): the attempt never got a verdict out of tmux. Either the send spawn
- *    REJECTED (process creation failed, the tmux binary momentarily unavailable), or the send
+ *  - DEFER (`onDefer`): a shell or an active dialog was positively identified. The broker counts
+ *    these toward the not-ready escalation (issue #42), not the demotion streak. Nothing was typed.
+ *  - FAULT (`onFault`): the attempt never got a verdict out of tmux. Either a capture/send spawn
+ *    REJECTED (process creation failed, the tmux binary momentarily unavailable), or that command
  *    outlived its deadline and the spawner killed it (`timedOut` — a stalled tmux server, whose
  *    128+signal exit code is otherwise indistinguishable from a genuine failure). Both say
  *    something about the HOST, not the pane, so they neither advance nor clear the demotion
  *    streak; counting them would let a transient outage lasting `cap` heartbeats strip an
- *    interrupt of its push channel. A probe that faults is not this: probePaneReadiness swallows
- *    its own errors and fails open, so a broken probe still injects.
- *  - MISS: tmux ran the send and exited non-zero on its own. Neither callback fires. This is the
- *    only outcome the demotion streak counts, and it is unchanged from before the guard existed.
+ *    interrupt of its push channel. The foreground probe alone still fails open; the atomic
+ *    guard backs it up.
+ *  - MISS: tmux ran the capture or send and exited non-zero on its own. Neither callback fires.
+ *    An unreachable pane must still advance the demotion streak so its mail becomes poll-only.
  *
  * The callbacks are mutually exclusive, and a clean exit that is not a defer returns true —
  * including the marker-less answer a stubbed or pre-2.9 tmux gives, which classifyGuardedSend
@@ -1016,6 +1049,22 @@ export async function deliverViaTmux(
     if (!readiness.ready) {
       console.error(`[claude-peers broker] deferring tmux delivery to pane ${pane}: ${readiness.reason}`);
       onDefer?.(readiness.reason);
+      return false;
+    }
+    const capture = await run(buildPaneCaptureArgs(pane, socket));
+    if (capture.timedOut) {
+      throw new Error(`tmux pane capture failed (exit ${capture.exitCode}, timed out: ${capture.timedOut === true})`);
+    }
+    if (capture.exitCode !== 0) {
+      // The target is unreachable: count a miss so #70 still bounds the doorbell withhold.
+      // Do not type into a pane whose dialog state could not be read.
+      console.error(`[claude-peers broker] pane capture exited ${capture.exitCode} for pane ${pane}; not typing`);
+      return false;
+    }
+    const dialog = classifyPaneDialog(capture.stdout);
+    if (!dialog.ready) {
+      console.error(`[claude-peers broker] deferring tmux delivery to pane ${pane}: ${dialog.reason}`);
+      onDefer?.(dialog.reason);
       return false;
     }
     const { exitCode, stdout, timedOut } = await run(buildGuardedTmuxArgs(pane, socket, text));
@@ -1040,13 +1089,13 @@ export async function deliverViaTmux(
     }
     return outcome === "sent";
   } catch (e) {
-    // A non-zero exit is handled above; reaching here means the spawn itself
-    // rejected (a bug or environment fault, not a normal failed delivery). The
+    // Non-zero exits are handled above; reaching here means capture timed out or a
+    // capture/send spawn rejected (a host fault, not a normal failed delivery). The
     // message still stays queued — never silently dropped — but the fault is
     // logged so it does not vanish, unlike the ordinary non-zero-exit miss, and
     // reported through onFault so a caller can hold it against the environment
     // rather than against the pane.
-    console.error(`[claude-peers broker] tmux delivery spawn error for pane ${pane}:`, e);
+    console.error(`[claude-peers broker] tmux delivery error for pane ${pane}:`, e);
     onFault?.(e);
     return false;
   }

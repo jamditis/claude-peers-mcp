@@ -28,6 +28,7 @@ const SLOW_PANE = "%77";
 // requeues the row with its push_after intact and retries on every later heartbeat. This is the
 // pane that never recovers -- the case the push-delay bound does not cover.
 const FAIL_PANE = "%78";
+const UNREACHABLE_PANE = "%80";
 // A pane whose first send stalls and fails, then succeeds. It makes a failed coalesced attempt
 // deterministic without changing the broker's retry schedule.
 const FLAKY_PANE = "%79";
@@ -122,13 +123,15 @@ beforeAll(async () => {
   const stub = join(work, "tmux");
   writeFileSync(stub, `#!/usr/bin/env bash
 if [ "$1" = "-V" ]; then echo "tmux 3.4"; exit 0; fi
-_sk=0; _slow=0; _fail=0; _flaky=0
+_sk=0; _slow=0; _fail=0; _unreachable=0; _flaky=0
 for _a in "$@"; do
   case "$_a" in *send-keys*) _sk=1;; esac
   [ "$_a" = "${SLOW_PANE}" ] && _slow=1
   [ "$_a" = "${FAIL_PANE}" ] && _fail=1
+  [ "$_a" = "${UNREACHABLE_PANE}" ] && _unreachable=1
   [ "$_a" = "${FLAKY_PANE}" ] && _flaky=1
 done
+[ "$_unreachable" = 1 ] && exit 1
 [ "$_sk" = 1 ] && [ -n "$TMUX_LOG" ] && { printf '%q ' "$@" >> "$TMUX_LOG"; printf '\n' >> "$TMUX_LOG"; }
 [ "$_sk" = 1 ] && [ "$_slow" = 1 ] && sleep 1
 [ "$_sk" = 1 ] && [ "$_flaky" = 1 ] && [ -n "$TMUX_FAIL_ONCE" ] && [ ! -e "$TMUX_FAIL_ONCE" ] && { sleep 1; : > "$TMUX_FAIL_ONCE"; exit 1; }
@@ -626,70 +629,74 @@ describe("a ring waits for a push that is coming later, not just one already in 
   // failed push IS: after a bounded run of failed sends the row's push_after is cleared, it stops
   // being a push, and the guard opens on that attempt's own settle. This test walks the failing
   // pane past the cap and expects the whole readable backlog announced.
-  it("rings poll-only mail once a repeatedly-failing push is demoted (issue #70)", async () => {
-    writeFileSync(CONFIG_PATH_FAIL, JSON.stringify({
-      machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_FAIL,
-      id_prefix: "dbf", siblings: [], allowed_ips: ["127.0.0.1"], db_path: DB_PATH_FAIL,
-      push_delay_ms: 0,
-    }));
-    const failing = Bun.spawn(["bun", "broker.ts"], {
-      cwd: join(import.meta.dir, ".."),
-      env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH_FAIL, PATH: `${work}:${process.env.PATH}` },
-      stdout: "ignore", stderr: "ignore",
-    });
-    try {
-      expect(await waitForHealth(PORT_FAIL)).toBe(true);
-      const rcpt = await regRcpt({ cwd: "/tmp/fail", tmux_pane: FAIL_PANE }, PORT_FAIL);
-      const sender = await regSender({ cwd: "/tmp/fail-s" }, PORT_FAIL);
+  for (const pane of [FAIL_PANE, UNREACHABLE_PANE]) {
+    it(`rings poll-only mail after failed send or capture on ${pane} is demoted (#70, #118)`, async () => {
+      const configPath = `${CONFIG_PATH_FAIL}-${pane.slice(1)}`;
+      const dbPath = `${DB_PATH_FAIL}-${pane.slice(1)}`;
+      writeFileSync(configPath, JSON.stringify({
+        machine: "db-a", tailscale_ip: "127.0.0.1", port: PORT_FAIL,
+        id_prefix: "dbf", siblings: [], allowed_ips: ["127.0.0.1"], db_path: dbPath,
+        push_delay_ms: 0,
+      }));
+      const failing = Bun.spawn(["bun", "broker.ts"], {
+        cwd: join(import.meta.dir, ".."),
+        env: { ...process.env, CLAUDE_PEERS_CONFIG: configPath, PATH: `${work}:${process.env.PATH}` },
+        stdout: "ignore", stderr: "ignore",
+      });
+      try {
+        expect(await waitForHealth(PORT_FAIL)).toBe(true);
+        const rcpt = await regRcpt({ cwd: "/tmp/fail", tmux_pane: pane }, PORT_FAIL);
+        const sender = await regSender({ cwd: "/tmp/fail-s" }, PORT_FAIL);
 
-      // Due immediately (push_delay_ms 0), so the send's own deliverNext attempts the push now.
-      // send-keys exits 1, so deliverViaTmux returns false and the row goes back to 'queued' with
-      // push_after untouched — still pushable, and retried on every heartbeat until the cap.
-      await okAt(PORT_FAIL, "/send-message",
-        { from_id: sender.id, to_id: rcpt.id, text: "push that cannot land", urgency: "normal" }, sender.token);
-      await okAt(PORT_FAIL, "/send-message",
-        { from_id: sender.id, to_id: rcpt.id, text: "poll only", urgency: "fyi" }, sender.token);
+        // Due immediately (push_delay_ms 0), so the send's own deliverNext attempts the push now.
+        // send-keys or capture-pane exits 1, so deliverViaTmux returns false and the row goes back to 'queued' with
+        // push_after untouched — still pushable, and retried on every heartbeat until the cap.
+        await okAt(PORT_FAIL, "/send-message",
+          { from_id: sender.id, to_id: rcpt.id, text: "push that cannot land", urgency: "normal" }, sender.token);
+        await okAt(PORT_FAIL, "/send-message",
+          { from_id: sender.id, to_id: rcpt.id, text: "poll only", urgency: "fyi" }, sender.token);
 
-      const peek = await okAt(PORT_FAIL, "/peek", { id: rcpt.id }, rcpt.token);
-      expect(peek.count).toBe(2);
-      const probe = new Database(DB_PATH_FAIL);
-      const states = probe.query(
-        "SELECT delivery_state, push_after FROM messages WHERE to_id = ? ORDER BY id",
-      ).all(rcpt.id) as { delivery_state: string; push_after: number | null }[];
-      probe.close();
-      // Both rows sit queued between attempts, so a poll right now would release the pair.
-      expect(states.map((s) => s.delivery_state)).toEqual(["queued", "queued"]);
-      expect(states[0]?.push_after).not.toBeNull();  // the failed push is still pushable
+        const peek = await okAt(PORT_FAIL, "/peek", { id: rcpt.id }, rcpt.token);
+        expect(peek.count).toBe(2);
+        const probe = new Database(dbPath);
+        const states = probe.query(
+          "SELECT delivery_state, push_after FROM messages WHERE to_id = ? ORDER BY id",
+        ).all(rcpt.id) as { delivery_state: string; push_after: number | null }[];
+        probe.close();
+        // Both rows sit queued between attempts, so a poll right now would release the pair.
+        expect(states.map((s) => s.delivery_state)).toEqual(["queued", "queued"]);
+        expect(states[0]?.push_after).not.toBeNull();  // the failed push is still pushable
 
-      // Below the cap nothing changes: each heartbeat re-attempts, re-fails, and re-queues, and
-      // the bell stays silent because the row is still a push the next heartbeat will claim. A
-      // single transient failure must not cost a row its push channel, so this half matters as
-      // much as the demotion below.
-      await okAt(PORT_FAIL, "/heartbeat", { id: rcpt.id }, rcpt.token); // failures: 2
-      await okAt(PORT_FAIL, "/heartbeat", { id: rcpt.id }, rcpt.token); // failures: 3
-      expect(readDoorbell(DB_PATH_FAIL, rcpt.id, -1)).toBe(-1);
+        // Below the cap nothing changes: each heartbeat re-attempts, re-fails, and re-queues, and
+        // the bell stays silent because the row is still a push the next heartbeat will claim. A
+        // single transient failure must not cost a row its push channel, so this half matters as
+        // much as the demotion below.
+        await okAt(PORT_FAIL, "/heartbeat", { id: rcpt.id }, rcpt.token); // failures: 2
+        await okAt(PORT_FAIL, "/heartbeat", { id: rcpt.id }, rcpt.token); // failures: 3
+        expect(readDoorbell(dbPath, rcpt.id, -1)).toBe(-1);
 
-      // Past the cap (5 consecutive failed sends: the send itself plus four heartbeats) the row is
-      // demoted out of the push channel, so nothing is left that a poll could be beaten to, and
-      // this heartbeat's own settle announces the backlog -- the demoted row included.
-      await okAt(PORT_FAIL, "/heartbeat", { id: rcpt.id }, rcpt.token); // failures: 4
-      await okAt(PORT_FAIL, "/heartbeat", { id: rcpt.id }, rcpt.token); // failures: 5 -> demoted
-      expect(readDoorbell(DB_PATH_FAIL, rcpt.id, -1)).toBe(peek.max_id);
+        // Past the cap (5 consecutive tmux failures: the send itself plus four heartbeats) the row is
+        // demoted out of the push channel, so nothing is left that a poll could be beaten to, and
+        // this heartbeat's own settle announces the backlog -- the demoted row included.
+        await okAt(PORT_FAIL, "/heartbeat", { id: rcpt.id }, rcpt.token); // failures: 4
+        await okAt(PORT_FAIL, "/heartbeat", { id: rcpt.id }, rcpt.token); // failures: 5 -> demoted
+        expect(readDoorbell(dbPath, rcpt.id, -1)).toBe(peek.max_id);
 
-      const after = new Database(DB_PATH_FAIL);
-      const rows = after.query(
-        "SELECT delivery_state, push_after FROM messages WHERE to_id = ? ORDER BY id",
-      ).all(rcpt.id) as { delivery_state: string; push_after: number | null }[];
-      after.close();
-      // Demoted, not dropped: both rows are still queued and still readable by check_messages;
-      // the failed push simply joined the fyi in the poll-only channel.
-      expect(rows.map((r) => r.delivery_state)).toEqual(["queued", "queued"]);
-      expect(rows[0]?.push_after).toBeNull();
-    } finally {
-      failing.kill();
-      await failing.exited;
-    }
-  }, 20_000);
+        const after = new Database(dbPath);
+        const rows = after.query(
+          "SELECT delivery_state, push_after FROM messages WHERE to_id = ? ORDER BY id",
+        ).all(rcpt.id) as { delivery_state: string; push_after: number | null }[];
+        after.close();
+        // Demoted, not dropped: both rows are still queued and still readable by check_messages;
+        // the failed push simply joined the fyi in the poll-only channel.
+        expect(rows.map((r) => r.delivery_state)).toEqual(["queued", "queued"]);
+        expect(rows[0]?.push_after).toBeNull();
+      } finally {
+        failing.kill();
+        await failing.exited;
+      }
+    }, 20_000);
+  }
 
   const PORT_LOUD = 17949;
   const DB_PATH_LOUD = join(work, "loud.db");
