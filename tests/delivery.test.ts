@@ -946,7 +946,7 @@ describe("dialog-safe tmux delivery (#118)", () => {
       return row.id;
     };
     for (let i = 0; i < DEFAULT_PUSH_FAILURE_DEMOTION_CAP + 1; i++) {
-      expect(await attempt()).toBe(ids[0]);
+      expect(await attempt()).toBe(ids[0]!);
     }
     expect(pastes).toEqual([]);
     for (const id of ids) {
@@ -956,8 +956,8 @@ describe("dialog-safe tmux delivery (#118)", () => {
       expect(readPushAfter(db, id, null)).toBe(0);
     }
     paneText = dialogFixture("question-closed");
-    expect(await attempt()).toBe(ids[0]);
-    expect(await attempt()).toBe(ids[1]);
+    expect(await attempt()).toBe(ids[0]!);
+    expect(await attempt()).toBe(ids[1]!);
     expect(await attempt()).toBeNull();
     expect(pastes).toHaveLength(2);
     expect(pastes[0]?.join(" ")).toContain("first peer message");
