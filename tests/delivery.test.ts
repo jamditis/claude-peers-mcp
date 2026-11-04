@@ -857,6 +857,22 @@ describe("dialog-safe tmux delivery (#118)", () => {
     expect(classifyPaneDialog(screen).ready).toBe(false);
   });
 
+  it("defers hidden-index permission variants from the installed auto-mode renderer", async () => {
+    const bash = dialogFixture("permission").replace(/^(\s*(?:❯\s*)?)\d+\. /gm, "$1");
+    const fetch = dialogFixture("permission-fetch");
+    const choices = fetch.indexOf(" ❯ 1. Yes");
+    expect(choices).toBeGreaterThan(0);
+    // inPlaceOfClassifier hides indexes and reverses the No/Yes option order in 2.1.318.
+    const noFirst = `${fetch.slice(0, choices)} ❯ No, and tell Claude what to do differently (esc)\n   Yes\n`;
+    const yesFocused = noFirst.replace("❯ No", "No").replace("\n   Yes", "\n ❯ Yes");
+    for (const paneText of [bash, noFirst, yesFocused]) {
+      const tmux = fakeTmux({ paneText });
+      expect(await deliverViaTmux("%1", null, "peer message", tmux.run)).toBe(false);
+      expect(tmux.injected()).toBe(false);
+      expect(classifyPaneDialog(`${paneText}\n${dialogFixture("question-closed")}`).ready).toBe(true);
+    }
+  });
+
   for (const capture of [{ captureExit: 1 }, { captureExit: 143, captureTimedOut: true }]) {
     it(`keeps mail retryable when capture fails: ${JSON.stringify(capture)}`, async () => {
       const tmux = fakeTmux(capture);

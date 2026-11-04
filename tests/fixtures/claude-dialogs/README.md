@@ -11,3 +11,5 @@ The closed fixtures contain the transcript result and ordinary input prompt afte
 The installed 2.1.318 footer renderer also supplies the optional non-NORMAL Vim mode prefix and cancel hint. One test applies those independently observed variants to a captured two-question screen.
 
 `question-two-text-80.txt` records an application-written line break in the keyboard hint while the free-text option has focus. `permission-fetch.txt` records a WebFetch permission screen with no keyboard footer. Both use `tmux capture-pane -p -J` at 80 columns by 38 rows.
+
+Auto-mode hidden-index variants are derived from these recorded permission controls and the installed renderer's `inPlaceOfClassifier`, `hideIndexes` and default-to-No branches. They are labelled source-derived tests, not additional live recordings.

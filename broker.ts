@@ -928,7 +928,7 @@ if (import.meta.main) {
             console.error(`[claude-peers broker] escalation: pane ${target.pane} (peer ${toId}) deferred ${streak}x in a row (${reason}); mail stays queued while the pane is not ready for push; check for an open dialog or a session that exited to a shell under a still-live pid`);
           }
         },
-        // onFault: the spawn never ran, so this attempt is evidence about the host, not the pane.
+        // onFault: spawn rejection or capture/send timeout is host evidence, not pane evidence.
         // It must not accrue toward the #70 demotion streak — an environment outage lasting a few
         // heartbeats would otherwise strip a row (worst, an interrupt) of its push channel.
         () => { faultedThisAttempt = true; });

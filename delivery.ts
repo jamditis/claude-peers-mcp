@@ -22,7 +22,7 @@ export function ensureMessagesTable(db: Database): void {
   // this row. NOT NULL DEFAULT 0 so every row carries a real count; the cap in
   // decideChannelPush reads it, and persisting it in the row (not an in-memory map) keeps
   // the cap honest across a broker restart. Never touched by the acked backends.
-  // push_failures: consecutive FAILED acked pushes of this row (the tmux send ran and missed).
+  // push_failures: consecutive failures reaching or typing into the pane (capture/send exited non-zero).
   // Per-row and persisted for the same reason: a restart must not hand a pane that cannot
   // accept keystrokes a fresh run of attempts. decidePushDemotion reads it (issue #70).
   db.run(`CREATE TABLE IF NOT EXISTS messages (
@@ -294,7 +294,7 @@ export function decidePushDemotion(
  *  - `ok`: the send landed. Nothing to count (the caller resets the streak instead).
  *  - `deferred`: a probe positively identified a shell or active dialog, so nothing was sent. It has
  *    its own consecutive-deferral counter and escalation (#42).
- *  - `faulted`: the attempt never reached the pane — the spawn rejected, or the send outlived its
+ *  - `faulted`: the attempt never reached the pane — the spawn rejected, or capture/send outlived its
  *    deadline and was killed. This is evidence about the host, not the pane, and counting it would
  *    let a transient outage lasting `cap` heartbeats demote a healthy pane's mail, which is
  *    precisely what requiring a streak was meant to prevent. It does not clear the streak either:
@@ -719,8 +719,13 @@ export function classifyPaneDialog(paneText: string): PaneReadiness {
   }
   const permission = /^Esc to cancel(?: · Tab to amend)?$/;
   // WebFetch has no keyboard footer; its last control is this explicit rejection option.
-  const reject = /(?:^| )(?:❯\s*)?\d+\. No, and tell Claude what to do differently \(esc\)$/;
-  if ((permission.test(footer) || reject.test(tail)) && /^\s*(?:❯\s*)?\d+\. Yes\b/m.test(screen)) {
+  const reject = /(?:^| )(?:❯\s*)?(?:\d+\.\s*)?No, and tell Claude what to do differently \(esc\)$/;
+  const yes = /^\s*(?:❯\s*)?(?:\d+\.\s*)?Yes\b/m;
+  // Auto-mode fallbacks hide indexes, put No first, and end with a plain Yes control.
+  const noFirst = /(?:^| )(?:❯\s*)?Yes$/.test(tail)
+    && /^\s*(?:❯\s*)?No\b/m.test(screen)
+    && /^\s*❯\s*(?:Yes|No)\b/m.test(screen);
+  if ((permission.test(footer) || reject.test(tail) || noFirst) && yes.test(screen)) {
     return { ready: false, reason: "pane shows a permission dialog" };
   }
   return { ready: true, reason: "no active dialog footer found" };
