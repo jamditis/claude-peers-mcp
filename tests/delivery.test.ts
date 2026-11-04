@@ -1,11 +1,12 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { unlinkSync } from "node:fs";
+import { readFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildPaneCommandArgs, buildPaneReadyFormat, buildSessionNameArgs, buildTmuxArgs, claimForDelivery, classifyPaneReadiness, SHELL_COMMANDS,
   buildGuardedTmuxArgs, classifyGuardedSend, GUARD_DEFERRED_MARKER, GUARD_SENT_MARKER,
+  buildPaneCaptureArgs, classifyPaneDialog,
   quoteTmuxArg, renderTmuxCommandString,
   bumpChannelPushAttempts, getChannelPushAttempts, resolveChannelPushCap,
   confirmDelivered, DEFAULT_CHANNEL_PUSH_CAP,
@@ -780,8 +781,8 @@ describe("buildTmuxArgs", () => {
   });
 });
 
-// One injected seam stands in for tmux across both stages of a send: the display-message
-// readiness probe answers with `foreground`, and the guarded if-shell inject answers with the
+// One boundary seam stands in for tmux: display-message answers with `foreground`, capture-pane
+// with recorded visible text, and the guarded if-shell inject answers with the
 // branch tmux would have taken. `branch: "silent"` is the marker-less tmux (too old for the
 // format operators, or a stub) the send path must still fail open on; `timedOut` is the spawner
 // reporting that its own kill-timer, not tmux, ended the send (#70).
@@ -791,10 +792,16 @@ function fakeTmux(opts: {
   branch?: "sent" | "deferred" | "silent";
   sendExit?: number;
   timedOut?: boolean;
+  paneText?: string;
+  captureExit?: number;
+  captureTimedOut?: boolean;
 }) {
   const calls: string[][] = [];
   const run: TmuxQuery = async (args) => {
     calls.push(args);
+    if (args.includes("capture-pane")) {
+      return { exitCode: opts.captureExit ?? 0, stdout: opts.paneText ?? "", timedOut: opts.captureTimedOut ?? false };
+    }
     if (args.includes("if-shell")) {
       const branch = opts.branch ?? "sent";
       const stdout = branch === "silent" ? "" : `${branch === "sent" ? GUARD_SENT_MARKER : GUARD_DEFERRED_MARKER}\n`;
@@ -804,6 +811,129 @@ function fakeTmux(opts: {
   };
   return { run, calls, injected: () => calls.some((a) => a.includes("if-shell")) };
 }
+
+function dialogFixture(name: string): string {
+  return readFileSync(new URL(`./fixtures/claude-dialogs/${name}.txt`, import.meta.url), "utf8");
+}
+
+describe("dialog-safe tmux delivery (#118)", () => {
+  for (const fixture of ["question-select", "question-text", "question-80", "question-multi", "question-submit", "permission", "permission-amend"]) {
+    it(`defers the captured ${fixture} dialog without typing or counting a push failure`, async () => {
+      const tmux = fakeTmux({ paneText: dialogFixture(fixture) });
+      const reasons: string[] = [];
+      const faults: unknown[] = [];
+      const ok = await deliverViaTmux("%1", null, "peer message", tmux.run,
+        (reason) => reasons.push(reason), (error) => faults.push(error));
+      expect(ok).toBe(false);
+      expect(tmux.injected()).toBe(false);
+      expect(reasons).toHaveLength(1);
+      expect(faults).toEqual([]);
+      expect(countsAsPushFailure({ ok, deferred: reasons.length > 0, faulted: faults.length > 0 })).toBe(false);
+    });
+  }
+
+  for (const fixture of ["question-closed", "permission-closed"]) {
+    it(`delivers into the captured ${fixture} pane`, async () => {
+      const tmux = fakeTmux({ paneText: dialogFixture(fixture) });
+      expect(await deliverViaTmux("%1", null, "peer message", tmux.run)).toBe(true);
+      expect(tmux.injected()).toBe(true);
+    });
+  }
+
+  it("does not treat quoted dialog text above a normal prompt as an active dialog", () => {
+    const transcript = `${dialogFixture("question-text")}\n${dialogFixture("question-closed")}`;
+    expect(classifyPaneDialog(transcript).ready).toBe(true);
+    expect(classifyPaneDialog("Which sample color should be used?\nDo you want to proceed?\n").ready).toBe(true);
+    expect(classifyPaneDialog("Press a key\nEsc to cancel\n").ready).toBe(true);
+  });
+
+  for (const capture of [{ captureExit: 1 }, { captureExit: 143, captureTimedOut: true }]) {
+    it(`keeps mail retryable when capture fails: ${JSON.stringify(capture)}`, async () => {
+      const tmux = fakeTmux(capture);
+      const faults: unknown[] = [];
+      let deferred = false;
+      const ok = await deliverViaTmux("%1", null, "peer message", tmux.run,
+        () => { deferred = true; }, (error) => faults.push(error));
+      expect(ok).toBe(false);
+      expect(tmux.injected()).toBe(false);
+      expect(deferred).toBe(false);
+      expect(faults).toHaveLength(1);
+      expect(countsAsPushFailure({ ok, deferred, faulted: faults.length > 0 })).toBe(false);
+    });
+  }
+
+  it("defers when capture cannot spawn, without counting a push failure", async () => {
+    const tmux = fakeTmux({});
+    const run: TmuxQuery = async (args) => {
+      if (args.includes("capture-pane")) throw new Error("spawn EAGAIN");
+      return tmux.run(args);
+    };
+    const faults: unknown[] = [];
+    expect(await deliverViaTmux("%1", null, "peer message", run, undefined, (error) => faults.push(error))).toBe(false);
+    expect(tmux.injected()).toBe(false);
+    expect(faults).toHaveLength(1);
+  });
+
+  it("keeps deferred rows queued, then delivers them once in order when the dialog closes", async () => {
+    const db = new Database(":memory:");
+    ensureMessagesTable(db);
+    for (const text of ["first peer message", "second peer message"]) {
+      db.run("INSERT INTO messages (from_id,to_id,text,sent_at,push_failures) VALUES ('a','b',?,?,2)",
+        [text, new Date().toISOString()]);
+    }
+    const ids = (db.query("SELECT id FROM messages ORDER BY id").all() as { id: number }[]).map((row) => row.id);
+    let paneText = dialogFixture("question-text");
+    const pastes: string[][] = [];
+    const run: TmuxQuery = async (args) => {
+      if (args.includes("capture-pane")) return { exitCode: 0, stdout: paneText };
+      if (args.includes("if-shell")) {
+        pastes.push(args);
+        return { exitCode: 0, stdout: `${GUARD_SENT_MARKER}\n` };
+      }
+      return { exitCode: 0, stdout: "node\n" };
+    };
+    const attempt = async () => {
+      const row = nextDeliverable(db, "b", 1000, new Set());
+      if (!row) return null;
+      const token = `attempt-${row.id}`;
+      expect(claimForDelivery(db, row.id, 1000, 5000, token)).toBe(true);
+      let deferred = false;
+      let faulted = false;
+      const ok = await deliverViaTmux("%1", null, row.text, run,
+        () => { deferred = true; }, () => { faulted = true; });
+      if (ok) {
+        expect(confirmDelivered(db, row.id, token)).toBe(true);
+        resetPushFailures(db, row.id);
+      } else {
+        releaseToQueued(db, row.id, token);
+        if (countsAsPushFailure({ ok, deferred, faulted })) bumpPushFailures(db, row.id);
+      }
+      return row.id;
+    };
+    for (let i = 0; i < DEFAULT_PUSH_FAILURE_DEMOTION_CAP + 1; i++) {
+      expect(await attempt()).toBe(ids[0]);
+    }
+    expect(pastes).toEqual([]);
+    for (const id of ids) {
+      expect(state(db, id).delivery_state).toBe("queued");
+      expect(state(db, id).lease_token).toBeNull();
+      expect(getPushFailures(db, id)).toBe(2);
+      expect(readPushAfter(db, id, null)).toBe(0);
+    }
+    paneText = dialogFixture("question-closed");
+    expect(await attempt()).toBe(ids[0]);
+    expect(await attempt()).toBe(ids[1]);
+    expect(await attempt()).toBeNull();
+    expect(pastes).toHaveLength(2);
+    expect(pastes[0]?.join(" ")).toContain("first peer message");
+    expect(pastes[1]?.join(" ")).toContain("second peer message");
+    for (const id of ids) {
+      expect(state(db, id).delivery_state).toBe("delivered");
+      expect(getPushFailures(db, id)).toBe(0);
+    }
+    db.close();
+  });
+});
 
 describe("deliverViaTmux", () => {
   it("returns true when the guarded inject reports it sent", async () => {
@@ -829,11 +959,12 @@ describe("deliverViaTmux", () => {
     expect(await deliverViaTmux("%1", null, "hi", tmux.run)).toBe(false);
     expect(tmux.injected()).toBe(false); // the wrong text must not land in the shell
   });
-  it("fails open and injects when the probe errors", async () => {
+  it("still checks the visible pane when the foreground probe errors", async () => {
     const calls: string[][] = [];
     const run: TmuxQuery = async (args) => {
       calls.push(args);
       if (args.includes("if-shell")) return { exitCode: 0, stdout: `${GUARD_SENT_MARKER}\n` };
+      if (args.includes("capture-pane")) return { exitCode: 0, stdout: "" };
       throw new Error("probe blew up");
     };
     expect(await deliverViaTmux("%1", null, "hi", run)).toBe(true);
@@ -874,6 +1005,7 @@ describe("deliverViaTmux", () => {
     // probe fault fails open and injects
     await deliverViaTmux("%1", null, "hi", async (args) => {
       if (args.includes("if-shell")) return { exitCode: 0, stdout: `${GUARD_SENT_MARKER}\n` };
+      if (args.includes("capture-pane")) return { exitCode: 0, stdout: "" };
       throw new Error("x");
     }, onDefer);
     // a genuine tmux failure is a failed send, not a readiness deferral
@@ -931,12 +1063,13 @@ describe("deliverViaTmux", () => {
       () => seen.push("defer"), () => seen.push("fault"));
     expect(seen).toEqual(["defer", "fault"]);
   });
-  it("probes first, then injects — never the other way round", async () => {
+  it("reads the foreground and visible pane before the guarded inject", async () => {
     const tmux = fakeTmux({ foreground: "node\n" });
     await deliverViaTmux("%1", "/tmp/sock", "hi", tmux.run);
-    expect(tmux.calls.length).toBe(2);
+    expect(tmux.calls.length).toBe(3);
     expect(tmux.calls[0]).toEqual(buildPaneCommandArgs("%1", "/tmp/sock"));
-    expect(tmux.calls[1]).toEqual(buildGuardedTmuxArgs("%1", "/tmp/sock", "hi"));
+    expect(tmux.calls[1]).toEqual(buildPaneCaptureArgs("%1", "/tmp/sock"));
+    expect(tmux.calls[2]).toEqual(buildGuardedTmuxArgs("%1", "/tmp/sock", "hi"));
   });
 });
 

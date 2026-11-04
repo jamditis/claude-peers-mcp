@@ -682,13 +682,15 @@ describe("unregister during in-flight delivery defers peer deletion", () => {
     Bun.spawnSync(["mkfifo", fifo]);
     const stub = join(dir, "tmux");
     // -V answers the availability probe and returns at once; display-message answers the
-    // pre-send readiness probe with a Claude-like foreground (node) so the inject proceeds.
+    // pre-send readiness probe with a Claude-like foreground (node), and capture-pane reports
+    // no active dialog so the inject proceeds.
     // Only the real send-keys invocation signals it started (marker), then blocks reading
     // the fifo until the test releases it, holding the delivery in flight as long as needed.
     writeFileSync(stub,
       `#!/usr/bin/env bash\n` +
       `if [ "$1" = "-V" ]; then echo "tmux 3.4"; exit 0; fi\n` +
       `if [ "$1" = "display-message" ]; then echo node; exit 0; fi\n` +
+      `if [ "$1" = "capture-pane" ]; then exit 0; fi\n` +
       `echo started > "${marker}"\n` +
       `cat "${fifo}" > /dev/null\n` +
       `exit 0\n`);
@@ -792,6 +794,7 @@ describe("post-send confirm ignores heartbeat aging (no duplicate delivery)", ()
       `#!/usr/bin/env bash\n` +
       `if [ "$1" = "-V" ]; then echo "tmux 3.4"; exit 0; fi\n` +
       `if [ "$1" = "display-message" ]; then echo node; exit 0; fi\n` +
+      `if [ "$1" = "capture-pane" ]; then exit 0; fi\n` +
       `echo started > "${marker}"\n` +
       `cat "${fifo}" > /dev/null\n` +
       `exit 0\n`);
@@ -884,6 +887,7 @@ describe("same-pid re-register during in-flight delivery defers old-peer deletio
       `#!/usr/bin/env bash\n` +
       `if [ "$1" = "-V" ]; then echo "tmux 3.4"; exit 0; fi\n` +
       `if [ "$1" = "display-message" ]; then echo node; exit 0; fi\n` +
+      `if [ "$1" = "capture-pane" ]; then exit 0; fi\n` +
       `echo started > "${marker}"\n` +
       `cat "${fifo}" > /dev/null\n` +
       `exit 0\n`);

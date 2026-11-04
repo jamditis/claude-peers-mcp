@@ -925,7 +925,7 @@ if (import.meta.main) {
           const streak = (deferralStreaks.get(toId) ?? 0) + 1;
           deferralStreaks.set(toId, streak);
           if (decideDeferralEscalation(streak, DEFERRAL_ESCALATION_CAP).escalate) {
-            console.error(`[claude-peers broker] escalation: pane ${target.pane} (peer ${toId}) deferred ${streak}x in a row (${reason}); no live Claude foreground seen, so its peer mail is not being delivered — if the session exited to a shell under a still-live pid the dead-pid sweep will not reap it`);
+            console.error(`[claude-peers broker] escalation: pane ${target.pane} (peer ${toId}) deferred ${streak}x in a row (${reason}); mail stays queued while the pane is not ready for push; check for an open dialog or a session that exited to a shell under a still-live pid`);
           }
         },
         // onFault: the spawn never ran, so this attempt is evidence about the host, not the pane.

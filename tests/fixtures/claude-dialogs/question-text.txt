@@ -1,0 +1,14 @@
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Color
+
+Which sample color should be used?
+
+  1. Blue
+     A cool, calm sample color.
+  2. Orange
+     A warm, bright sample color.
+❯ 3. Sample response
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · ctrl+g to edit in Vim · Esc to cancel
