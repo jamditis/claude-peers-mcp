@@ -28,7 +28,7 @@ A peer ID addresses one live registration. Removing that peer also removes its q
 
 Start the client inside tmux so its MCP server inherits the pane and socket information. The broker uses bracketed paste to inject text into that pane, strips C0/C1 control characters, and checks the pane before sending. A known bare-shell foreground process defers the push.
 
-Before the guarded write, the broker reads the visible pane with `capture-pane`. Active Claude Code question and permission dialog footers defer the push, so peer text does not answer the dialog. The message stays queued and the next heartbeat can retry after the dialog closes. If capture fails, no text is typed. A nonzero tmux exit counts toward the existing failed-push demotion; a spawn fault or capture timeout does not. Captured pane text is not logged.
+Before the guarded write, the broker reads the visible pane with `capture-pane`. Active Claude Code question and permission dialog controls defer the push, so peer text does not answer the dialog. The message stays queued and the next heartbeat can retry after the dialog closes. If capture fails, no text is typed. A nonzero tmux exit counts toward the existing failed-push demotion; a spawn fault or capture timeout does not. Captured pane text is not logged.
 
 The dialog signatures are based on recorded Claude Code 2.1.318 screens. This is a point-in-time check: an unknown dialog layout or a dialog that opens after capture can still escape detection. The atomic foreground guard remains in place for sessions that exit to a shell.
 

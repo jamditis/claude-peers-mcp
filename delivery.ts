@@ -707,15 +707,20 @@ export function classifyPaneReadiness(currentCommand: string): PaneReadiness {
 /** Match active dialog controls at the screen bottom, not questions in the transcript. */
 export function classifyPaneDialog(paneText: string): PaneReadiness {
   const screen = paneText.split("\n").map((line) => line.trimEnd()).join("\n").trimEnd();
-  const footer = screen.split("\n").at(-1)?.trim() ?? "";
-  const question = /^(?:-- [A-Z]+ -- · )?Enter to select · (?:↑\/↓|Tab\/Arrow keys) to navigate(?: · ctrl\+g to edit in [^·]+)?(?: · Esc to cancel)?$/;
+  const lines = screen.split("\n");
+  const footer = lines.at(-1)?.trim() ?? "";
+  // Ink can write hard line breaks inside hints; capture-pane -J cannot join those.
+  const tail = lines.slice(-4).map((line) => line.trim()).join(" ");
+  const question = /(?:^| )Enter to select · (?:↑\/↓|Tab\/Arrow keys) to navigate(?: · ctrl\+g to edit in [^·]+)?(?: · Esc to cancel)?$/;
   // The multi-question review screen has no footer, but has these exact final controls.
   const submit = /\nReady to submit your answers\?\n\n\s*(?:❯\s*)?1\. Submit answers\n\s*(?:❯\s*)?2\. Cancel\s*$/;
-  if (question.test(footer) || submit.test(screen)) {
+  if (question.test(tail) || submit.test(screen)) {
     return { ready: false, reason: "pane shows a question dialog" };
   }
   const permission = /^Esc to cancel(?: · Tab to amend)?$/;
-  if (permission.test(footer) && /^\s*(?:❯\s*)?\d+\. Yes\b/m.test(screen)) {
+  // WebFetch has no keyboard footer; its last control is this explicit rejection option.
+  const reject = /(?:^| )(?:❯\s*)?\d+\. No, and tell Claude what to do differently \(esc\)$/;
+  if ((permission.test(footer) || reject.test(tail)) && /^\s*(?:❯\s*)?\d+\. Yes\b/m.test(screen)) {
     return { ready: false, reason: "pane shows a permission dialog" };
   }
   return { ready: true, reason: "no active dialog footer found" };
@@ -996,7 +1001,7 @@ export async function probePaneReadiness(
  * foreground command, and a clean probe that positively identifies a shell defers the whole
  * attempt — no send is issued, false is returned, and the row stays queued. Next capture-pane
  * reads the visible screen: an active question or permission footer defers the attempt, and an
- * unreadable capture faults without typing. The captured screen is a point-in-time observation;
+ * unreadable capture leaves mail queued without typing. The captured screen is a point-in-time observation;
  * a dialog can still open after capture, unlike the atomic foreground guard. Then the guarded
  * send (buildGuardedTmuxArgs): one tmux process that re-evaluates the same readiness predicate
  * and types the text in the same invocation, which narrows the window in which a session that
@@ -1014,8 +1019,8 @@ export async function probePaneReadiness(
  *
  *  - DEFER (`onDefer`): a shell or an active dialog was positively identified. The broker counts
  *    these toward the not-ready escalation (issue #42), not the demotion streak. Nothing was typed.
- *  - FAULT (`onFault`): the attempt never got a verdict out of tmux. Either the send spawn
- *    REJECTED (process creation failed, the tmux binary momentarily unavailable), or the send
+ *  - FAULT (`onFault`): the attempt never got a verdict out of tmux. Either a capture/send spawn
+ *    REJECTED (process creation failed, the tmux binary momentarily unavailable), or that command
  *    outlived its deadline and the spawner killed it (`timedOut` — a stalled tmux server, whose
  *    128+signal exit code is otherwise indistinguishable from a genuine failure). Both say
  *    something about the HOST, not the pane, so they neither advance nor clear the demotion
@@ -1079,8 +1084,8 @@ export async function deliverViaTmux(
     }
     return outcome === "sent";
   } catch (e) {
-    // A send's non-zero exit is handled above; reaching here means capture failed or a
-    // spawn rejected (a host fault, not a normal failed delivery). The
+    // Non-zero exits are handled above; reaching here means capture timed out or a
+    // capture/send spawn rejected (a host fault, not a normal failed delivery). The
     // message still stays queued — never silently dropped — but the fault is
     // logged so it does not vanish, unlike the ordinary non-zero-exit miss, and
     // reported through onFault so a caller can hold it against the environment

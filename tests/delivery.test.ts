@@ -817,7 +817,7 @@ function dialogFixture(name: string): string {
 }
 
 describe("dialog-safe tmux delivery (#118)", () => {
-  for (const fixture of ["question-select", "question-text", "question-80", "question-multi", "question-two", "question-submit", "permission", "permission-amend", "permission-edit", "permission-edit-amend"]) {
+  for (const fixture of ["question-select", "question-text", "question-80", "question-multi", "question-two", "question-two-text-80", "question-submit", "permission", "permission-amend", "permission-edit", "permission-edit-amend", "permission-fetch"]) {
     it(`defers the captured ${fixture} dialog without typing or counting a push failure`, async () => {
       const tmux = fakeTmux({ paneText: dialogFixture(fixture) });
       const reasons: string[] = [];
@@ -841,8 +841,10 @@ describe("dialog-safe tmux delivery (#118)", () => {
   }
 
   it("does not treat quoted dialog text above a normal prompt as an active dialog", () => {
-    const transcript = `${dialogFixture("question-text")}\n${dialogFixture("question-closed")}`;
-    expect(classifyPaneDialog(transcript).ready).toBe(true);
+    for (const fixture of ["question-text", "question-submit", "permission-fetch"]) {
+      const transcript = `${dialogFixture(fixture)}\n${dialogFixture("question-closed")}`;
+      expect(classifyPaneDialog(transcript).ready).toBe(true);
+    }
     expect(classifyPaneDialog("Which sample color should be used?\nDo you want to proceed?\n").ready).toBe(true);
     expect(classifyPaneDialog("Press a key\nEsc to cancel\n").ready).toBe(true);
   });
@@ -1576,7 +1578,7 @@ describe("decidePushDemotion (#70)", () => {
 });
 
 describe("countsAsPushFailure (#70)", () => {
-  it("counts only a send that ran and missed", () => {
+  it("counts only a tmux command that ran and missed", () => {
     expect(countsAsPushFailure({ ok: false, deferred: false, faulted: false })).toBe(true);
   });
 
