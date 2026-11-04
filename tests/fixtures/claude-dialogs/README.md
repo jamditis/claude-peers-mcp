@@ -2,8 +2,10 @@
 
 These screens were captured from an isolated Claude Code 2.1.318 session with tmux on Linux. The questions, answers and command text are synthetic. No permission request was approved.
 
-`question-select.txt` and `question-text.txt` use `tmux capture-pane -p` at 110 columns by 38 rows. `question-80.txt` uses `tmux capture-pane -p -J` at 80 columns by 38 rows. The other open dialogs use `tmux capture-pane -p -J` at the same size. Each open fixture contains the dialog region through the bottom of the visible pane. The multi-select review screen has no keyboard footer, so its final confirmation controls are a separate signature.
+`question-select.txt` and `question-text.txt` use `tmux capture-pane -p` at 110 columns by 38 rows. `question-80.txt` uses `tmux capture-pane -p -J` at 80 columns by 38 rows. The two-question and edit-permission fixtures also use `tmux capture-pane -p -J` at 80 columns by 38 rows. The remaining open dialogs use `tmux capture-pane -p -J` at 110 columns by 38 rows. Each open fixture contains the dialog region through the bottom of the visible pane. The multi-select review screen has no keyboard footer, so its final confirmation controls are a separate signature.
 
 The closed fixtures contain the transcript result and ordinary input prompt after cancelling the question or permission dialog. Machine-specific status bars are cropped out. They confirm that text about a completed dialog does not defer later delivery.
 
 `delivery.test.ts` passes these recordings through the real delivery path and substitutes only the tmux process boundary. The queue test uses real SQLite and the production lease, queue and failed-push functions.
+
+The installed 2.1.318 footer renderer also supplies the optional non-NORMAL Vim mode prefix and cancel hint. One test applies those independently observed variants to a captured two-question screen.

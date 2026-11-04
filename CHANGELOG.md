@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Defer tmux pushes while the visible pane shows a recognized Claude Code question or permission dialog. Keep messages queued for ordered retry when the dialog closes, without counting deferrals or failed pane captures toward push demotion (#118).
+- Defer tmux pushes while the visible pane shows a recognized Claude Code question or permission dialog. Keep messages queued for ordered retry when the dialog closes, without counting deferrals toward push demotion. Unreachable panes still accrue failed attempts (#118).
 
 - Create empty-mail markers before handing managed doorbell recipes to the host. An owner-bound watcher now exits as peer removal if that marker disappears before launch, rather than recreating it and arming a stale peer ID. Legacy manual watchers still create their initial marker.
 

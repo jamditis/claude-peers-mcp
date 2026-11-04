@@ -395,7 +395,7 @@ describe("silent-consume regression", () => {
     dir = mkdtempSync(join(tmpdir(), "fail-tmux-"));
     logFile = join(dir, "calls.log");
     const stub = join(dir, "tmux");
-    writeFileSync(stub, `#!/usr/bin/env bash\nif [ "$1" = "-V" ]; then echo "tmux 3.4"; exit 0; fi\nprintf '%s\\0' "$@" >> "${logFile}"\nexit 1\n`);
+    writeFileSync(stub, `#!/usr/bin/env bash\nif [ "$1" = "-V" ]; then echo "tmux 3.4"; exit 0; fi\nif [ "$1" = "capture-pane" ]; then exit 0; fi\nprintf '%s\\0' "$@" >> "${logFile}"\nexit 1\n`);
     chmodSync(stub, 0o755);
     await Bun.write("/tmp/config-reg.json", JSON.stringify({
       machine: "reg-a", tailscale_ip: "127.0.0.1", port: PORT, id_prefix: "rga", siblings: [], allowed_ips: ["127.0.0.1"],

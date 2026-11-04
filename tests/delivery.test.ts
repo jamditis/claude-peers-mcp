@@ -817,7 +817,7 @@ function dialogFixture(name: string): string {
 }
 
 describe("dialog-safe tmux delivery (#118)", () => {
-  for (const fixture of ["question-select", "question-text", "question-80", "question-multi", "question-submit", "permission", "permission-amend"]) {
+  for (const fixture of ["question-select", "question-text", "question-80", "question-multi", "question-two", "question-submit", "permission", "permission-amend", "permission-edit", "permission-edit-amend"]) {
     it(`defers the captured ${fixture} dialog without typing or counting a push failure`, async () => {
       const tmux = fakeTmux({ paneText: dialogFixture(fixture) });
       const reasons: string[] = [];
@@ -847,6 +847,14 @@ describe("dialog-safe tmux delivery (#118)", () => {
     expect(classifyPaneDialog("Press a key\nEsc to cancel\n").ready).toBe(true);
   });
 
+  it("recognizes optional Vim mode and cancel hints rendered by the installed client", () => {
+    // The 2.1.318 footer renderer adds a non-NORMAL mode and can omit the cancel hint.
+    const screen = dialogFixture("question-two")
+      .replace("Enter to select", "-- INSERT -- · Enter to select")
+      .replace(" · Esc to cancel", "");
+    expect(classifyPaneDialog(screen).ready).toBe(false);
+  });
+
   for (const capture of [{ captureExit: 1 }, { captureExit: 143, captureTimedOut: true }]) {
     it(`keeps mail retryable when capture fails: ${JSON.stringify(capture)}`, async () => {
       const tmux = fakeTmux(capture);
@@ -857,8 +865,8 @@ describe("dialog-safe tmux delivery (#118)", () => {
       expect(ok).toBe(false);
       expect(tmux.injected()).toBe(false);
       expect(deferred).toBe(false);
-      expect(faults).toHaveLength(1);
-      expect(countsAsPushFailure({ ok, deferred, faulted: faults.length > 0 })).toBe(false);
+      expect(faults).toHaveLength(capture.captureTimedOut ? 1 : 0);
+      expect(countsAsPushFailure({ ok, deferred, faulted: faults.length > 0 })).toBe(!capture.captureTimedOut);
     });
   }
 

@@ -269,7 +269,7 @@ export const DEFAULT_PUSH_FAILURE_DEMOTION_CAP = 5;
  *
  * Pure and storage-agnostic like its siblings: the caller owns where the count lives (a per-row
  * push_failures column, so a restart cannot reset it) and what a "failure" is. Only one outcome
- * qualifies: a send that RAN and missed (send-keys exited non-zero). A readiness deferral never
+ * qualifies: tmux ran but could not reach or type into the pane (capture or send exited non-zero). A readiness deferral never
  * sent anything and keeps its own #42 counter, and a spawn FAULT (deliverViaTmux's onFault: the
  * process could not be created at all) is evidence about the host, not the pane — counting it
  * would let a transient tmux outage demote a row, which is the failure mode the streak exists to
@@ -286,13 +286,13 @@ export function decidePushDemotion(
 }
 
 /**
- * Whether one finished tmux attempt is the kind of failure the #70 demotion streak counts: a send
- * that RAN and missed. All three exclusions are attempts that also return false and also leave the
+ * Whether one finished tmux attempt is the kind of failure the #70 demotion streak counts: tmux
+ * ran but could not reach or type into the pane. All three exclusions also return false and leave the
  * row queued, so the boolean alone cannot separate them — the caller passes what deliverViaTmux's
  * callbacks told it.
  *
  *  - `ok`: the send landed. Nothing to count (the caller resets the streak instead).
- *  - `deferred`: the readiness probe positively identified a shell, so nothing was sent. It has
+ *  - `deferred`: a probe positively identified a shell or active dialog, so nothing was sent. It has
  *    its own consecutive-deferral counter and escalation (#42).
  *  - `faulted`: the attempt never reached the pane — the spawn rejected, or the send outlived its
  *    deadline and was killed. This is evidence about the host, not the pane, and counting it would
@@ -708,14 +708,14 @@ export function classifyPaneReadiness(currentCommand: string): PaneReadiness {
 export function classifyPaneDialog(paneText: string): PaneReadiness {
   const screen = paneText.split("\n").map((line) => line.trimEnd()).join("\n").trimEnd();
   const footer = screen.split("\n").at(-1)?.trim() ?? "";
-  const question = /^Enter to select · ↑\/↓ to navigate(?: · ctrl\+g to edit in [^·]+)? · Esc to cancel$/;
+  const question = /^(?:-- [A-Z]+ -- · )?Enter to select · (?:↑\/↓|Tab\/Arrow keys) to navigate(?: · ctrl\+g to edit in [^·]+)?(?: · Esc to cancel)?$/;
   // The multi-question review screen has no footer, but has these exact final controls.
   const submit = /\nReady to submit your answers\?\n\n\s*(?:❯\s*)?1\. Submit answers\n\s*(?:❯\s*)?2\. Cancel\s*$/;
   if (question.test(footer) || submit.test(screen)) {
     return { ready: false, reason: "pane shows a question dialog" };
   }
   const permission = /^Esc to cancel(?: · Tab to amend)?$/;
-  if (permission.test(footer) && /^\s*Do you want to proceed\?\s*$/m.test(screen)) {
+  if (permission.test(footer) && /^\s*(?:❯\s*)?\d+\. Yes\b/m.test(screen)) {
     return { ready: false, reason: "pane shows a permission dialog" };
   }
   return { ready: true, reason: "no active dialog footer found" };
@@ -1020,10 +1020,10 @@ export async function probePaneReadiness(
  *    128+signal exit code is otherwise indistinguishable from a genuine failure). Both say
  *    something about the HOST, not the pane, so they neither advance nor clear the demotion
  *    streak; counting them would let a transient outage lasting `cap` heartbeats strip an
- *    interrupt of its push channel. A failed capture is also a fault: the pane cannot be checked
- *    safely. The foreground probe alone still fails open; the atomic guard backs it up.
- *  - MISS: tmux ran the send and exited non-zero on its own. Neither callback fires. This is the
- *    only outcome the demotion streak counts, and it is unchanged from before the guard existed.
+ *    interrupt of its push channel. The foreground probe alone still fails open; the atomic
+ *    guard backs it up.
+ *  - MISS: tmux ran the capture or send and exited non-zero on its own. Neither callback fires.
+ *    An unreachable pane must still advance the demotion streak so its mail becomes poll-only.
  *
  * The callbacks are mutually exclusive, and a clean exit that is not a defer returns true —
  * including the marker-less answer a stubbed or pre-2.9 tmux gives, which classifyGuardedSend
@@ -1042,9 +1042,14 @@ export async function deliverViaTmux(
       return false;
     }
     const capture = await run(buildPaneCaptureArgs(pane, socket));
-    if (capture.exitCode !== 0 || capture.timedOut) {
-      // An unread pane may contain a dialog. Retry without typing or penalizing the row.
+    if (capture.timedOut) {
       throw new Error(`tmux pane capture failed (exit ${capture.exitCode}, timed out: ${capture.timedOut === true})`);
+    }
+    if (capture.exitCode !== 0) {
+      // The target is unreachable: count a miss so #70 still bounds the doorbell withhold.
+      // Do not type into a pane whose dialog state could not be read.
+      console.error(`[claude-peers broker] pane capture exited ${capture.exitCode} for pane ${pane}; not typing`);
+      return false;
     }
     const dialog = classifyPaneDialog(capture.stdout);
     if (!dialog.ready) {
