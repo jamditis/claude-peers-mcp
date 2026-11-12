@@ -285,6 +285,13 @@ export function toGossipPeer(p: Peer): Peer {
   };
 }
 
+export function selectGossipPeers(peers: Peer[]): Peer[] {
+  return peers
+    .filter(p => !isPidDead(pidProbe(p.pid)))
+    .filter(p => !isLocalPeerStale(p.last_seen, LOCAL_PEER_TTL_MS))
+    .map(toGossipPeer);
+}
+
 // Strip the secret capability token before a peer crosses the /list-peers boundary. That route is
 // token-exempt (read-only browsing), so serializing the token column `SELECT *` reads off the row
 // would hand any loopback caller every peer's credential — enough to impersonate it on the gated
@@ -1298,13 +1305,10 @@ if (import.meta.main) {
   const gossipFailureStates = new Map<string, GossipFailureState>();
 
   async function gossipToSiblings(peerList?: Peer[]) {
-    const sourcePeers = peerList ?? (selectAllPeers.all() as Peer[]).filter(p => {
-      try { process.kill(p.pid, 0); return true; } catch { return false; }
-    }).filter(p => !isLocalPeerStale(p.last_seen, LOCAL_PEER_TTL_MS));
     // Project every peer through the federated allow-list before it crosses a machine boundary,
     // regardless of whether the caller passed an explicit list or we read the table. This keeps the
     // local-only delivery coordinates (tmux_pane/tmux_socket/delivery_kind) on this host.
-    const peers = sourcePeers.map(toGossipPeer);
+    const peers = selectGossipPeers(peerList ?? selectAllPeers.all() as Peer[]);
     for (const sibling of config.siblings) {
       let succeeded = false;
       let errorMessage = "";
