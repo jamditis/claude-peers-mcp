@@ -1,7 +1,7 @@
 // tests/broker.test.ts
 
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import {
   advanceStaleGraceFloor,
   generatePeerId,
@@ -15,7 +15,9 @@ import {
   validateControlPlaneBody,
   resolveTargetBroker,
   shouldPruneLocalPeer,
+  selectGossipPeers,
 } from "../broker.ts";
+import type { Peer } from "../shared/types.ts";
 import { NAME_DISPLAY_MAX_CHARS } from "../shared/format-peers.ts";
 
 function createTestDb(): Database {
@@ -45,6 +47,31 @@ function createTestDb(): Database {
 
   return db;
 }
+
+describe("selectGossipPeers", () => {
+  it("keeps permission-denied live peers while excluding dead and stale peers", () => {
+    const probe = spyOn(process, "kill").mockImplementation((pid) => {
+      const code = new Map([[2, "EPERM"], [3, "EACCES"], [4, "ESRCH"]]).get(Number(pid));
+      if (code) throw Object.assign(new Error("PID probe"), { code });
+      return true;
+    });
+    try {
+      const now = new Date().toISOString();
+      const peers: Peer[] = [1, 2, 3, 4, 5].map(pid => ({
+        id: `tst-${pid}`, pid, machine: "node-a", tailscale_ip: "127.0.0.1",
+        cwd: "/worker", git_root: null, tty: null, summary: "", registered_at: now,
+        last_seen: pid === 5 ? new Date(Date.now() - 120_000).toISOString() : now,
+        tmux_pane: "%1", tmux_socket: "/private/socket", delivery_kind: "tmux",
+      }));
+      const advertised = selectGossipPeers(peers);
+      expect(advertised.map(peer => peer.pid)).toEqual([1, 2, 3]);
+      expect(advertised.every(peer => !("tmux_pane" in peer) && !("tmux_socket" in peer))).toBe(true);
+      expect(selectGossipPeers([])).toEqual([]);
+    } finally {
+      probe.mockRestore();
+    }
+  });
+});
 
 describe("generatePeerId", () => {
   it("generates IDs with the correct prefix", () => {
