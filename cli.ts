@@ -64,6 +64,12 @@ async function brokerFetch<T>(path: string, body?: unknown, token?: string): Pro
 
 const cmd = process.argv[2];
 
+const helpArgs = cmd === "send" ? process.argv.slice(2, 4) : process.argv.slice(2);
+if (helpArgs.some((arg) => arg === "--help" || arg === "-h")) {
+  printUsage();
+  process.exit(0);
+}
+
 switch (cmd) {
   case "status": {
     try {
@@ -159,6 +165,10 @@ switch (cmd) {
 
   case "send": {
     const toId = process.argv[3];
+    if (toId?.startsWith("-")) {
+      printUsage();
+      process.exit(2);
+    }
     let rest = process.argv.slice(4);
     // The CLI keeps push-on-send as its default: existing scripts (wake announcements,
     // ops nudges) rely on the message landing in the pane now. The flag opts into the
@@ -503,6 +513,10 @@ switch (cmd) {
         dbOverride = rest[++i];
         if (!dbOverride || dbOverride.startsWith("--")) { console.error("--db-path requires a path"); process.exit(1); }
       }
+      else if (a?.startsWith("-")) {
+        printUsage();
+        process.exit(2);
+      }
       else if (!id && a) id = a;
     }
     if (!id) {
@@ -524,7 +538,11 @@ switch (cmd) {
   }
 
   default:
-    console.log(`claude-peers CLI
+    printUsage();
+}
+
+function printUsage() {
+  console.log(`claude-peers CLI
 
 Usage:
   Installed package: bunx --no-install claude-peers-mcp cli <command>
