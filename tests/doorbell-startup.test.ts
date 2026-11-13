@@ -8,6 +8,7 @@ import { handleTool, type ToolContext } from "../shared/tool-results.ts";
 import type { doorbellRecipe } from "../shared/doorbell-session.ts";
 import { singleHostDefault } from "../shared/config.ts";
 import { PROTOCOL_VERSION } from "../shared/types.ts";
+import { claimForDelivery, releaseToQueued } from "../delivery.ts";
 
 const root = resolve(import.meta.dir, "..");
 const children: ReturnType<typeof Bun.spawn>[] = [];
@@ -208,10 +209,10 @@ test("manual doorbells wake for remote mail arriving after a drain and before la
   const suffix = await forward("behind lease");
   const db = new Database(f.dbPath);
   try {
-    db.run("UPDATE messages SET delivery_state = 'delivering' WHERE id = ?", [lease]);
+    expect(claimForDelivery(db, lease, Date.now(), 60_000, "fixture-lease")).toBe(true);
     expect((await poll()).messages.map(m => m.text)).toEqual(["readable prefix"]);
     expect(readDrainedDoorbell(f.dbPath, peer.id)).toBe(prefix);
-    db.run("UPDATE messages SET delivery_state = 'queued' WHERE id = ?", [lease]);
+    releaseToQueued(db, lease, "fixture-lease");
     expect((await poll()).messages.map(m => m.text)).toEqual(["in flight", "behind lease"]);
     expect(readDrainedDoorbell(f.dbPath, peer.id)).toBe(suffix);
   } finally { db.close(); }

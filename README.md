@@ -113,7 +113,7 @@ See [federation security](docs/federation.md#security-boundary) for the remainin
 
 ## Upgrading
 
-The broker protocol is currently `10`; it is separate from the package version.
+The broker protocol is currently `11`; it is separate from the package version.
 
 From your checkout, pull the current source and install its locked dependencies:
 

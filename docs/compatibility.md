@@ -136,7 +136,7 @@ does not add a racy per-send health probe or claim remote protocol knowledge.
 
 ## Protocol and upgrade rules
 
-The current broker protocol is 10. A current server refuses to run silently
+The current broker protocol is 11. Default manual watchers require the broker's drained-counter polling behavior. A current server refuses to run silently
 against an older local broker: it retires that broker and starts the required
 version. Protocol 9 to 10 is the current mixed-version path and has tests for
 legacy registrations and stored rows without `repo_key`.
