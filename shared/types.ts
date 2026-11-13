@@ -50,8 +50,7 @@ export function parseListPeersScope(
 // (a server that reports repo_key for worktree-aware repo scope must retire a broker that neither
 // stores nor queries it, or scope "repo" would keep splitting one repository's worktrees).
 // server.ts requires at least this from a running broker.
-// Protocol 11 requires broker-owned drained counters for default manual watchers.
-export const PROTOCOL_VERSION = 11;
+export const PROTOCOL_VERSION = 10;
 
 // Urgency tiers arrived in protocol 4 (see the history above). A broker older than
 // this ignores the urgency field and keeps the old push-on-send behavior, so a

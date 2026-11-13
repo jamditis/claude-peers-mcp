@@ -73,7 +73,7 @@ Watcher exit codes: `0` mail signal, `1` invalid arguments or filesystem failure
 
 ### Adoption and existing sessions
 
-The launch recipe resolves even a relative no-config `CLAUDE_PEERS_DB` override against the MCP working directory, so a host task started elsewhere reads the same marker. Readiness requires a readable regular file containing a valid counter, including when `--since` supplies the baseline. Startup validation failures exit `1` without reporting armed. During startup and after arming, a read failure reports degraded immediately; a successful read reports recovery. Startup retries withhold armed until a valid signal counter is read, preserving an explicit baseline or reading the drained counter for the default. Failure lasting at least two polling intervals exits `1` and releases the guard. This grace handles brief empty reads during in-place broker writes; filesystem-watch failure alone still falls back to polling if the counter is readable.
+The launch recipe resolves even a relative no-config `CLAUDE_PEERS_DB` override against the MCP working directory, so a host task started elsewhere reads the same marker. Readiness requires a readable regular file containing a valid counter, including when `--since` supplies the baseline. Startup validation failures exit `1` without reporting armed. During startup and after arming, a read failure reports degraded immediately; a successful read reports recovery. Startup retries withhold armed until a valid signal counter is read, preserving an explicit baseline or using the negotiated default baseline. Failure lasting at least two polling intervals exits `1` and releases the guard. This grace handles brief empty reads during in-place broker writes; filesystem-watch failure alone still falls back to polling if the counter is readable.
 
 This change does not install a host hook or restart a session. After adopting the updated checkout/package, a new MCP server process must load it. The shipped source and package launchers run ordinary Bun processes; neither uses `--hot`/`--watch` or implements a release updater. Publishing a release, fetching Git changes, or replacing files therefore does not hot-reload an already-running MCP process. A host may offer its own reconnect/restart feature, but that behavior is outside this fork and must be verified for that host. Future sessions also need the background-completion facility and must follow the startup handoff. This does not promise to repair an already-idle session.
 
@@ -81,7 +81,7 @@ For deterministic startup without relying on model-followed instructions, the mi
 
 ### Manual watcher
 
-Use this order:
+When `/health` advertises `capabilities.drainedCounter: true`, use this order:
 
 1. Call `peek_messages` to learn your peer ID.
 2. Call `check_messages` to drain existing mail.
@@ -94,7 +94,9 @@ From the checkout:
 bun cli.ts doorbell <your-peer-id>
 ```
 
-Without a harness background-task feature, use manual polling. Without `--since`, the watcher compares the signal against the last drained counter, or zero before the first poll. Mail arriving after a drain and before watcher startup therefore wakes it immediately. Merely launching it is not a mail read.
+Without a harness background-task feature, use manual polling. Without `--since`, a watcher whose broker advertises `drainedCounter` compares the signal against the last drained counter, or zero before the first poll. Mail arriving after a drain and before watcher startup therefore wakes it immediately. Merely launching it is not a mail read.
+
+Against an older broker, or when `/health` cannot be read, the watcher keeps the queue-head baseline and prints one stderr note per launch. Arm it before `check_messages`; to catch mail in the next launch gap, pass `--since` with the mark printed by the previous watcher. An old client against a new broker keeps its queue-head behavior. These combinations allow a rolling update without stopping all clients or nodes together.
 
 The drained counter closes the launch gap, so drain before re-arming a default manual watcher to avoid waking twice for the same unread mail. Explicit `--since` watchers and managed recipes retain the re-arm-before-check order. Keep the watcher's config and database path identical to the broker's.
 

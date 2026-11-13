@@ -1408,6 +1408,7 @@ if (import.meta.main) {
             status: "ok", peers: (selectAllPeers.all() as unknown[]).length,
             machine: config.machine, remote_peer_count: (selectAllRemotePeers.all() as unknown[]).length,
             protocol_version: PROTOCOL_VERSION,
+            capabilities: { drainedCounter: true },
           });
         }
         return new Response("claude-peers broker (federated)", { status: 200 });

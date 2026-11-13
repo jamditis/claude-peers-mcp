@@ -54,7 +54,7 @@ A healthy `/health` response alone does not prove that peer reads, tmux delivery
 | A send is queued | Check urgency, whether the recipient has tmux, and the receiving host's remote floor. Queuing is expected for `fyi`, non-tmux clients, and default remote delivery. Poll at the recipient. |
 | Mail stays queued in tmux | Use doctor to check the pane and peer process. A bare-shell pane defers push. A normal message waits until due unless another push flushes it sooner. Repeated failed writes can demote the backlog to polling. |
 | Peek shows mail but polling returns none | A delivery lease can temporarily block the readable prefix. Use doctor for stalled leases and backend state. Avoid consuming the store manually. |
-| The doorbell does not wake the model | Confirm the harness reacts to process completion/output and the watcher uses the correct ID and database path. Drain before starting or re-arming a default manual watcher; arm a managed or explicit `--since` watcher before polling. A standalone watcher does not start a model turn. |
+| The doorbell does not wake the model | Confirm the harness reacts to process completion/output and the watcher uses the correct ID and database path. With `drainedCounter`, drain before starting or re-arming a default manual watcher. If the watcher reports a queue-head fallback, arm before polling or pass the last watcher mark with `--since`. Arm a managed or explicit `--since` watcher before polling. A standalone watcher does not start a model turn. |
 | A session name is ambiguous | Discover peers and send to the exact ID. Multiple panes can share a tmux session name. |
 | A peer disappeared after restart | Registrations are tied to live MCP processes. Discover the new ID; old registrations and their mail can be removed. |
 | Siblings are missing or return 403 | Check reciprocal sibling entries, source-IP allowlists, private-network/firewall reachability, and the receiving port. Run `ping-siblings` on both hosts. |
@@ -65,7 +65,7 @@ For a reproducible install, delivery, or federation problem, use the [issue form
 
 ## Upgrading
 
-Package version and broker protocol are separate. The current broker protocol is 11. Default manual watchers require the broker's drained counter. A protocol 10-to-11 mixed-version rolling transition is unverified; use a coordinated stopped upgrade, as described in the [compatibility contract](compatibility.md#protocol-and-upgrade-rules).
+Package version and broker protocol are separate. The current broker protocol is 10. The drained-counter change is additive: `/health` advertises `capabilities.drainedCounter: true`, with no schema migration or protocol bump. The [compatibility contract](compatibility.md#protocol-and-upgrade-rules) covers all four old/new client and broker pairs.
 
 For a source checkout:
 
@@ -76,7 +76,14 @@ bun install --frozen-lockfile
 
 A running process keeps its loaded code. Restart the MCP client/server to load server changes. When the new server finds an older-protocol local broker, it asks that broker to retire and starts a current one. A same-protocol code change does not force replacement of an already-running broker.
 
-For an operator-managed upgrade:
+For the protocol-10 drained-counter update, roll one node at a time:
+
+1. Update that node's checkout and locked dependencies. Leave other nodes and active client sessions running.
+2. Restart that node's broker through its supervisor to load the capability. Preserve its database and peer registrations. Clients may load the new code before or after this step; new manual watchers against an older broker retain the queue-head behavior with one stderr note. No automatic retirement is triggered by this change.
+3. Read `/health` and confirm protocol 10 and `capabilities.drainedCounter: true`. Verify a local send/poll round trip and federated delivery in both directions before proceeding to the next node.
+4. Restart or reconnect clients when convenient to load new client code. Old clients remain compatible with the updated broker. Default manual watchers with the capability drain before re-arming; explicit `--since` and managed recipes retain their existing order.
+
+For an operator-managed protocol/schema upgrade that requires a stopped backup:
 
 1. Read the changelog and supported migration path. Drain important mail or record its outcome before ending client sessions.
 2. Stop the clients and stop the broker through its supervisor, if present. Confirm it stays stopped.

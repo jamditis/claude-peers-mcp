@@ -529,7 +529,15 @@ switch (cmd) {
       process.exit(1);
     }
     try {
-      process.exitCode = await watchDoorbell({ dbPath, id, since, pollMs, timeoutSec, persistent, ownerPid, exclusive });
+      let drainedCounter = false;
+      if (since === null) {
+        try {
+          const health = await brokerFetch<{ capabilities?: { drainedCounter?: boolean } }>("/health");
+          drainedCounter = health.capabilities?.drainedCounter === true;
+        } catch { /* An unavailable handshake keeps the queue-head baseline. */ }
+        if (!drainedCounter) console.error("doorbell: broker does not advertise drainedCounter; using the queue-head marker. Re-arm before check_messages, or use --since with the last watcher mark to cover the launch gap.");
+      }
+      process.exitCode = await watchDoorbell({ dbPath, id, since, pollMs, timeoutSec, persistent, ownerPid, exclusive, drainedCounter });
     } catch (error) {
       console.error(`doorbell failed: ${error instanceof Error ? error.message : String(error)}`);
       process.exitCode = 1;

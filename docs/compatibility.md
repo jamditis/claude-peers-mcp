@@ -136,12 +136,23 @@ does not add a racy per-send health probe or claim remote protocol knowledge.
 
 ## Protocol and upgrade rules
 
-The current broker protocol is 11. Default manual watchers require the broker's drained-counter polling behavior. A current server refuses to run silently
-against an older local broker: it retires that broker and starts the required
-version. The native integration in `tests/doorbell-startup.test.ts` covers the
-drained-counter behavior with a protocol-11 broker. A protocol 10-to-11
-mixed-version rolling transition is unverified; stop clients and brokers before
-upgrading, following the [upgrade procedure](operations.md#upgrading).
+The current broker protocol is 10. A current server retires a local broker below
+the required protocol. Protocol 9 to 10 has tests for legacy registrations and
+stored rows without `repo_key`.
+
+The drained-counter improvement keeps protocol 10 and adds
+`capabilities: { drainedCounter: true }` to `/health`. A default manual watcher
+uses the drained baseline only when this capability is advertised. An absent,
+false or unavailable capability keeps the queue-head baseline and emits one
+stderr note per launch. An old client ignores the additional health field and
+keeps its existing behavior. Explicit `--since` watchers and managed recipes
+use their supplied baseline without capability negotiation.
+
+`tests/doorbell-startup.test.ts` covers all four pairs of old/new watcher and
+old/new broker. The old broker is faked at the health/marker boundary; the old
+client is faked with its queue-head startup baseline. New brokers run as isolated
+processes, including authenticated polling and remote forwards. These pairs
+support [one-node-at-a-time updates](operations.md#upgrading) without a fleet stop.
 
 The supported rolling-upgrade rule is:
 
@@ -195,7 +206,7 @@ The Ubuntu smoke test starts an isolated broker and two minimal MCP SDK clients.
 ### Delivery and fallback
 
 - **Tmux push:** A valid `TMUX_PANE` selects the pane; `TMUX` supplies an optional socket path. Without a valid pane ID, the server registers without a push target. The broker checks that the pane foreground is not a bare shell before injecting `[peer …]` text. That check cannot prove a given client's prompt is ready. `interrupt` is due immediately, `normal` waits for its configured deadline, and `fyi` never pushes.
-- **Doorbell watcher:** `bun cli.ts doorbell <peer-id>` signals pending mail that will not push. Learn the ID with `peek_messages`, call `check_messages`, then start or re-arm the default watcher. Its drained baseline catches mail arriving before launch. Explicit `--since` watchers and managed recipes re-arm before checking. The watcher does not read or clear mail; the client must run it or poll at task boundaries.
+- **Doorbell watcher:** `bun cli.ts doorbell <peer-id>` signals pending mail that will not push. Learn the ID with `peek_messages`. With `drainedCounter`, call `check_messages`, then start or re-arm the default watcher; its drained baseline catches mail arriving before launch. Without the capability, the watcher prints a stderr note and keeps the queue-head baseline: arm before checking, or pass the last watcher mark with `--since` to cover the launch gap. Explicit `--since` watchers and managed recipes re-arm before checking. The watcher does not read or clear mail; the client must run it or poll at task boundaries.
 - **No tmux or watcher:** Messages stay queued. `check_messages` reads and clears them; `peek_messages` reports a count without clearing it. There is no automatic wake for a client with neither a pushable pane nor a watcher.
 - **No config file:** With no `CLAUDE_PEERS_CONFIG` and no `~/.claude-peers.json`, the server uses a loopback-only single-host default. An explicitly named missing config file fails at startup. A config file is needed for a different port, identity, or federation setup.
 
