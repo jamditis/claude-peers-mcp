@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { doorbellDir, doorbellPath, readDoorbell, removeDoorbell, writeDoorbell } from "../shared/notify.ts";
+import { doorbellDir, doorbellPath, readDoorbell, readDrainedDoorbell, removeDoorbell, writeDoorbell, writeDrainedDoorbell } from "../shared/notify.ts";
 
 describe("doorbell path derivation", () => {
   it("derives the doorbell dir as a sibling of the db file", () => {
@@ -45,6 +45,22 @@ describe("doorbell read/write/remove", () => {
     expect(writeDoorbell(dbPath, "p-1", 42)).toBe(true);
     expect(readDoorbell(dbPath, "p-1")).toBe(42);
     expect(readFileSync(doorbellPath(dbPath, "p-1") as string, "utf8")).toBe("42");
+  });
+
+  it("keeps the monotonic drained counter separate from the unread signal", () => {
+    writeDoorbell(dbPath, "p-1", 42);
+    expect(readDrainedDoorbell(dbPath, "p-1")).toBe(0);
+    expect(writeDrainedDoorbell(dbPath, "p-1", 40)).toBe(true);
+    expect(writeDrainedDoorbell(dbPath, "p-1", 39)).toBe(false);
+    expect(readDrainedDoorbell(dbPath, "p-1")).toBe(40);
+    expect(readDoorbell(dbPath, "p-1")).toBe(42);
+    writeFileSync(`${doorbellPath(dbPath, "p-1")}.drained`, "40junk");
+    expect(readDrainedDoorbell(dbPath, "p-1")).toBe(0);
+    expect(writeDrainedDoorbell(dbPath, "p-1", 40)).toBe(true);
+    removeDoorbell(dbPath, "p-1");
+    expect(readDoorbell(dbPath, "p-1")).toBe(-1);
+    expect(readDrainedDoorbell(dbPath, "p-1")).toBe(0);
+    expect(writeDrainedDoorbell(dbPath, "../escape", 1)).toBe(false);
   });
 
   it("creates the doorbell directory on first write", () => {

@@ -1,11 +1,13 @@
 import { afterEach, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { doorbellPath, readDoorbell, removeDoorbell, writeDoorbell } from "../shared/notify.ts";
+import { doorbellPath, readDoorbell, readDrainedDoorbell, removeDoorbell, writeDoorbell, writeDrainedDoorbell } from "../shared/notify.ts";
 import { handleTool, type ToolContext } from "../shared/tool-results.ts";
 import type { doorbellRecipe } from "../shared/doorbell-session.ts";
 import { singleHostDefault } from "../shared/config.ts";
+import { PROTOCOL_VERSION } from "../shared/types.ts";
 
 const root = resolve(import.meta.dir, "..");
 const children: ReturnType<typeof Bun.spawn>[] = [];
@@ -140,6 +142,86 @@ test("legacy manual watchers still create an absent marker", async () => {
   writeDoorbell(f.dbPath, "test-peer", 1);
   expect(await child.exited).toBe(0);
 });
+
+test("manual doorbells wake for remote mail arriving after a drain and before launch", async () => {
+  const f = fixture();
+  const port = 17955;
+  const configPath = join(f.work, "config.json");
+  writeFileSync(configPath, JSON.stringify({ machine: "test", tailscale_ip: "127.0.0.1", port,
+    id_prefix: "test", siblings: [], allowed_ips: ["127.0.0.1"], db_path: f.dbPath, auto_summary: false }));
+  const broker = Bun.spawn([process.execPath, join(root, "broker.ts")], {
+    env: { ...process.env, CLAUDE_PEERS_CONFIG: configPath }, stdout: "ignore", stderr: "ignore",
+  });
+  children.push(broker);
+  const url = `http://127.0.0.1:${port}`;
+  const deadline = Date.now() + 2000;
+  for (;;) {
+    try { if ((await fetch(`${url}/health`)).ok) break; } catch {}
+    if (Date.now() >= deadline) throw new Error("Test broker did not start");
+    await Bun.sleep(25);
+  }
+  async function request<T>(path: string, body: unknown, token?: string): Promise<T> {
+    const response = await fetch(`${url}${path}`, { method: "POST", body: JSON.stringify(body),
+      headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) } });
+    expect(response.status).toBe(200);
+    return response.json() as Promise<T>;
+  }
+  const peer = await request<{ id: string; token: string }>("/register", {
+    pid: process.pid, cwd: f.work, git_root: null, tty: null, summary: "", machine: "test",
+    tailscale_ip: "127.0.0.1", tmux_pane: null, tmux_socket: null,
+  });
+  const poll = () => request<{ messages: { id: number; text: string }[] }>("/poll-messages", { id: peer.id }, peer.token);
+  const forward = async (text: string) => {
+    expect(await request("/forward-message", { protocol_version: PROTOCOL_VERSION,
+      from_id: "remote-peer", from_machine: "remote", to_id: peer.id, text })).toMatchObject({ ok: true, poll_only: true });
+    return readDoorbell(f.dbPath, peer.id);
+  };
+  const launch = () => f.launch([process.execPath, join(root, "cli.ts"), "doorbell", peer.id, "--db-path", f.dbPath], 2);
+
+  // Pending mail on the first launch must also wake without an explicit --since.
+  const first = await forward("already queued");
+  const startup = launch();
+  expect(await startup.exited).toBe(0);
+  expect(await remaining(startup)).toContain(`mark=${first}`);
+  expect((await poll()).messages.map(m => m.text)).toEqual(["already queued"]);
+  expect(readDrainedDoorbell(f.dbPath, peer.id)).toBe(first);
+
+  const gap = await forward("in the launch gap");
+  const delayed = launch();
+  expect(await delayed.exited).toBe(0);
+  const output = await remaining(delayed);
+  expect(output).toContain(`since=${first}`);
+  expect(output).toContain(`mark=${gap}`);
+  expect(output).toContain("run check_messages, then re-arm");
+  expect(readDrainedDoorbell(f.dbPath, peer.id)).toBe(first); // watching never consumes
+  expect((await poll()).messages.map(m => m.text)).toEqual(["in the launch gap"]);
+
+  const armedWatcher = launch();
+  expect(await armed(armedWatcher)).toContain(`since=${gap}`);
+  const later = await forward("after arming");
+  expect(await armedWatcher.exited).toBe(0);
+  expect(await remaining(armedWatcher)).toContain(`mark=${later}`);
+  expect((await poll()).messages.map(m => m.text)).toEqual(["after arming"]);
+
+  const prefix = await forward("readable prefix");
+  const lease = await forward("in flight");
+  const suffix = await forward("behind lease");
+  const db = new Database(f.dbPath);
+  try {
+    db.run("UPDATE messages SET delivery_state = 'delivering' WHERE id = ?", [lease]);
+    expect((await poll()).messages.map(m => m.text)).toEqual(["readable prefix"]);
+    expect(readDrainedDoorbell(f.dbPath, peer.id)).toBe(prefix);
+    db.run("UPDATE messages SET delivery_state = 'queued' WHERE id = ?", [lease]);
+    expect((await poll()).messages.map(m => m.text)).toEqual(["in flight", "behind lease"]);
+    expect(readDrainedDoorbell(f.dbPath, peer.id)).toBe(suffix);
+  } finally { db.close(); }
+  // A signal left by already-delivered mail is acknowledged by an empty poll.
+  writeDoorbell(f.dbPath, peer.id, suffix + 1);
+  expect((await poll()).messages).toEqual([]);
+  expect(readDrainedDoorbell(f.dbPath, peer.id)).toBe(suffix + 1);
+  await request("/unregister", { id: peer.id }, peer.token);
+  expect(existsSync(`${doorbellPath(f.dbPath, peer.id)}.drained`)).toBe(false);
+}, 10_000);
 
 test("one host task per peer, arm-before-drain, and rearm after each fire", async () => {
   const f = fixture();
@@ -282,6 +364,7 @@ for (const explicitBaseline of [true, false]) {
   test(`startup empty marker recovers before readiness (${explicitBaseline ? "explicit" : "default"} baseline)`, async () => {
     const f = fixture();
     writeDoorbell(f.dbPath, "test-peer", 0);
+    writeDrainedDoorbell(f.dbPath, "test-peer", 3);
     const argv = await recipe(f.context);
     if (!explicitBaseline) argv.splice(argv.indexOf("--since"), 2);
     writeFileSync(doorbellPath(f.dbPath, "test-peer") as string, "");
@@ -293,13 +376,12 @@ for (const explicitBaseline of [true, false]) {
     let output = "";
     if (!explicitBaseline) {
       output = await armed(child);
-      expect(output).toContain("since=7");
-      writeDoorbell(f.dbPath, "test-peer", 8);
+      expect(output).toContain("since=3");
     }
     expect(await child.exited).toBe(0);
     output += await remaining(child);
     expect(output).toContain("doorbell armed");
-    expect(output).toContain(`mark=${explicitBaseline ? 7 : 8}`);
+    expect(output).toContain("mark=7");
     expect(existsSync(`${doorbellPath(f.dbPath, "test-peer")}.watcher`)).toBe(false);
   });
 }

@@ -50,7 +50,7 @@ No MCP notification in this package forces an idle client to start a turn. Witho
 
 The doorbell signals readable poll-only mail. It covers non-tmux recipients, `fyi` messages, default-floored remote forwards, and mail demoted after repeated push failures.
 
-The broker writes a content-free counter to `<db_path>.doorbells/<peer-id>.mark`. The CLI watches it using filesystem events with a polling fallback. It does not read message bodies or consume mail.
+The broker writes a content-free counter to `<db_path>.doorbells/<peer-id>.mark`. Authenticated polling records the drained counter in the adjacent `.mark.drained` file; both counters are removed with the peer. The CLI watches the signal using filesystem events with a polling fallback. It does not read message bodies or consume mail.
 
 A client harness must notice the watcher's completion or output and schedule a turn. Running the command in an unrelated terminal only prints a signal; it does not automatically wake an idle model.
 
@@ -73,7 +73,7 @@ Watcher exit codes: `0` mail signal, `1` invalid arguments or filesystem failure
 
 ### Adoption and existing sessions
 
-The launch recipe resolves even a relative no-config `CLAUDE_PEERS_DB` override against the MCP working directory, so a host task started elsewhere reads the same marker. Readiness requires a readable regular file containing a valid counter, including when `--since` supplies the baseline. Startup validation failures exit `1` without reporting armed. During startup and after arming, a read failure reports degraded immediately; a successful read reports recovery. Startup retries withhold armed until a valid counter is read, preserving an explicit baseline or establishing the default from the first valid read. Failure lasting at least two polling intervals exits `1` and releases the guard. This grace handles brief empty reads during in-place broker writes; filesystem-watch failure alone still falls back to polling if the counter is readable.
+The launch recipe resolves even a relative no-config `CLAUDE_PEERS_DB` override against the MCP working directory, so a host task started elsewhere reads the same marker. Readiness requires a readable regular file containing a valid counter, including when `--since` supplies the baseline. Startup validation failures exit `1` without reporting armed. During startup and after arming, a read failure reports degraded immediately; a successful read reports recovery. Startup retries withhold armed until a valid signal counter is read, preserving an explicit baseline or reading the drained counter for the default. Failure lasting at least two polling intervals exits `1` and releases the guard. This grace handles brief empty reads during in-place broker writes; filesystem-watch failure alone still falls back to polling if the counter is readable.
 
 This change does not install a host hook or restart a session. After adopting the updated checkout/package, a new MCP server process must load it. The shipped source and package launchers run ordinary Bun processes; neither uses `--hot`/`--watch` or implements a release updater. Publishing a release, fetching Git changes, or replacing files therefore does not hot-reload an already-running MCP process. A host may offer its own reconnect/restart feature, but that behavior is outside this fork and must be verified for that host. Future sessions also need the background-completion facility and must follow the startup handoff. This does not promise to repair an already-idle session.
 
@@ -84,9 +84,9 @@ For deterministic startup without relying on model-followed instructions, the mi
 Use this order:
 
 1. Call `peek_messages` to learn your peer ID.
-2. Start the watcher as a background task in your client harness.
-3. Once it is armed, call `check_messages` to drain existing mail.
-4. When the watcher reports mail, re-arm it **before** calling `check_messages` again.
+2. Call `check_messages` to drain existing mail.
+3. Start the watcher without `--since` as a background task in your client harness.
+4. When the watcher reports mail, call `check_messages`, then re-arm it.
 
 From the checkout:
 
@@ -94,9 +94,9 @@ From the checkout:
 bun cli.ts doorbell <your-peer-id>
 ```
 
-Without a harness background-task feature, use manual polling. The command blocks until a new marker advance; merely launching it is not a mail read.
+Without a harness background-task feature, use manual polling. Without `--since`, the watcher compares the signal against the last drained counter, or zero before the first poll. Mail arriving after a drain and before watcher startup therefore wakes it immediately. Merely launching it is not a mail read.
 
-Arming before checking closes the gap where mail could arrive between a poll and the next watch baseline. Keep the watcher's config and database path identical to the broker's.
+The drained counter closes the launch gap, so drain before re-arming a default manual watcher to avoid waking twice for the same unread mail. Explicit `--since` watchers and managed recipes retain the re-arm-before-check order. Keep the watcher's config and database path identical to the broker's.
 
 | Option | Meaning |
 | --- | --- |

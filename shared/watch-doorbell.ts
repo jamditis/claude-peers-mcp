@@ -1,6 +1,6 @@
 import { closeSync, constants, fstatSync, type FSWatcher, mkdirSync, openSync, readFileSync, unlinkSync, watch, writeFileSync } from "node:fs";
 import { isPidDead, pidProbe } from "../delivery.ts";
-import { doorbellDir, doorbellPath } from "./notify.ts";
+import { doorbellDir, doorbellPath, readDrainedDoorbell } from "./notify.ts";
 
 // Unlike the broker's best-effort marker read, readiness cannot treat an I/O
 // error as "unchanged". Validate and read the same descriptor; O_NONBLOCK keeps
@@ -113,9 +113,9 @@ export async function watchDoorbell(options: WatchDoorbellOptions): Promise<numb
           }
           return;
         }
-        // Without --since, the first valid counter establishes the baseline.
+        // Without --since, only a completed poll establishes the baseline.
         // An explicit pre-launch baseline must survive startup read failures.
-        baseline ??= cur;
+        baseline ??= readDrainedDoorbell(dbPath, id);
         if (!ready) {
           ready = true;
           console.log(`doorbell armed for ${id} (since=${baseline}; backend=${watcher ? "watch+poll" : "poll"}; consumed=false)`);
@@ -124,7 +124,8 @@ export async function watchDoorbell(options: WatchDoorbellOptions): Promise<numb
         if (persistent) {
           console.log(`mail for ${id} (mark=${cur})`);
           baseline = cur;
-        } else finish(0, `mail for ${id} (mark=${cur}) - re-arm, then run check_messages`);
+        } else finish(0, `mail for ${id} (mark=${cur}) - ${since === null
+          ? "run check_messages, then re-arm" : "re-arm, then run check_messages"}`);
       }
       function onEvent() {
         if (done) return;
