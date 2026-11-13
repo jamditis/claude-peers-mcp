@@ -138,8 +138,10 @@ does not add a racy per-send health probe or claim remote protocol knowledge.
 
 The current broker protocol is 11. Default manual watchers require the broker's drained-counter polling behavior. A current server refuses to run silently
 against an older local broker: it retires that broker and starts the required
-version. Protocol 9 to 10 is the current mixed-version path and has tests for
-legacy registrations and stored rows without `repo_key`.
+version. The native integration in `tests/doorbell-startup.test.ts` covers the
+drained-counter behavior with a protocol-11 broker. A protocol 10-to-11
+mixed-version rolling transition is unverified; stop clients and brokers before
+upgrading, following the [upgrade procedure](operations.md#upgrading).
 
 The supported rolling-upgrade rule is:
 

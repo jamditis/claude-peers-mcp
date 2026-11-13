@@ -54,7 +54,7 @@ A healthy `/health` response alone does not prove that peer reads, tmux delivery
 | A send is queued | Check urgency, whether the recipient has tmux, and the receiving host's remote floor. Queuing is expected for `fyi`, non-tmux clients, and default remote delivery. Poll at the recipient. |
 | Mail stays queued in tmux | Use doctor to check the pane and peer process. A bare-shell pane defers push. A normal message waits until due unless another push flushes it sooner. Repeated failed writes can demote the backlog to polling. |
 | Peek shows mail but polling returns none | A delivery lease can temporarily block the readable prefix. Use doctor for stalled leases and backend state. Avoid consuming the store manually. |
-| The doorbell does not wake the model | Confirm the harness reacts to process completion/output, the watcher uses the correct ID and database path, and it was armed before polling. A standalone watcher does not start a model turn. |
+| The doorbell does not wake the model | Confirm the harness reacts to process completion/output and the watcher uses the correct ID and database path. Drain before starting or re-arming a default manual watcher; arm a managed or explicit `--since` watcher before polling. A standalone watcher does not start a model turn. |
 | A session name is ambiguous | Discover peers and send to the exact ID. Multiple panes can share a tmux session name. |
 | A peer disappeared after restart | Registrations are tied to live MCP processes. Discover the new ID; old registrations and their mail can be removed. |
 | Siblings are missing or return 403 | Check reciprocal sibling entries, source-IP allowlists, private-network/firewall reachability, and the receiving port. Run `ping-siblings` on both hosts. |
@@ -65,7 +65,7 @@ For a reproducible install, delivery, or federation problem, use the [issue form
 
 ## Upgrading
 
-Package version and broker protocol are separate. The current broker protocol is 10; the supported mixed-version path from 9 to 10 is described in the [compatibility contract](compatibility.md#protocol-and-upgrade-rules).
+Package version and broker protocol are separate. The current broker protocol is 11. Default manual watchers require the broker's drained counter. A protocol 10-to-11 mixed-version rolling transition is unverified; use a coordinated stopped upgrade, as described in the [compatibility contract](compatibility.md#protocol-and-upgrade-rules).
 
 For a source checkout:
 

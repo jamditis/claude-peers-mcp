@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Wake default manual doorbells for unread remote mail arriving between a poll and watcher launch. Drain before re-arming a manual watcher without `--since`; managed recipes retain their explicit-baseline order. This requires broker protocol 11, so the next updated MCP server start replaces an older local broker. A protocol 10-to-11 mixed-version rolling transition is unverified; follow the [coordinated stopped upgrade procedure](docs/operations.md#upgrading) (#121).
+
 - Defer tmux pushes while the visible pane shows a recognized Claude Code question or permission dialog. Keep messages queued for ordered retry when the dialog closes, without counting deferrals toward push demotion. Unreachable panes still accrue failed attempts (#118).
 
 - Create empty-mail markers before handing managed doorbell recipes to the host. An owner-bound watcher now exits as peer removal if that marker disappears before launch, rather than recreating it and arming a stale peer ID. Legacy manual watchers still create their initial marker.
