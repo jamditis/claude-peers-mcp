@@ -193,7 +193,7 @@ The Ubuntu smoke test starts an isolated broker and two minimal MCP SDK clients.
 ### Delivery and fallback
 
 - **Tmux push:** A valid `TMUX_PANE` selects the pane; `TMUX` supplies an optional socket path. Without a valid pane ID, the server registers without a push target. The broker checks that the pane foreground is not a bare shell before injecting `[peer …]` text. That check cannot prove a given client's prompt is ready. `interrupt` is due immediately, `normal` waits for its configured deadline, and `fyi` never pushes.
-- **Doorbell watcher:** `bun cli.ts doorbell <peer-id>` signals pending mail that will not push. Learn the ID with `peek_messages`, arm the watcher, then call `check_messages`. Re-arm before the next check. The watcher does not read or clear mail; the client must run it or poll at task boundaries.
+- **Doorbell watcher:** `bun cli.ts doorbell <peer-id>` signals pending mail that will not push. Learn the ID with `peek_messages`, call `check_messages`, then start or re-arm the default watcher. Its drained baseline catches mail arriving before launch. Explicit `--since` watchers and managed recipes re-arm before checking. The watcher does not read or clear mail; the client must run it or poll at task boundaries.
 - **No tmux or watcher:** Messages stay queued. `check_messages` reads and clears them; `peek_messages` reports a count without clearing it. There is no automatic wake for a client with neither a pushable pane nor a watcher.
 - **No config file:** With no `CLAUDE_PEERS_CONFIG` and no `~/.claude-peers.json`, the server uses a loopback-only single-host default. An explicitly named missing config file fails at startup. A config file is needed for a different port, identity, or federation setup.
 
