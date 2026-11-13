@@ -1,30 +1,45 @@
 import { afterEach, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { doorbellPath, readDoorbell, removeDoorbell, writeDoorbell } from "../shared/notify.ts";
+import { doorbellPath, readDoorbell, readDrainedDoorbell, removeDoorbell, writeDoorbell, writeDrainedDoorbell } from "../shared/notify.ts";
 import { handleTool, type ToolContext } from "../shared/tool-results.ts";
 import type { doorbellRecipe } from "../shared/doorbell-session.ts";
 import { singleHostDefault } from "../shared/config.ts";
+import { PROTOCOL_VERSION } from "../shared/types.ts";
+import { claimForDelivery, releaseToQueued } from "../delivery.ts";
 
 const root = resolve(import.meta.dir, "..");
 const children: ReturnType<typeof Bun.spawn>[] = [];
 const directories: string[] = [];
+const healthServers: ReturnType<typeof Bun.serve>[] = [];
 afterEach(async () => {
   for (const child of children.splice(0)) {
     if (child.exitCode === null) child.kill();
     await child.exited;
   }
+  for (const server of healthServers.splice(0)) server.stop(true);
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
-function fixture() {
+function fixture(drainedCounter = true) {
   const work = mkdtempSync(join(tmpdir(), "doorbell-startup-"));
   directories.push(work);
   const dbPath = join(work, "store with spaces.db");
   const configPath = join(work, "config.json");
+  const healthRequests: string[] = [];
+  const health = Bun.serve({
+    hostname: "127.0.0.1", port: 0,
+    fetch(request) {
+      healthRequests.push(new URL(request.url).pathname);
+      return Response.json({ status: "ok", protocol_version: 10,
+        ...(drainedCounter ? { capabilities: { drainedCounter: true } } : {}) });
+    },
+  });
+  healthServers.push(health);
   // Deliberately different from the MCP server's resolved DB: --db-path must win.
-  writeFileSync(configPath, JSON.stringify({ machine: "test", tailscale_ip: "127.0.0.1", port: 1,
+  writeFileSync(configPath, JSON.stringify({ machine: "test", tailscale_ip: "127.0.0.1", port: health.port,
     id_prefix: "test", siblings: [], allowed_ips: ["127.0.0.1"], db_path: join(work, "wrong.db") }));
   const context: ToolContext = {
     myId: "old-peer", myCwd: work, myGitRoot: null, myRepoKey: null,
@@ -39,7 +54,7 @@ function fixture() {
     children.push(child);
     return child;
   }
-  return { work, dbPath, context, launch };
+  return { work, dbPath, context, launch, healthRequests };
 }
 
 async function recipe(context: ToolContext) {
@@ -140,6 +155,133 @@ test("legacy manual watchers still create an absent marker", async () => {
   writeDoorbell(f.dbPath, "test-peer", 1);
   expect(await child.exited).toBe(0);
 });
+
+// The old client is modeled at startup with its queue-head baseline. An explicit
+// --since executes that unchanged marker-watching path without negotiating health.
+for (const oldClient of [true, false]) {
+  test(`rolling contract: ${oldClient ? "old" : "new"} client with old broker uses the queue head`, async () => {
+    const f = fixture(false); // protocol-10 health has no capabilities; no drained writes
+    writeDoorbell(f.dbPath, "test-peer", 9);
+    // Leftover data from a previous new broker must not enable the new behavior.
+    writeDrainedDoorbell(f.dbPath, "test-peer", 3);
+    const argv = [process.execPath, join(root, "cli.ts"), "doorbell", "test-peer", "--db-path", f.dbPath];
+    if (oldClient) argv.push("--since", String(readDoorbell(f.dbPath, "test-peer")));
+    const child = f.launch(argv);
+    expect(await armed(child)).toContain("since=9");
+    writeDoorbell(f.dbPath, "test-peer", 10);
+    expect(await child.exited).toBe(0);
+    expect(await remaining(child)).toContain("re-arm, then run check_messages");
+    const stderr = await new Response(child.stderr).text();
+    expect(stderr.split("does not advertise drainedCounter").length - 1).toBe(oldClient ? 0 : 1);
+    expect(f.healthRequests).toEqual(oldClient ? [] : ["/health"]);
+    expect(readDoorbell(f.dbPath, "test-peer")).toBe(10);
+    expect(readDrainedDoorbell(f.dbPath, "test-peer")).toBe(3); // notify only
+  });
+}
+
+async function brokerFixture() {
+  const f = fixture();
+  const port = 17955;
+  const configPath = join(f.work, "config.json");
+  writeFileSync(configPath, JSON.stringify({ machine: "test", tailscale_ip: "127.0.0.1", port,
+    id_prefix: "test", siblings: [], allowed_ips: ["127.0.0.1"], db_path: f.dbPath, auto_summary: false }));
+  const broker = Bun.spawn([process.execPath, join(root, "broker.ts")], {
+    env: { ...process.env, CLAUDE_PEERS_CONFIG: configPath }, stdout: "ignore", stderr: "ignore",
+  });
+  children.push(broker);
+  const url = `http://127.0.0.1:${port}`;
+  const deadline = Date.now() + 2000;
+  for (;;) {
+    try { if ((await fetch(`${url}/health`)).ok) break; } catch {}
+    if (Date.now() >= deadline) throw new Error("Test broker did not start");
+    await Bun.sleep(25);
+  }
+  async function request<T>(path: string, body: unknown, token?: string): Promise<T> {
+    const response = await fetch(`${url}${path}`, { method: "POST", body: JSON.stringify(body),
+      headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) } });
+    expect(response.status).toBe(200);
+    return response.json() as Promise<T>;
+  }
+  const peer = await request<{ id: string; token: string }>("/register", {
+    pid: process.pid, cwd: f.work, git_root: null, tty: null, summary: "", machine: "test",
+    tailscale_ip: "127.0.0.1", tmux_pane: null, tmux_socket: null,
+  });
+  const poll = () => request<{ messages: { id: number; text: string }[] }>("/poll-messages", { id: peer.id }, peer.token);
+  const forward = async (text: string) => {
+    expect(await request("/forward-message", { protocol_version: PROTOCOL_VERSION,
+      from_id: "remote-peer", from_machine: "remote", to_id: peer.id, text })).toMatchObject({ ok: true, poll_only: true });
+    return readDoorbell(f.dbPath, peer.id);
+  };
+  const launch = () => f.launch([process.execPath, join(root, "cli.ts"), "doorbell", peer.id, "--db-path", f.dbPath], 2);
+  expect(await (await fetch(`${url}/health`)).json()).toMatchObject({
+    protocol_version: 10, capabilities: { drainedCounter: true },
+  });
+  return { f, request, peer, poll, forward, launch };
+}
+
+test("rolling contract: new client with new broker catches remote mail across drain and launch", async () => {
+  const { f, request, peer, poll, forward, launch } = await brokerFixture();
+  // Pending mail on the first launch must also wake without an explicit --since.
+  const first = await forward("already queued");
+  const startup = launch();
+  expect(await startup.exited).toBe(0);
+  expect(await new Response(startup.stderr).text()).toBe("");
+  expect(await remaining(startup)).toContain(`mark=${first}`);
+  expect((await poll()).messages.map(m => m.text)).toEqual(["already queued"]);
+  expect(readDrainedDoorbell(f.dbPath, peer.id)).toBe(first);
+
+  const gap = await forward("in the launch gap");
+  const delayed = launch();
+  expect(await delayed.exited).toBe(0);
+  const output = await remaining(delayed);
+  expect(output).toContain(`since=${first}`);
+  expect(output).toContain(`mark=${gap}`);
+  expect(output).toContain("run check_messages, then re-arm");
+  expect(readDrainedDoorbell(f.dbPath, peer.id)).toBe(first); // watching never consumes
+  expect((await poll()).messages.map(m => m.text)).toEqual(["in the launch gap"]);
+
+  const armedWatcher = launch();
+  expect(await armed(armedWatcher)).toContain(`since=${gap}`);
+  const later = await forward("after arming");
+  expect(await armedWatcher.exited).toBe(0);
+  expect(await remaining(armedWatcher)).toContain(`mark=${later}`);
+  expect((await poll()).messages.map(m => m.text)).toEqual(["after arming"]);
+
+  const prefix = await forward("readable prefix");
+  const lease = await forward("in flight");
+  const suffix = await forward("behind lease");
+  const db = new Database(f.dbPath);
+  try {
+    expect(claimForDelivery(db, lease, Date.now(), 60_000, "fixture-lease")).toBe(true);
+    expect((await poll()).messages.map(m => m.text)).toEqual(["readable prefix"]);
+    expect(readDrainedDoorbell(f.dbPath, peer.id)).toBe(prefix);
+    releaseToQueued(db, lease, "fixture-lease");
+    expect((await poll()).messages.map(m => m.text)).toEqual(["in flight", "behind lease"]);
+    expect(readDrainedDoorbell(f.dbPath, peer.id)).toBe(suffix);
+  } finally { db.close(); }
+  // A signal left by already-delivered mail is acknowledged by an empty poll.
+  writeDoorbell(f.dbPath, peer.id, suffix + 1);
+  expect((await poll()).messages).toEqual([]);
+  expect(readDrainedDoorbell(f.dbPath, peer.id)).toBe(suffix + 1);
+  await request("/unregister", { id: peer.id }, peer.token);
+  expect(existsSync(`${doorbellPath(f.dbPath, peer.id)}.drained`)).toBe(false);
+}, 10_000);
+
+test("rolling contract: old client with new broker keeps polling and marker behavior", async () => {
+  const { f, peer, poll, forward } = await brokerFixture();
+  const first = await forward("queued before old client starts");
+  const child = f.launch([process.execPath, join(root, "cli.ts"), "doorbell", peer.id,
+    "--db-path", f.dbPath, "--since", String(readDoorbell(f.dbPath, peer.id))]);
+  expect(await armed(child)).toContain(`since=${first}`);
+  const later = await forward("queued after old client arms");
+  expect(await child.exited).toBe(0);
+  expect(await remaining(child)).toContain(`mail for ${peer.id} (mark=${later}) - re-arm, then run check_messages`);
+  expect(await new Response(child.stderr).text()).toBe("");
+  expect((await poll()).messages.map(m => m.text)).toEqual([
+    "queued before old client starts", "queued after old client arms",
+  ]);
+  expect(readDrainedDoorbell(f.dbPath, peer.id)).toBe(later);
+}, 10_000);
 
 test("one host task per peer, arm-before-drain, and rearm after each fire", async () => {
   const f = fixture();
@@ -282,6 +424,7 @@ for (const explicitBaseline of [true, false]) {
   test(`startup empty marker recovers before readiness (${explicitBaseline ? "explicit" : "default"} baseline)`, async () => {
     const f = fixture();
     writeDoorbell(f.dbPath, "test-peer", 0);
+    writeDrainedDoorbell(f.dbPath, "test-peer", 3);
     const argv = await recipe(f.context);
     if (!explicitBaseline) argv.splice(argv.indexOf("--since"), 2);
     writeFileSync(doorbellPath(f.dbPath, "test-peer") as string, "");
@@ -293,13 +436,12 @@ for (const explicitBaseline of [true, false]) {
     let output = "";
     if (!explicitBaseline) {
       output = await armed(child);
-      expect(output).toContain("since=7");
-      writeDoorbell(f.dbPath, "test-peer", 8);
+      expect(output).toContain("since=3");
     }
     expect(await child.exited).toBe(0);
     output += await remaining(child);
     expect(output).toContain("doorbell armed");
-    expect(output).toContain(`mark=${explicitBaseline ? 7 : 8}`);
+    expect(output).toContain("mark=7");
     expect(existsSync(`${doorbellPath(f.dbPath, "test-peer")}.watcher`)).toBe(false);
   });
 }

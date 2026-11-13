@@ -51,7 +51,7 @@ import {
 } from "./delivery.ts";
 import { loadConfig, type SiblingConfig } from "./shared/config.ts";
 import { displaySessionName } from "./shared/format-peers.ts";
-import { removeDoorbell, writeDoorbell } from "./shared/notify.ts";
+import { readDoorbell, removeDoorbell, writeDoorbell, writeDrainedDoorbell } from "./shared/notify.ts";
 import { getRepoKey } from "./shared/repo-key.ts";
 import type {
   ControlPlaneRequest,
@@ -1298,6 +1298,13 @@ if (import.meta.main) {
     for (const msg of releasableQueuedPrefix(pending)) {
       if (markPolled.run(msg.id).changes === 1) messages.push(msg);
     }
+    // A queue-head snapshot would hide mail arriving between this poll and a
+    // manual watcher launch. Record only the drained prefix; an in-flight head
+    // must not acknowledge the still-unread signal behind it. An empty queue
+    // also drains any older signal left by messages delivered through tmux.
+    const lastRead = messages.at(-1)?.id ?? 0;
+    writeDrainedDoorbell(DB_PATH, body.id, pending.length === messages.length
+      ? Math.max(lastRead, readDoorbell(DB_PATH, body.id, 0)) : lastRead);
     return { messages };
   }
 
@@ -1401,6 +1408,7 @@ if (import.meta.main) {
             status: "ok", peers: (selectAllPeers.all() as unknown[]).length,
             machine: config.machine, remote_peer_count: (selectAllRemotePeers.all() as unknown[]).length,
             protocol_version: PROTOCOL_VERSION,
+            capabilities: { drainedCounter: true },
           });
         }
         return new Response("claude-peers broker (federated)", { status: 200 });

@@ -25,6 +25,7 @@
 // SQLite store directly, and stays decoupled from the messages schema.
 
 import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 
 // Peer ids are `${id_prefix}-${alnum}` (see generatePeerId), and id_prefix is copied verbatim
 // from config — which permits a dot (e.g. a machine-derived `node.a`). So dots must be allowed,
@@ -75,11 +76,14 @@ export function doorbellPath(dbPath: string, id: string): string | null {
  * would not advance the counter.
  */
 export function writeDoorbell(dbPath: string, id: string, seq: number): boolean {
-  const path = doorbellPath(dbPath, id);
+  return writeCounter(doorbellPath(dbPath, id), seq);
+}
+
+function writeCounter(path: string | null, seq: number): boolean {
   if (path === null) return false;
   try {
-    mkdirSync(doorbellDir(dbPath), { recursive: true });
-    if (readDoorbell(dbPath, id) >= seq) return false;
+    mkdirSync(dirname(path), { recursive: true });
+    if (readCounter(path, -1) >= seq) return false;
     writeFileSync(path, String(seq));
     return true;
   } catch {
@@ -102,7 +106,10 @@ export function writeDoorbell(dbPath: string, id: string, seq: number): boolean 
  * lock in. Absent rings, so the failure that remains is a spare ring rather than silence.
  */
 export function readDoorbell(dbPath: string, id: string, missing = -1): number {
-  const path = doorbellPath(dbPath, id);
+  return readCounter(doorbellPath(dbPath, id), missing);
+}
+
+function readCounter(path: string | null, missing: number): number {
   if (path === null) return missing;
   try {
     const raw = readFileSync(path, "utf8").trim();
@@ -114,6 +121,18 @@ export function readDoorbell(dbPath: string, id: string, missing = -1): number {
   }
 }
 
+/** Only authenticated polling advances the drained counter. A manual watcher
+ * defaults to it so mail arriving between a drain and launch remains visible. */
+export function writeDrainedDoorbell(dbPath: string, id: string, seq: number): boolean {
+  const path = doorbellPath(dbPath, id);
+  return writeCounter(path === null ? null : `${path}.drained`, seq);
+}
+
+export function readDrainedDoorbell(dbPath: string, id: string): number {
+  const path = doorbellPath(dbPath, id);
+  return readCounter(path === null ? null : `${path}.drained`, 0);
+}
+
 /**
  * Drop a recipient's marker when its peer is removed (graceful exit, same-pid re-register, or
  * the dead-pid sweep), so stale markers do not accumulate. Best-effort; a missing file is fine.
@@ -121,9 +140,11 @@ export function readDoorbell(dbPath: string, id: string, missing = -1): number {
 export function removeDoorbell(dbPath: string, id: string): void {
   const path = doorbellPath(dbPath, id);
   if (path === null) return;
-  try {
-    unlinkSync(path);
-  } catch {
-    // already gone, or never created — nothing to clean up
+  for (const counter of [path, `${path}.drained`]) {
+    try {
+      unlinkSync(counter);
+    } catch {
+      // already gone, or never created — nothing to clean up
+    }
   }
 }

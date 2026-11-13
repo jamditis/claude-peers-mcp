@@ -16,6 +16,7 @@ describe("MCP compatibility contract", () => {
       ["../README.md", `currently \`${PROTOCOL_VERSION}\``],
       ["../CLAUDE.md", `PROTOCOL_VERSION = ${PROTOCOL_VERSION}`],
       ["../docs/compatibility.md", `current broker protocol is ${PROTOCOL_VERSION}`],
+      ["../docs/operations.md", `current broker protocol is ${PROTOCOL_VERSION}`],
     ] as const;
     for (const [path, expected] of references) {
       expect(readFileSync(new URL(path, import.meta.url), "utf8").toLowerCase()).toContain(expected.toLowerCase());
