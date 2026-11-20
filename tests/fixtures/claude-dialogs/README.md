@@ -17,3 +17,5 @@ Auto-mode hidden-index variants are derived from these recorded permission contr
 `question-preview.txt` and `question-notes.txt` are live 80-column preview-question recordings before and after entering notes. The background-agent permission-hint test appends only the installed renderer's independently verified stop-agent hint to a recorded permission screen.
 
 `answer-review.txt`, `plan-approval.txt` and `quoted-footer.txt` use `tmux capture-pane -p -J` from an isolated Claude Code 2.1.327 session at 100 columns by 38 rows. The first two retain the visible dialog and stop before confirmation. The quoted-footer fixture keeps the recorded reply and input box and omits the turn timing, status bar and blank rows so the reply sits directly above the box.
+
+`ultracode-closed.txt` and `history-search.txt` use the same capture command and dimensions with Claude Code 2.1.327. The first shows the idle composer after `/effort ultracode`. The second shows the inline history field after Ctrl+R, with the composer still visible.

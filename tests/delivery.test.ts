@@ -819,8 +819,8 @@ function dialogFixture(name: string): string {
 }
 
 describe("dialog-safe tmux delivery (#118, #130)", () => {
-  for (const fixture of ["question-select", "question-text", "question-80", "question-multi", "question-two", "question-two-text-80", "question-preview", "question-notes", "question-submit", "permission", "permission-amend", "permission-edit", "permission-edit-amend", "permission-fetch", "answer-review", "plan-approval"]) {
-    it(`defers the captured ${fixture} dialog without typing or counting a push failure`, async () => {
+  for (const fixture of ["question-select", "question-text", "question-80", "question-multi", "question-two", "question-two-text-80", "question-preview", "question-notes", "question-submit", "permission", "permission-amend", "permission-edit", "permission-edit-amend", "permission-fetch", "answer-review", "plan-approval", "history-search"]) {
+    it(`defers the captured ${fixture} pane without typing or counting a push failure`, async () => {
       const tmux = fakeTmux({ paneText: dialogFixture(fixture) });
       const deferrals: string[] = [];
       const faults: unknown[] = [];
@@ -834,7 +834,7 @@ describe("dialog-safe tmux delivery (#118, #130)", () => {
     });
   }
 
-  for (const fixture of ["question-closed", "permission-closed", "quoted-footer"]) {
+  for (const fixture of ["question-closed", "permission-closed", "quoted-footer", "ultracode-closed"]) {
     it(`delivers into the captured ${fixture} pane`, async () => {
       const tmux = fakeTmux({ paneText: dialogFixture(fixture) });
       expect(await deliverViaTmux("%1", null, "peer message", tmux.run)).toBe(true);

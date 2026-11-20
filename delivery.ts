@@ -714,14 +714,22 @@ export function classifyPaneDialog(paneText: string): PaneScreenReadiness {
   // Leave room for a wrapped draft and footer while excluding older transcript rules.
   const lines = screen.split("\n").slice(-14).map((line) => line.trim());
   const bottom = lines.findLastIndex((line) => /^─{10,}$/.test(line));
-  const top = lines.findLastIndex((line, index) => index < bottom && line === lines[bottom]);
+  const top = lines.findLastIndex((line, index) => index < bottom
+    && line.length === lines[bottom]?.length
+    && (line === lines[bottom] || /^─{10,} ultracode ─+$/.test(line)));
+  const yes = /^\s*(?:❯\s*)?(?:\d+\.\s*)?Yes\b/m;
+  const planEditHint = /\b(?:ctrl\+g|ctrl-g) to edit\b/;
   if (top >= 0 && top + 1 < bottom && /^❯(?:\s|$)/.test(lines[top + 1] ?? "")) {
-    const footer = lines.slice(bottom + 1).join(" ");
+    const footerLines = lines.slice(bottom + 1);
+    const footer = footerLines.join(" ");
     // A hint below the bottom rule can wrap. Transcript above the box is irrelevant.
-    if (!/\b(?:Enter to (?:select|confirm|submit)|Esc to cancel)\b/.test(footer)) {
-      return { ready: true, reason: "pane shows the Claude Code input box" };
+    const dialogHint = /\b(?:Enter to (?:select|confirm|submit)|Esc to cancel)\b/.test(footer);
+    const historySearch = footerLines.some((line) => /^(?:search prompts|no matching prompt):/.test(line));
+    const planApproval = planEditHint.test(footer) && yes.test(footerLines.join("\n"));
+    if (dialogHint || historySearch || planApproval) {
+      return { ready: false, reason: "pane shows an active control below the input box", kind: "dialog" };
     }
-    return { ready: false, reason: "pane shows a dialog hint below the input box", kind: "dialog" };
+    return { ready: true, reason: "pane shows the Claude Code input box" };
   }
 
   // These signatures only distinguish a dialog worth waiting for from an unknown layout.
@@ -735,12 +743,11 @@ export function classifyPaneDialog(paneText: string): PaneScreenReadiness {
   }
   const permission = /^Esc to cancel(?: · .*)?$/;
   const reject = /(?:^| )(?:❯\s*)?(?:\d+\.\s*)?No, and tell Claude what to do differently \(esc\)$/;
-  const yes = /^\s*(?:❯\s*)?(?:\d+\.\s*)?Yes\b/m;
   const noFirst = /(?:^| )(?:❯\s*)?Yes$/.test(tail)
     && /^\s*(?:❯\s*)?No\b/m.test(screen)
     && /^\s*❯\s*(?:Yes|No)\b/m.test(screen);
   const plan = /^\s*Ready to code\?$/m.test(screen)
-    && /\b(?:ctrl\+g|ctrl-g) to edit\b/.test(tail);
+    && planEditHint.test(tail);
   if ((permission.test(footer) || reject.test(tail) || noFirst || plan) && yes.test(screen)) {
     return { ready: false, reason: "pane shows an approval dialog", kind: "dialog" };
   }

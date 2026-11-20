@@ -28,7 +28,7 @@ A peer ID addresses one live registration. Removing that peer also removes its q
 
 Start the client inside tmux so its MCP server inherits the pane and socket information. The broker uses bracketed paste to inject text into that pane, strips C0/C1 control characters, and checks the pane before sending. A known bare-shell foreground process defers the push.
 
-Before the guarded write, the broker reads the visible pane with `capture-pane`. Push requires the standard Claude Code input prompt between two horizontal rules near the bottom of the pane. A dialog hint below the box also defers delivery. The message stays queued and the next heartbeat can retry when the input box appears.
+Before the guarded write, the broker reads the visible pane with `capture-pane`. Push requires the standard Claude Code input prompt between two horizontal rules near the bottom of the pane. A dialog or inline history search below the box also defers delivery. The message stays queued and the next heartbeat can retry when the input box is ready.
 
 For Claude Code screen-reader mode or a client with an unverified layout, launch with `TMUX_PANE=` to register for polling and the doorbell from the start. For example, use `TMUX_PANE= claude --ax-screen-reader` inside tmux.
 
