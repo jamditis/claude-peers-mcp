@@ -822,15 +822,15 @@ describe("dialog-safe tmux delivery (#118, #130)", () => {
   for (const fixture of ["question-select", "question-text", "question-80", "question-multi", "question-two", "question-two-text-80", "question-preview", "question-notes", "question-submit", "permission", "permission-amend", "permission-edit", "permission-edit-amend", "permission-fetch", "answer-review", "plan-approval"]) {
     it(`defers the captured ${fixture} dialog without typing or counting a push failure`, async () => {
       const tmux = fakeTmux({ paneText: dialogFixture(fixture) });
-      const reasons: string[] = [];
+      const deferrals: string[] = [];
       const faults: unknown[] = [];
       const ok = await deliverViaTmux("%1", null, "peer message", tmux.run,
-        (reason) => reasons.push(reason), (error) => faults.push(error));
+        (_reason, kind) => deferrals.push(kind), (error) => faults.push(error));
       expect(ok).toBe(false);
       expect(tmux.injected()).toBe(false);
-      expect(reasons).toHaveLength(1);
+      expect(deferrals).toEqual(["dialog"]);
       expect(faults).toEqual([]);
-      expect(countsAsPushFailure({ ok, deferred: reasons.length > 0, faulted: faults.length > 0 })).toBe(false);
+      expect(countsAsPushFailure({ ok, deferred: deferrals.length > 0, faulted: faults.length > 0 })).toBe(false);
     });
   }
 
@@ -853,10 +853,10 @@ describe("dialog-safe tmux delivery (#118, #130)", () => {
   for (const paneText of ["", "$\n"]) {
     it(`defers a capture without the framed input box (${JSON.stringify(paneText)})`, async () => {
       const tmux = fakeTmux({ paneText });
-      const reasons: string[] = [];
-      expect(await deliverViaTmux("%1", null, "peer message", tmux.run, (reason) => reasons.push(reason))).toBe(false);
+      const deferrals: string[] = [];
+      expect(await deliverViaTmux("%1", null, "peer message", tmux.run, (_reason, kind) => deferrals.push(kind))).toBe(false);
       expect(tmux.injected()).toBe(false);
-      expect(reasons).toHaveLength(1);
+      expect(deferrals).toEqual(["unverified-layout"]);
     });
   }
 

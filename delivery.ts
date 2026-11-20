@@ -292,7 +292,7 @@ export function decidePushDemotion(
  * callbacks told it.
  *
  *  - `ok`: the send landed. Nothing to count (the caller resets the streak instead).
- *  - `deferred`: a probe positively identified a shell or active dialog, so nothing was sent. It has
+ *  - `deferred`: the pane was a shell or lacked a ready input box. Nothing was sent. It has
  *    its own consecutive-deferral counter and escalation (#42).
  *  - `faulted`: the attempt never reached the pane — the spawn rejected, or capture/send outlived its
  *    deadline and was killed. This is evidence about the host, not the pane, and counting it would
@@ -704,21 +704,47 @@ export function classifyPaneReadiness(currentCommand: string): PaneReadiness {
   return { ready: true, reason: `pane foreground is ${cmd}` };
 }
 
+type PaneDeferral = "shell" | "dialog" | "unverified-layout";
+type PaneScreenReadiness = { ready: true; reason: string }
+  | { ready: false; reason: string; kind: "dialog" | "unverified-layout" };
+
 /** Require the normal Claude Code input box near the bottom of a captured pane. */
-export function classifyPaneDialog(paneText: string): PaneReadiness {
+export function classifyPaneDialog(paneText: string): PaneScreenReadiness {
+  const screen = paneText.split("\n").map((line) => line.trimEnd()).join("\n").trimEnd();
   // Leave room for a wrapped draft and footer while excluding older transcript rules.
-  const lines = paneText.trimEnd().split("\n").slice(-14).map((line) => line.trim());
+  const lines = screen.split("\n").slice(-14).map((line) => line.trim());
   const bottom = lines.findLastIndex((line) => /^─{10,}$/.test(line));
   const top = lines.findLastIndex((line, index) => index < bottom && line === lines[bottom]);
-  // A hint after the lower rule can wrap over multiple rows. Text before the input box
-  // is transcript and does not take part in the hint check.
-  const footer = lines.slice(bottom + 1).join(" ");
-  if (top >= 0 && top + 1 < bottom
-    && /^❯(?:\s|$)/.test(lines[top + 1] ?? "")
-    && !/\b(?:Enter to (?:select|confirm|submit)|Esc to cancel)\b/.test(footer)) {
-    return { ready: true, reason: "pane shows the Claude Code input box" };
+  if (top >= 0 && top + 1 < bottom && /^❯(?:\s|$)/.test(lines[top + 1] ?? "")) {
+    const footer = lines.slice(bottom + 1).join(" ");
+    // A hint below the bottom rule can wrap. Transcript above the box is irrelevant.
+    if (!/\b(?:Enter to (?:select|confirm|submit)|Esc to cancel)\b/.test(footer)) {
+      return { ready: true, reason: "pane shows the Claude Code input box" };
+    }
+    return { ready: false, reason: "pane shows a dialog hint below the input box", kind: "dialog" };
   }
-  return { ready: false, reason: "pane does not show a ready Claude Code input box" };
+
+  // These signatures only distinguish a dialog worth waiting for from an unknown layout.
+  // Neither result permits a push.
+  const footer = lines.at(-1) ?? "";
+  const tail = lines.slice(-4).join(" ");
+  const question = /(?:^| )Enter to select · (?:↑\/↓|Tab\/Arrow keys) to navigate(?: · [^·]+)*$/;
+  const submit = /(?:^|\n)(?:Ready to submit your answers\?|Review your answers)\n[\s\S]*\n\s*(?:❯\s*)?1\. Submit answers\n\s*(?:❯\s*)?2\. Cancel$/;
+  if (question.test(tail) || submit.test(screen)) {
+    return { ready: false, reason: "pane shows a question dialog", kind: "dialog" };
+  }
+  const permission = /^Esc to cancel(?: · .*)?$/;
+  const reject = /(?:^| )(?:❯\s*)?(?:\d+\.\s*)?No, and tell Claude what to do differently \(esc\)$/;
+  const yes = /^\s*(?:❯\s*)?(?:\d+\.\s*)?Yes\b/m;
+  const noFirst = /(?:^| )(?:❯\s*)?Yes$/.test(tail)
+    && /^\s*(?:❯\s*)?No\b/m.test(screen)
+    && /^\s*❯\s*(?:Yes|No)\b/m.test(screen);
+  const plan = /^\s*Ready to code\?$/m.test(screen)
+    && /\b(?:ctrl\+g|ctrl-g) to edit\b/.test(tail);
+  if ((permission.test(footer) || reject.test(tail) || noFirst || plan) && yes.test(screen)) {
+    return { ready: false, reason: "pane shows an approval dialog", kind: "dialog" };
+  }
+  return { ready: false, reason: "pane does not show a verified input layout", kind: "unverified-layout" };
 }
 
 /**
@@ -1031,14 +1057,14 @@ export async function probePaneReadiness(
  */
 export async function deliverViaTmux(
   pane: string, socket: string | null, text: string, run: TmuxQuery,
-  onDefer?: (reason: string) => void,
+  onDefer?: (reason: string, kind: PaneDeferral) => void,
   onFault?: (error: unknown) => void,
 ): Promise<boolean> {
   try {
     const readiness = await probePaneReadiness(pane, socket, run);
     if (!readiness.ready) {
       console.error(`[claude-peers broker] deferring tmux delivery to pane ${pane}: ${readiness.reason}`);
-      onDefer?.(readiness.reason);
+      onDefer?.(readiness.reason, "shell");
       return false;
     }
     const capture = await run(buildPaneCaptureArgs(pane, socket));
@@ -1054,7 +1080,7 @@ export async function deliverViaTmux(
     const screen = classifyPaneDialog(capture.stdout);
     if (!screen.ready) {
       console.error(`[claude-peers broker] deferring tmux delivery to pane ${pane}: ${screen.reason}`);
-      onDefer?.(screen.reason);
+      onDefer?.(screen.reason, screen.kind);
       return false;
     }
     const { exitCode, stdout, timedOut } = await run(buildGuardedTmuxArgs(pane, socket, text));
@@ -1064,7 +1090,7 @@ export async function deliverViaTmux(
       // guard exists for. Nothing was typed, so the row simply stays queued.
       const reason = "pane foreground became a shell between probe and send";
       console.error(`[claude-peers broker] atomic guard suppressed tmux delivery to pane ${pane}: ${reason}`);
-      onDefer?.(reason);
+      onDefer?.(reason, "shell");
       return false;
     }
     if (outcome === "failed" && timedOut) {

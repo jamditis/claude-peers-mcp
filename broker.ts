@@ -507,10 +507,13 @@ if (import.meta.main) {
   // Consecutive not-ready deferrals per recipient, for the stuck-pane escalation (issue #42).
   // A readiness-deferred attempt increments the recipient's streak; it resets on any delivered
   // (or otherwise-not-deferred) tmux attempt, on a poll (handlePollMessages — the recipient is
-  // alive and draining mail through the floor), and on peer removal (deletePeerAndMail), so the
-  // map only ever holds peers currently wedged on a shell pane. deliverNext is serial per
-  // recipient, so a streak is only touched by one in-flight attempt at a time.
-  const deferralStreaks = new Map<string, number>();
+  // alive and draining mail through the floor), and on peer removal (deletePeerAndMail).
+  // Unknown layouts also track an unmixed streak for the same queue head. A dialog, shell,
+  // or new queue head starts that layout count over.
+  const deferralStreaks = new Map<string, {
+    count: number;
+    unverifiedLayout?: { rowId: number; count: number };
+  }>();
   // delivery's lease must resolve first (see removePeerOrDefer); deliverNext's finally
   // drains this set the instant the lease frees.
   const pendingPeerDeletes = new Set<string>();
@@ -854,10 +857,14 @@ if (import.meta.main) {
   // path is what failed, and a message that was meant to type itself into the pane now waits for
   // a poll. Accepted, because the alternative is retrying a pane that has failed `cap` times in a
   // row while its recipient hears nothing at all.
-  function notePushFailure(row: { id: number; to_id: string; urgency: string }): void {
+  function notePushFailure(row: { id: number; to_id: string }): void {
     const failures = bumpPushFailures(db, row.id);
     const decision = decidePushDemotion(failures, PUSH_FAILURE_DEMOTION_CAP);
     if (!decision.demote) return;
+    demotePushBacklog(row, `${decision.reason} consecutive failed pushes (tmux could not reach or type into the pane)`);
+  }
+
+  function demotePushBacklog(row: { id: number; to_id: string }, reason: string): void {
     const { demoted, interrupts } = demoteQueuedPushable(db, row.to_id);
     if (demoted === 0) return;
     // The interrupt count is over the whole demoted set, not the row that tripped the cap: a
@@ -866,7 +873,7 @@ if (import.meta.main) {
     const lost = interrupts > 0
       ? ` ${interrupts} of them ${interrupts === 1 ? "was an interrupt, whose sender is blocked on this peer; it loses" : "were interrupts, whose senders are blocked on this peer; they lose"} push urgency and now wait for check_messages/the doorbell`
       : " they stay queued for check_messages and the doorbell now announces them";
-    console.error(`[claude-peers broker] demoting ${demoted} queued message(s) for peer ${row.to_id} to poll-only: message #${row.id} hit ${decision.reason} consecutive failed pushes (tmux could not reach or type into the pane);${lost}`);
+    console.error(`[claude-peers broker] demoting ${demoted} queued message(s) for peer ${row.to_id} to poll-only: message #${row.id} hit ${reason};${lost}`);
   }
 
   async function attemptDeliverNext(toId: string): Promise<"accepted" | "queued" | null> {
@@ -914,6 +921,7 @@ if (import.meta.main) {
     inFlightDeliveries++;
     let deferredThisAttempt = false;
     let faultedThisAttempt = false;
+    let layoutDeferrals = 0;
     try {
       // deliverViaTmux probes the pane before injecting: if its foreground process is a bare
       // shell rather than a live Claude session, it skips the inject and returns false, so the
@@ -927,12 +935,19 @@ if (import.meta.main) {
       // — a permanently shelled pid is invisible to the dead-pid sweep, so its mail would
       // otherwise stall in silence.
       const ok = await deliverViaTmux(target.pane, target.socket, text, realTmuxQuery,
-        (reason) => {
+        (reason, kind) => {
           deferredThisAttempt = true;
-          const streak = (deferralStreaks.get(toId) ?? 0) + 1;
-          deferralStreaks.set(toId, streak);
+          const previous = deferralStreaks.get(toId);
+          const streak = (previous?.count ?? 0) + 1;
+          const layout = previous?.unverifiedLayout;
+          if (kind === "unverified-layout") {
+            layoutDeferrals = layout?.rowId === row.id ? layout.count + 1 : 1;
+            deferralStreaks.set(toId, { count: streak, unverifiedLayout: { rowId: row.id, count: layoutDeferrals } });
+          } else {
+            deferralStreaks.set(toId, { count: streak });
+          }
           if (decideDeferralEscalation(streak, DEFERRAL_ESCALATION_CAP).escalate) {
-            console.error(`[claude-peers broker] escalation: pane ${target.pane} (peer ${toId}) deferred ${streak}x in a row (${reason}); mail stays queued while the pane is not ready for push; check for an open dialog or a session that exited to a shell under a still-live pid`);
+            console.error(`[claude-peers broker] escalation: pane ${target.pane} (peer ${toId}) deferred ${streak}x in a row (${reason}); mail stays queued while the pane is not ready for push; check the pane layout, an open dialog or a session that exited to a shell under a still-live pid`);
           }
         },
         // onFault: spawn rejection or capture/send timeout is host evidence, not pane evidence.
@@ -970,9 +985,15 @@ if (import.meta.main) {
         return "accepted";
       }
       // Any non-deferred miss (send failed, peer died mid-send) also breaks the not-ready run:
-      // only an unbroken streak of shell deferrals should accrue toward the stuck-pane escalation.
+      // only an unbroken streak of deferrals should accrue toward the stuck-pane escalation.
       if (!deferredThisAttempt) deferralStreaks.delete(toId);
       for (const message of rows) releaseToQueued(db, message.id, token);
+
+      // A layout this broker cannot verify may never accept a push. Once this head
+      // reaches the cap, remove the whole backlog from push so settle can ring.
+      if (layoutDeferrals >= DEFERRAL_ESCALATION_CAP) {
+        demotePushBacklog(row, `${layoutDeferrals} consecutive deferrals for an unverified pane layout`);
+      }
       // A capture or send that ran and exited non-zero is the #70 case: the row returns to
       // queued still pushable, so the next heartbeat retries it and the doorbell's withhold stays
       // shut on the poll-only mail behind it. Count it, and once the run reaches the cap demote the

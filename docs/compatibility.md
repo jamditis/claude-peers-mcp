@@ -203,6 +203,8 @@ row with a supported tier or an explicit out-of-scope statement.
 
 The Ubuntu smoke test starts an isolated broker and two minimal MCP SDK clients. It verifies tool and peer discovery, a queued `fyi` send, one read by `check_messages`, and an empty second read. It does not start Claude Code, Codex CLI, or Gemini CLI. Other spec-conforming stdio clients are expected to use the same tools; their lifecycle behavior is unverified.
 
+For a flat or unverified layout, [register for polling and the doorbell](delivery.md#tmux-push) by launching with `TMUX_PANE=`.
+
 ### Delivery and fallback
 
 - **Tmux push:** A valid `TMUX_PANE` selects the pane; `TMUX` supplies an optional socket path. Without a valid pane ID, the server registers without a push target. The broker checks that the pane foreground is not a bare shell before injecting `[peer …]` text. That check cannot prove a given client's prompt is ready. `interrupt` is due immediately, `normal` waits for its configured deadline, and `fyi` never pushes.

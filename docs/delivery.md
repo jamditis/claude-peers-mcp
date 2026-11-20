@@ -28,7 +28,9 @@ A peer ID addresses one live registration. Removing that peer also removes its q
 
 Start the client inside tmux so its MCP server inherits the pane and socket information. The broker uses bracketed paste to inject text into that pane, strips C0/C1 control characters, and checks the pane before sending. A known bare-shell foreground process defers the push.
 
-Before the guarded write, the broker reads the visible pane with `capture-pane`. Push requires the standard Claude Code input prompt between two horizontal rules near the bottom of the pane. A dialog hint below the box also defers delivery. The message stays queued and the next heartbeat can retry when the input box appears. Use `check_messages` for client layouts without the framed input box.
+Before the guarded write, the broker reads the visible pane with `capture-pane`. Push requires the standard Claude Code input prompt between two horizontal rules near the bottom of the pane. A dialog hint below the box also defers delivery. The message stays queued and the next heartbeat can retry when the input box appears.
+
+For Claude Code screen-reader mode or a client with an unverified layout, launch with `TMUX_PANE=` to register for polling and the doorbell from the start. For example, use `TMUX_PANE= claude --ax-screen-reader` inside tmux.
 
 The screen check uses fixtures recorded with Claude Code 2.1.318 and 2.1.327. A dialog can still open after capture. The atomic foreground guard rechecks for a shell at the time of the write.
 
@@ -36,7 +38,7 @@ If capture fails, the broker leaves the message queued. A nonzero tmux exit coun
 
 The server heartbeats every 15 seconds. A normal message becomes eligible after its deadline and is ordinarily attempted on a subsequent heartbeat, so the delay is not an exact delivery timer.
 
-After five consecutive counted capture/send failures on a row, the broker demotes the recipient's queued pushable backlog to poll-only and signals the doorbell. This preserves readable mail instead of retrying a broken pane forever. A pane-not-ready defer or a host-side spawn/timeout fault does not count as a failed capture/send attempt. Newly arriving mail can try push again.
+After five consecutive counted capture/send failures on a row, the broker moves the recipient's queued pushable backlog to poll-only and signals the doorbell. The same fallback applies after five consecutive unverified-layout deferrals of the same queue head. Shell and recognized dialog deferrals keep their normal retry behavior. Neither deferrals nor host-side spawn faults and timeouts count as failed capture/send attempts. Newly arriving mail can try push again.
 
 ## Polling
 
