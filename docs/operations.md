@@ -76,6 +76,8 @@ bun install --frozen-lockfile
 
 A running process keeps its loaded code. Restart the MCP client/server to load server changes. When the new server finds an older-protocol local broker, it asks that broker to retire and starts a current one. A same-protocol code change does not force replacement of an already-running broker.
 
+Use the [same-protocol rollout checklist](rollout.md) to identify the process that owns the listener and verify the source it loaded after a broker restart.
+
 For the protocol-10 drained-counter update, roll one node at a time:
 
 1. Update that node's checkout and locked dependencies. Leave other nodes and active client sessions running.
