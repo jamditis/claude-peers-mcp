@@ -25,6 +25,8 @@ Verify that the updated checkout contains the reviewed merge commit. Record `git
 2. In that checkout, run `git merge-base --is-ancestor <reviewed-merge-sha> HEAD` and `git diff --quiet HEAD --`. Both commands must succeed. Together with the process readback, they show which source the broker loaded. The protocol number from `/health` can stay the same across these releases.
 3. Read `/health` and run `bun cli.ts doctor` using the same configuration. Check a local send and poll with a disposable peer. Check both directions with a sibling if federation is enabled. Move to the next broker after these checks pass.
 
+A live MCP client can start a broker during a brief outage. If the supervisor cannot bind the port, identify the listener and its checkout. For a supervised installation, stop only the verified client-launched broker and start the intended supervisor against the original database. Repeat the process readback. Keep this node out of the completed rollout until the intended process owns the port.
+
 ## Preserve queued mail
 
 A broker restart keeps queued mail for live registrations when the replacement uses the same database. Broker startup returns interrupted delivery leases to the queue. A terminated MCP client, an expired registration or a different database can make the old inbox unavailable. Keep existing clients connected, keep the restart brief, and verify a live peer retains its ID after its next heartbeat.
