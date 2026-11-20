@@ -18,13 +18,16 @@ import { PROTOCOL_VERSION } from "../shared/types.ts";
 // hardcode `/tmp` paths (config/broker/delivery); that is tracked in #53.
 const describe = bunDescribe.skipIf(process.platform === "win32");
 
+const readyPane = readFileSync(new URL("./fixtures/claude-dialogs/question-closed.txt", import.meta.url), "utf8");
+const readyPaneCapture = `if [ "$1" = "capture-pane" ]; then printf '%s\\n' '${readyPane}'; exit 0; fi\n`;
+
 // Create a directory holding a fake `tmux` executable that records its argv and
 // exits 0, so the broker's tmux backend is deterministic without a real tmux.
 function makeStubTmux(): { dir: string; logFile: string } {
   const dir = mkdtempSync(join(tmpdir(), "stub-tmux-"));
   const logFile = join(dir, "tmux.log");
   const stub = join(dir, "tmux");
-  writeFileSync(stub, `#!/usr/bin/env bash\nprintf '%s\\0' "$@" >> "${logFile}"\nexit 0\n`);
+  writeFileSync(stub, `#!/usr/bin/env bash\n${readyPaneCapture}printf '%s\\0' "$@" >> "${logFile}"\nexit 0\n`);
   chmodSync(stub, 0o755);
   return { dir, logFile };
 }
@@ -395,7 +398,7 @@ describe("silent-consume regression", () => {
     dir = mkdtempSync(join(tmpdir(), "fail-tmux-"));
     logFile = join(dir, "calls.log");
     const stub = join(dir, "tmux");
-    writeFileSync(stub, `#!/usr/bin/env bash\nif [ "$1" = "-V" ]; then echo "tmux 3.4"; exit 0; fi\nif [ "$1" = "capture-pane" ]; then exit 0; fi\nprintf '%s\\0' "$@" >> "${logFile}"\nexit 1\n`);
+    writeFileSync(stub, `#!/usr/bin/env bash\nif [ "$1" = "-V" ]; then echo "tmux 3.4"; exit 0; fi\n${readyPaneCapture}printf '%s\\0' "$@" >> "${logFile}"\nexit 1\n`);
     chmodSync(stub, 0o755);
     await Bun.write("/tmp/config-reg.json", JSON.stringify({
       machine: "reg-a", tailscale_ip: "127.0.0.1", port: PORT, id_prefix: "rga", siblings: [], allowed_ips: ["127.0.0.1"],
@@ -682,15 +685,15 @@ describe("unregister during in-flight delivery defers peer deletion", () => {
     Bun.spawnSync(["mkfifo", fifo]);
     const stub = join(dir, "tmux");
     // -V answers the availability probe and returns at once; display-message answers the
-    // pre-send readiness probe with a Claude-like foreground (node), and capture-pane reports
-    // no active dialog so the inject proceeds.
+    // pre-send readiness probe with a Claude-like foreground (node), and capture-pane shows
+    // a ready composer so the inject proceeds.
     // Only the real send-keys invocation signals it started (marker), then blocks reading
     // the fifo until the test releases it, holding the delivery in flight as long as needed.
     writeFileSync(stub,
       `#!/usr/bin/env bash\n` +
       `if [ "$1" = "-V" ]; then echo "tmux 3.4"; exit 0; fi\n` +
       `if [ "$1" = "display-message" ]; then echo node; exit 0; fi\n` +
-      `if [ "$1" = "capture-pane" ]; then exit 0; fi\n` +
+      readyPaneCapture +
       `echo started > "${marker}"\n` +
       `cat "${fifo}" > /dev/null\n` +
       `exit 0\n`);
@@ -794,7 +797,7 @@ describe("post-send confirm ignores heartbeat aging (no duplicate delivery)", ()
       `#!/usr/bin/env bash\n` +
       `if [ "$1" = "-V" ]; then echo "tmux 3.4"; exit 0; fi\n` +
       `if [ "$1" = "display-message" ]; then echo node; exit 0; fi\n` +
-      `if [ "$1" = "capture-pane" ]; then exit 0; fi\n` +
+      readyPaneCapture +
       `echo started > "${marker}"\n` +
       `cat "${fifo}" > /dev/null\n` +
       `exit 0\n`);
@@ -887,7 +890,7 @@ describe("same-pid re-register during in-flight delivery defers old-peer deletio
       `#!/usr/bin/env bash\n` +
       `if [ "$1" = "-V" ]; then echo "tmux 3.4"; exit 0; fi\n` +
       `if [ "$1" = "display-message" ]; then echo node; exit 0; fi\n` +
-      `if [ "$1" = "capture-pane" ]; then exit 0; fi\n` +
+      readyPaneCapture +
       `echo started > "${marker}"\n` +
       `cat "${fifo}" > /dev/null\n` +
       `exit 0\n`);

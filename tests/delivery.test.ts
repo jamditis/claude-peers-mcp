@@ -786,6 +786,8 @@ describe("buildTmuxArgs", () => {
 // branch tmux would have taken. `branch: "silent"` is the marker-less tmux (too old for the
 // format operators, or a stub) the send path must still fail open on; `timedOut` is the spawner
 // reporting that its own kill-timer, not tmux, ended the send (#70).
+const readyPane = dialogFixture("question-closed");
+
 function fakeTmux(opts: {
   foreground?: string;
   probeExit?: number;
@@ -800,7 +802,7 @@ function fakeTmux(opts: {
   const run: TmuxQuery = async (args) => {
     calls.push(args);
     if (args.includes("capture-pane")) {
-      return { exitCode: opts.captureExit ?? 0, stdout: opts.paneText ?? "", timedOut: opts.captureTimedOut ?? false };
+      return { exitCode: opts.captureExit ?? 0, stdout: opts.paneText ?? readyPane, timedOut: opts.captureTimedOut ?? false };
     }
     if (args.includes("if-shell")) {
       const branch = opts.branch ?? "sent";
@@ -816,8 +818,8 @@ function dialogFixture(name: string): string {
   return readFileSync(new URL(`./fixtures/claude-dialogs/${name}.txt`, import.meta.url), "utf8");
 }
 
-describe("dialog-safe tmux delivery (#118)", () => {
-  for (const fixture of ["question-select", "question-text", "question-80", "question-multi", "question-two", "question-two-text-80", "question-preview", "question-notes", "question-submit", "permission", "permission-amend", "permission-edit", "permission-edit-amend", "permission-fetch"]) {
+describe("dialog-safe tmux delivery (#118, #130)", () => {
+  for (const fixture of ["question-select", "question-text", "question-80", "question-multi", "question-two", "question-two-text-80", "question-preview", "question-notes", "question-submit", "permission", "permission-amend", "permission-edit", "permission-edit-amend", "permission-fetch", "answer-review", "plan-approval"]) {
     it(`defers the captured ${fixture} dialog without typing or counting a push failure`, async () => {
       const tmux = fakeTmux({ paneText: dialogFixture(fixture) });
       const reasons: string[] = [];
@@ -832,7 +834,7 @@ describe("dialog-safe tmux delivery (#118)", () => {
     });
   }
 
-  for (const fixture of ["question-closed", "permission-closed"]) {
+  for (const fixture of ["question-closed", "permission-closed", "quoted-footer"]) {
     it(`delivers into the captured ${fixture} pane`, async () => {
       const tmux = fakeTmux({ paneText: dialogFixture(fixture) });
       expect(await deliverViaTmux("%1", null, "peer message", tmux.run)).toBe(true);
@@ -845,9 +847,18 @@ describe("dialog-safe tmux delivery (#118)", () => {
       const transcript = `${dialogFixture(fixture)}\n${dialogFixture("question-closed")}`;
       expect(classifyPaneDialog(transcript).ready).toBe(true);
     }
-    expect(classifyPaneDialog("Which sample color should be used?\nDo you want to proceed?\n").ready).toBe(true);
-    expect(classifyPaneDialog("Press a key\nEsc to cancel\n").ready).toBe(true);
   });
+
+  // Claude Code 2.1.327 screen-reader mode shows a bare "$" input line.
+  for (const paneText of ["", "$\n"]) {
+    it(`defers a capture without the framed input box (${JSON.stringify(paneText)})`, async () => {
+      const tmux = fakeTmux({ paneText });
+      const reasons: string[] = [];
+      expect(await deliverViaTmux("%1", null, "peer message", tmux.run, (reason) => reasons.push(reason))).toBe(false);
+      expect(tmux.injected()).toBe(false);
+      expect(reasons).toHaveLength(1);
+    });
+  }
 
   it("recognizes optional Vim mode and cancel hints rendered by the installed client", () => {
     // The 2.1.318 footer renderer adds a non-NORMAL mode and can omit the cancel hint.
@@ -999,7 +1010,7 @@ describe("deliverViaTmux", () => {
     const run: TmuxQuery = async (args) => {
       calls.push(args);
       if (args.includes("if-shell")) return { exitCode: 0, stdout: `${GUARD_SENT_MARKER}\n` };
-      if (args.includes("capture-pane")) return { exitCode: 0, stdout: "" };
+      if (args.includes("capture-pane")) return { exitCode: 0, stdout: readyPane };
       throw new Error("probe blew up");
     };
     expect(await deliverViaTmux("%1", null, "hi", run)).toBe(true);
@@ -1040,7 +1051,7 @@ describe("deliverViaTmux", () => {
     // probe fault fails open and injects
     await deliverViaTmux("%1", null, "hi", async (args) => {
       if (args.includes("if-shell")) return { exitCode: 0, stdout: `${GUARD_SENT_MARKER}\n` };
-      if (args.includes("capture-pane")) return { exitCode: 0, stdout: "" };
+      if (args.includes("capture-pane")) return { exitCode: 0, stdout: readyPane };
       throw new Error("x");
     }, onDefer);
     // a genuine tmux failure is a failed send, not a readiness deferral
@@ -1064,6 +1075,7 @@ describe("deliverViaTmux", () => {
     const boom = new Error("spawn EAGAIN");
     const run: TmuxQuery = async (args) => {
       if (args.includes("if-shell")) throw boom;
+      if (args.includes("capture-pane")) return { exitCode: 0, stdout: readyPane };
       return { exitCode: 0, stdout: "node\n" };
     };
     const faults: unknown[] = [];
@@ -1088,6 +1100,7 @@ describe("deliverViaTmux", () => {
     // was only reached because the pane probed ready, so it can never also defer.
     const sendRejectsAfter = (foreground: string): TmuxQuery => async (args) => {
       if (args.includes("if-shell")) throw new Error("nope");
+      if (args.includes("capture-pane")) return { exitCode: 0, stdout: readyPane };
       return { exitCode: 0, stdout: foreground };
     };
     const seen: string[] = [];
@@ -1783,6 +1796,7 @@ describe("push failure streak persistence and demotion (#70)", () => {
   // (miss), and one the atomic guard declines at send time (defer, #44).
   const rejectingSend: TmuxQuery = async (args) => {
     if (args.includes("if-shell")) throw new Error("spawn EAGAIN");
+    if (args.includes("capture-pane")) return { exitCode: 0, stdout: readyPane };
     return { exitCode: 0, stdout: "node\n" };
   };
   const missingSend: TmuxQuery = fakeTmux({ foreground: "node\n", sendExit: 1 }).run;

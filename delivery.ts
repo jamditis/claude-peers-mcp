@@ -637,7 +637,7 @@ export function formatCoalescedPeerPaste(
 
 /**
  * One tmux invocation, with its stdout — the single seam every tmux process in the delivery path
- * goes through: the probes read the pane's foreground command and visible dialog footer,
+ * goes through: the probes read the pane's foreground command and visible input box,
  * and the guarded inject reads which branch tmux took.
  *
  * `exitCode` 0 is the only success. `timedOut` says the caller's own kill-timer fired, i.e. the
@@ -691,8 +691,8 @@ export interface PaneReadiness {
  * Anything else (node or bun running Claude, or an unrecognized command) is treated as
  * ready, so an unknown foreground never blocks a legitimate delivery. This check only
  * suppresses the one case it can positively identify as wrong, and fails open otherwise.
- * Dialogs keep the same foreground process; classifyPaneDialog checks captured pane text
- * separately before the guarded send.
+ * Dialogs keep the same foreground process. The captured screen must also show the
+ * input box before the guarded send.
  *
  * See buildPaneReadyFormat for the atomic-guard twin of this check: the same denylist
  * expressed as a tmux `-F` predicate, for closing the probe-to-send TOCTOU in issue #44.
@@ -704,31 +704,21 @@ export function classifyPaneReadiness(currentCommand: string): PaneReadiness {
   return { ready: true, reason: `pane foreground is ${cmd}` };
 }
 
-/** Match active dialog controls at the screen bottom, not questions in the transcript. */
+/** Require the normal Claude Code input box near the bottom of a captured pane. */
 export function classifyPaneDialog(paneText: string): PaneReadiness {
-  const screen = paneText.split("\n").map((line) => line.trimEnd()).join("\n").trimEnd();
-  const lines = screen.split("\n");
-  const footer = lines.at(-1)?.trim() ?? "";
-  // Ink can write hard line breaks inside hints; capture-pane -J cannot join those.
-  const tail = lines.slice(-4).map((line) => line.trim()).join(" ");
-  const question = /(?:^| )Enter to select · (?:↑\/↓|Tab\/Arrow keys) to navigate(?: · [^·]+)*$/;
-  // The multi-question review screen has no footer, but has these exact final controls.
-  const submit = /\nReady to submit your answers\?\n\n\s*(?:❯\s*)?1\. Submit answers\n\s*(?:❯\s*)?2\. Cancel\s*$/;
-  if (question.test(tail) || submit.test(screen)) {
-    return { ready: false, reason: "pane shows a question dialog" };
+  // Leave room for a wrapped draft and footer while excluding older transcript rules.
+  const lines = paneText.trimEnd().split("\n").slice(-14).map((line) => line.trim());
+  const bottom = lines.findLastIndex((line) => /^─{10,}$/.test(line));
+  const top = lines.findLastIndex((line, index) => index < bottom && line === lines[bottom]);
+  // A hint after the lower rule can wrap over multiple rows. Text before the input box
+  // is transcript and does not take part in the hint check.
+  const footer = lines.slice(bottom + 1).join(" ");
+  if (top >= 0 && top + 1 < bottom
+    && /^❯(?:\s|$)/.test(lines[top + 1] ?? "")
+    && !/\b(?:Enter to (?:select|confirm|submit)|Esc to cancel)\b/.test(footer)) {
+    return { ready: true, reason: "pane shows the Claude Code input box" };
   }
-  const permission = /^Esc to cancel(?: · .*)?$/;
-  // WebFetch has no keyboard footer; its last control is this explicit rejection option.
-  const reject = /(?:^| )(?:❯\s*)?(?:\d+\.\s*)?No, and tell Claude what to do differently \(esc\)$/;
-  const yes = /^\s*(?:❯\s*)?(?:\d+\.\s*)?Yes\b/m;
-  // Auto-mode fallbacks hide indexes, put No first, and end with a plain Yes control.
-  const noFirst = /(?:^| )(?:❯\s*)?Yes$/.test(tail)
-    && /^\s*(?:❯\s*)?No\b/m.test(screen)
-    && /^\s*❯\s*(?:Yes|No)\b/m.test(screen);
-  if ((permission.test(footer) || reject.test(tail) || noFirst) && yes.test(screen)) {
-    return { ready: false, reason: "pane shows a permission dialog" };
-  }
-  return { ready: true, reason: "no active dialog footer found" };
+  return { ready: false, reason: "pane does not show a ready Claude Code input box" };
 }
 
 /**
@@ -1000,13 +990,13 @@ export async function probePaneReadiness(
 }
 
 /**
- * Check the foreground and visible dialog state, then inject with the atomic shell guard.
+ * Check the foreground and visible input box, then inject with the atomic shell guard.
  *
  * First the pre-send probe (probePaneReadiness): a separate tmux process reads the pane's
  * foreground command, and a clean probe that positively identifies a shell defers the whole
  * attempt — no send is issued, false is returned, and the row stays queued. Next capture-pane
- * reads the visible screen: an active question or permission footer defers the attempt, and an
- * unreadable capture leaves mail queued without typing. The captured screen is a point-in-time observation;
+ * reads the visible screen. A missing or blocked input box defers the attempt, and an
+ * unreadable capture leaves mail queued without typing. The capture observes one instant;
  * a dialog can still open after capture, unlike the atomic foreground guard. Then the guarded
  * send (buildGuardedTmuxArgs): one tmux process that re-evaluates the same readiness predicate
  * and types the text in the same invocation, which narrows the window in which a session that
@@ -1022,7 +1012,7 @@ export async function probePaneReadiness(
  * apart — because only ONE of them is evidence that a push ran and missed, the single thing the
  * #70 demotion streak counts (countsAsPushFailure):
  *
- *  - DEFER (`onDefer`): a shell or an active dialog was positively identified. The broker counts
+ *  - DEFER (`onDefer`): the pane is a shell or lacks a ready input box. The broker counts
  *    these toward the not-ready escalation (issue #42), not the demotion streak. Nothing was typed.
  *  - FAULT (`onFault`): the attempt never got a verdict out of tmux. Either a capture/send spawn
  *    REJECTED (process creation failed, the tmux binary momentarily unavailable), or that command
@@ -1057,14 +1047,14 @@ export async function deliverViaTmux(
     }
     if (capture.exitCode !== 0) {
       // The target is unreachable: count a miss so #70 still bounds the doorbell withhold.
-      // Do not type into a pane whose dialog state could not be read.
+      // Do not type into a pane whose input box could not be verified.
       console.error(`[claude-peers broker] pane capture exited ${capture.exitCode} for pane ${pane}; not typing`);
       return false;
     }
-    const dialog = classifyPaneDialog(capture.stdout);
-    if (!dialog.ready) {
-      console.error(`[claude-peers broker] deferring tmux delivery to pane ${pane}: ${dialog.reason}`);
-      onDefer?.(dialog.reason);
+    const screen = classifyPaneDialog(capture.stdout);
+    if (!screen.ready) {
+      console.error(`[claude-peers broker] deferring tmux delivery to pane ${pane}: ${screen.reason}`);
+      onDefer?.(screen.reason);
       return false;
     }
     const { exitCode, stdout, timedOut } = await run(buildGuardedTmuxArgs(pane, socket, text));

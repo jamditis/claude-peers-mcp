@@ -194,11 +194,11 @@ row with a supported tier or an explicit out-of-scope statement.
 
 | Client | Platform | Status | Tmux push | Doorbell watcher | `check_messages` | Limit |
 | --- | --- | --- | --- | --- | --- | --- |
-| Claude Code | Linux | Supported | Supported in a live tmux pane | Manual watcher supported | Supported | `fyi` and default-floored remote mail require polling. |
-| Codex CLI | Linux | Expected to work for messaging | Expected to work in tmux | Manual watcher expected to work | Expected to work | Peer discovery was exercised in a live Linux session on 2026-09-25; Codex send, poll, and tmux delivery were not tested. |
-| Generic MCP stdio client | Ubuntu CI | Supported | Expected to work in tmux | Manual watcher expected to work | Supported | CI exercises two SDK clients without tmux. |
-| Gemini CLI | Linux | Expected to work | Expected to work in tmux | Manual watcher expected to work | Expected to work | No Gemini session has been exercised. |
-| Any client above | macOS | Expected to work | Expected to work in tmux | Manual watcher expected to work | Expected to work | No macOS CI run. |
+| Claude Code | Linux | Supported | Supported with the standard framed input box | Manual watcher supported | Supported | Screen-reader mode, `fyi` and default-floored remote mail require polling. |
+| Codex CLI | Linux | Expected to work for messaging | Input layout unverified | Manual watcher expected to work | Expected to work | Peer discovery was exercised in a live Linux session on 2026-09-25; Codex send, poll, and tmux delivery were not tested. |
+| Generic MCP stdio client | Ubuntu CI | Supported | Input layout unverified | Manual watcher expected to work | Supported | CI exercises two SDK clients without tmux. |
+| Gemini CLI | Linux | Expected to work | Input layout unverified | Manual watcher expected to work | Expected to work | No Gemini session has been exercised. |
+| Any client above | macOS | Expected to work | Input layout unverified | Manual watcher expected to work | Expected to work | No macOS CI run. |
 | Any client above | Native Windows | Expected to work for polling | Unsupported without tmux | Not exercised | Expected to work | Native broker tests run in CI, but [#57](https://github.com/jamditis/claude-peers-mcp/issues/57) records an unresolved Bun SQLite prune fault. The stdio smoke test does not run there. |
 
 The Ubuntu smoke test starts an isolated broker and two minimal MCP SDK clients. It verifies tool and peer discovery, a queued `fyi` send, one read by `check_messages`, and an empty second read. It does not start Claude Code, Codex CLI, or Gemini CLI. Other spec-conforming stdio clients are expected to use the same tools; their lifecycle behavior is unverified.
