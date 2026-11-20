@@ -2,7 +2,7 @@
 
 These screens were captured from an isolated Claude Code 2.1.318 session with tmux on Linux. The questions, answers and command text are synthetic. The permission recordings stop before approval.
 
-`question-select.txt` and `question-text.txt` use `tmux capture-pane -p` at 110 columns by 38 rows. `question-80.txt` uses `tmux capture-pane -p -J` at 80 columns by 38 rows. The two-question and edit-permission fixtures also use `tmux capture-pane -p -J` at 80 columns by 38 rows. The remaining open dialogs use `tmux capture-pane -p -J` at 110 columns by 38 rows. Each open fixture contains the dialog region through the bottom of the visible pane. The multi-select review screen has no keyboard footer, so its final confirmation controls are a separate signature.
+`question-select.txt` and `question-text.txt` use `tmux capture-pane -p` at 110 columns by 38 rows. `question-80.txt` uses `tmux capture-pane -p -J` at 80 columns by 38 rows. The two-question and edit-permission fixtures also use `tmux capture-pane -p -J` at 80 columns by 38 rows. The remaining 2.1.318 open dialogs use `tmux capture-pane -p -J` at 110 columns by 38 rows. Each open fixture contains the dialog region through the bottom of the visible pane. The multi-select review screen has no keyboard footer.
 
 The closed fixtures contain the transcript result and ordinary input prompt after cancelling the question or permission dialog. Machine-specific status bars are cropped out. They confirm that text about a completed dialog does not defer later delivery.
 
@@ -15,3 +15,7 @@ The installed 2.1.318 footer renderer also supplies the optional non-NORMAL Vim 
 Auto-mode hidden-index variants are derived from these recorded permission controls and the installed renderer's `inPlaceOfClassifier`, `hideIndexes` and default-to-No branches. They are labelled source-derived tests, not additional live recordings.
 
 `question-preview.txt` and `question-notes.txt` are live 80-column preview-question recordings before and after entering notes. The background-agent permission-hint test appends only the installed renderer's independently verified stop-agent hint to a recorded permission screen.
+
+`answer-review.txt`, `plan-approval.txt` and `quoted-footer.txt` use `tmux capture-pane -p -J` from an isolated Claude Code 2.1.327 session at 100 columns by 38 rows. The first two retain the visible dialog and stop before confirmation. The quoted-footer fixture keeps the recorded reply and input box and omits the turn timing, status bar and blank rows so the reply sits directly above the box.
+
+`ultracode-closed.txt` and `history-search.txt` use the same capture command and dimensions with Claude Code 2.1.327. The first shows the idle composer after `/effort ultracode`. The second shows the inline history field after Ctrl+R, with the composer still visible.

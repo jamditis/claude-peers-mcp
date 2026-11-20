@@ -10,6 +10,7 @@ import { afterAll, beforeAll, describe as bunDescribe, expect, it } from "bun:te
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DEFAULT_DEFERRAL_ESCALATION_CAP } from "../delivery.ts";
 import { doorbellPath, readDoorbell, writeDoorbell } from "../shared/notify.ts";
 import { PROTOCOL_VERSION } from "../shared/types.ts";
 
@@ -46,6 +47,10 @@ const DB_PATH_DRAIN = join(work, "drain.db");
 const CONFIG_PATH_DRAIN = join(work, "drain-config.json");
 const PUSH_DELAY_MS = 400;
 let drainProc: any;
+
+function paneFixture(name: string): string {
+  return readFileSync(new URL(`./fixtures/claude-dialogs/${name}.txt`, import.meta.url), "utf8");
+}
 
 async function callAt(port: number, path: string, body: unknown, token?: string) {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -132,6 +137,10 @@ for _a in "$@"; do
   [ "$_a" = "${FLAKY_PANE}" ] && _flaky=1
 done
 [ "$_unreachable" = 1 ] && exit 1
+if [ "$1" = "capture-pane" ]; then
+  if [ -n "$TMUX_CAPTURE_FILE" ]; then cat "$TMUX_CAPTURE_FILE"; else printf '%s' '${paneFixture("question-closed")}'; fi
+  exit 0
+fi
 [ "$_sk" = 1 ] && [ -n "$TMUX_LOG" ] && { printf '%q ' "$@" >> "$TMUX_LOG"; printf '\n' >> "$TMUX_LOG"; }
 [ "$_sk" = 1 ] && [ "$_slow" = 1 ] && sleep 1
 [ "$_sk" = 1 ] && [ "$_flaky" = 1 ] && [ -n "$TMUX_FAIL_ONCE" ] && [ ! -e "$TMUX_FAIL_ONCE" ] && { sleep 1; : > "$TMUX_FAIL_ONCE"; exit 1; }
@@ -697,6 +706,78 @@ describe("a ring waits for a push that is coming later, not just one already in 
       }
     }, 20_000);
   }
+
+  it("rings after an unverified layout defers the same head five times in a row", async () => {
+    const port = 17957;
+    const configPath = join(work, "layout-config.json");
+    const dbPath = join(work, "layout.db");
+    const capturePath = join(work, "layout-screen.txt");
+    const tmuxLog = join(work, "layout-sends.log");
+    writeFileSync(configPath, JSON.stringify({
+      machine: "db-a", tailscale_ip: "127.0.0.1", port,
+      id_prefix: "dblay", siblings: [], allowed_ips: ["127.0.0.1"], db_path: dbPath,
+      push_delay_ms: 600_000,
+    }));
+    writeFileSync(capturePath, "$\n");
+    const broker = Bun.spawn(["bun", "broker.ts"], {
+      cwd: join(import.meta.dir, ".."),
+      env: {
+        ...process.env, CLAUDE_PEERS_CONFIG: configPath, PATH: `${work}:${process.env.PATH}`,
+        TMUX_CAPTURE_FILE: capturePath, TMUX_LOG: tmuxLog,
+      },
+      stdout: "ignore", stderr: "pipe",
+    });
+    try {
+      expect(await waitForHealth(port)).toBe(true);
+      const rcpt = await regRcpt({ tmux_pane: "%1" }, port);
+      const sender = await regSender({}, port);
+      const heartbeat = () => okAt(port, "/heartbeat", { id: rcpt.id }, rcpt.token);
+      const send = (text: string, urgency: string) =>
+        okAt(port, "/send-message", { from_id: sender.id, to_id: rcpt.id, text, urgency }, sender.token);
+      await send("head", "normal");
+      await send("second push", "normal");
+      await send("poll only", "fyi");
+      const peek = await okAt(port, "/peek", { id: rcpt.id }, rcpt.token);
+      const db = new Database(dbPath);
+      try {
+        db.run("UPDATE messages SET push_after = 0 WHERE to_id = ? AND text = 'head'", [rcpt.id]);
+        const rows = db.query(
+          "SELECT push_after, push_failures FROM messages WHERE to_id = ? ORDER BY id",
+        );
+        for (let i = 1; i < DEFAULT_DEFERRAL_ESCALATION_CAP; i++) await heartbeat();
+        expect(readDoorbell(dbPath, rcpt.id, -1)).toBe(-1);
+
+        // A recognized dialog breaks the layout-only run and never demotes by itself.
+        writeFileSync(capturePath, paneFixture("answer-review"));
+        for (let i = 0; i < DEFAULT_DEFERRAL_ESCALATION_CAP; i++) await heartbeat();
+        expect(readDoorbell(dbPath, rcpt.id, -1)).toBe(-1);
+
+        writeFileSync(capturePath, "$\n");
+        for (let i = 1; i < DEFAULT_DEFERRAL_ESCALATION_CAP; i++) await heartbeat();
+        expect(readDoorbell(dbPath, rcpt.id, -1)).toBe(-1);
+        await heartbeat();
+        expect(readDoorbell(dbPath, rcpt.id, -1)).toBe(peek.max_id);
+        expect(rows.all(rcpt.id)).toEqual(
+          Array.from({ length: 3 }, () => ({ push_after: null, push_failures: 0 })),
+        );
+        expect(existsSync(tmuxLog)).toBe(false);
+      } finally {
+        db.close();
+      }
+      const poll = await okAt(port, "/poll-messages", { id: rcpt.id }, rcpt.token);
+      expect(poll.messages.map((message: { text: string }) => message.text)).toEqual(["head", "second push", "poll only"]);
+
+      writeFileSync(capturePath, paneFixture("question-closed"));
+      expect((await send("recovered", "interrupt")).delivery).toBe("accepted");
+      expect(readFileSync(tmuxLog, "utf8")).toContain("recovered");
+      broker.kill();
+      await broker.exited;
+      expect(await new Response(broker.stderr).text()).toContain("consecutive deferrals for an unverified pane layout");
+    } finally {
+      broker.kill();
+      await broker.exited;
+    }
+  }, 20_000);
 
   const PORT_LOUD = 17949;
   const DB_PATH_LOUD = join(work, "loud.db");

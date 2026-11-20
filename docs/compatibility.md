@@ -194,18 +194,20 @@ row with a supported tier or an explicit out-of-scope statement.
 
 | Client | Platform | Status | Tmux push | Doorbell watcher | `check_messages` | Limit |
 | --- | --- | --- | --- | --- | --- | --- |
-| Claude Code | Linux | Supported | Supported in a live tmux pane | Manual watcher supported | Supported | `fyi` and default-floored remote mail require polling. |
-| Codex CLI | Linux | Expected to work for messaging | Expected to work in tmux | Manual watcher expected to work | Expected to work | Peer discovery was exercised in a live Linux session on 2026-09-25; Codex send, poll, and tmux delivery were not tested. |
-| Generic MCP stdio client | Ubuntu CI | Supported | Expected to work in tmux | Manual watcher expected to work | Supported | CI exercises two SDK clients without tmux. |
-| Gemini CLI | Linux | Expected to work | Expected to work in tmux | Manual watcher expected to work | Expected to work | No Gemini session has been exercised. |
-| Any client above | macOS | Expected to work | Expected to work in tmux | Manual watcher expected to work | Expected to work | No macOS CI run. |
+| Claude Code | Linux | Supported | Supported with the standard framed input box | Manual watcher supported | Supported | Screen-reader mode, `fyi` and default-floored remote mail require polling. |
+| Codex CLI | Linux | Expected to work for messaging | Input layout unverified | Manual watcher expected to work | Expected to work | Peer discovery was exercised in a live Linux session on 2026-09-25; Codex send, poll, and tmux delivery were not tested. |
+| Generic MCP stdio client | Ubuntu CI | Supported | Input layout unverified | Manual watcher expected to work | Supported | CI exercises two SDK clients without tmux. |
+| Gemini CLI | Linux | Expected to work | Input layout unverified | Manual watcher expected to work | Expected to work | No Gemini session has been exercised. |
+| Any client above | macOS | Expected to work | Input layout unverified | Manual watcher expected to work | Expected to work | No macOS CI run. |
 | Any client above | Native Windows | Expected to work for polling | Unsupported without tmux | Not exercised | Expected to work | Native broker tests run in CI, but [#57](https://github.com/jamditis/claude-peers-mcp/issues/57) records an unresolved Bun SQLite prune fault. The stdio smoke test does not run there. |
 
 The Ubuntu smoke test starts an isolated broker and two minimal MCP SDK clients. It verifies tool and peer discovery, a queued `fyi` send, one read by `check_messages`, and an empty second read. It does not start Claude Code, Codex CLI, or Gemini CLI. Other spec-conforming stdio clients are expected to use the same tools; their lifecycle behavior is unverified.
 
+For a flat or unverified layout, [register for polling and the doorbell](delivery.md#tmux-push) by launching with `TMUX_PANE=`.
+
 ### Delivery and fallback
 
-- **Tmux push:** A valid `TMUX_PANE` selects the pane; `TMUX` supplies an optional socket path. Without a valid pane ID, the server registers without a push target. The broker checks that the pane foreground is not a bare shell before injecting `[peer …]` text. That check cannot prove a given client's prompt is ready. `interrupt` is due immediately, `normal` waits for its configured deadline, and `fyi` never pushes.
+- **Tmux push.** A valid `TMUX_PANE` selects the pane. `TMUX` supplies an optional socket path. Without a valid pane ID, the server registers for polling. Push requires the framed Claude Code input box and checks the foreground for a shell. After five consecutive unverified-layout deferrals of the same queue head, the backlog moves to polling and the doorbell rings. `interrupt` is due immediately, `normal` waits for its configured deadline, and `fyi` never pushes.
 - **Doorbell watcher:** `bun cli.ts doorbell <peer-id>` signals pending mail that will not push. Learn the ID with `peek_messages`. With `drainedCounter`, call `check_messages`, then start or re-arm the default watcher; its drained baseline catches mail arriving before launch. Without the capability, the watcher prints a stderr note and keeps the queue-head baseline: arm before checking, or pass the last watcher mark with `--since` to cover the launch gap. Explicit `--since` watchers and managed recipes re-arm before checking. The watcher does not read or clear mail; the client must run it or poll at task boundaries.
 - **No tmux or watcher:** Messages stay queued. `check_messages` reads and clears them; `peek_messages` reports a count without clearing it. There is no automatic wake for a client with neither a pushable pane nor a watcher.
 - **No config file:** With no `CLAUDE_PEERS_CONFIG` and no `~/.claude-peers.json`, the server uses a loopback-only single-host default. An explicitly named missing config file fails at startup. A config file is needed for a different port, identity, or federation setup.

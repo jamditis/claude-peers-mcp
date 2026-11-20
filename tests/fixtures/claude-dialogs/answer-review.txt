@@ -1,0 +1,12 @@
+────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☒ Color  ☒ Shape  ✔ Submit  →
+
+Review your answers
+
+ ● Which sample color should the fixture use?
+   → Blue
+ ● Which sample shape should the fixture use?
+   → Circle
+
+❯ 1. Submit answers
+  2. Cancel
