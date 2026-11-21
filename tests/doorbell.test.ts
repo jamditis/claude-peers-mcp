@@ -11,7 +11,7 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_DEFERRAL_ESCALATION_CAP } from "../delivery.ts";
-import { doorbellPath, readDoorbell, writeDoorbell } from "../shared/notify.ts";
+import { doorbellPath, readDoorbell, readDoorbellMetadata, writeDoorbell } from "../shared/notify.ts";
 import { PROTOCOL_VERSION } from "../shared/types.ts";
 
 // #22: this suite spins up a real broker with a shell-based `tmux` stub (shebang +
@@ -182,6 +182,54 @@ afterAll(async () => {
 });
 
 describe("doorbell marker", () => {
+  it("adds bounded metadata only to opt-in output and leaves inbox order intact", async () => {
+    const sender = await regSender();
+    const rcpt = await regRcpt();
+    const send = (text: string, urgency: string) => ok("/send-message", {
+      from_id: sender.id, to_id: rcpt.id, text, urgency,
+    }, sender.token);
+    const bodies = [
+      `worker-a started, peer ${sender.id}`,
+      "REVIEW READY worker-a: unprinted details",
+      "DONEISH unprinted details",
+    ];
+    await send(bodies[0]!, "normal");
+    await send(bodies[1]!, "normal");
+    await send(bodies[2]!, "fyi");
+    const mark = readDoorbell(DB_PATH, rcpt.id);
+    const metadata = readDoorbellMetadata(DB_PATH, rcpt.id, mark);
+    expect(metadata?.items.map(item => [item.sender_id, item.urgency, item.kind])).toEqual([
+      [sender.id, "normal", "started"],
+      [sender.id, "normal", "REVIEW READY"],
+      [sender.id, "fyi", "other"],
+    ]);
+    expect(readDoorbellMetadata(DB_PATH, rcpt.id, mark + 1)).toBeNull();
+    const runWatcher = (metadataEnabled: boolean) => {
+      const proc = Bun.spawnSync(
+        [process.execPath, "cli.ts", "doorbell", rcpt.id, "--since", "0", "--timeout", "2"],
+        { env: { ...process.env, CLAUDE_PEERS_CONFIG: CONFIG_PATH, CLAUDE_PEERS_DOORBELL_METADATA: metadataEnabled ? "1" : "0" } },
+      );
+      expect(proc.exitCode).toBe(0);
+      return proc.stdout.toString();
+    };
+    const ordinary = runWatcher(false);
+    const optIn = runWatcher(true);
+    expect(ordinary).toContain(`mail for ${rcpt.id} (mark=${mark})`);
+    expect(ordinary).not.toContain("DOORBELL_META");
+    expect(optIn).toContain(`DOORBELL_META ${JSON.stringify(metadata)}\n`);
+    expect(optIn).not.toContain("unprinted details");
+    const path = doorbellPath(DB_PATH, rcpt.id);
+    writeFileSync(`${path}.metadata`, "{");
+    expect(runWatcher(true)).toBe(ordinary);
+    writeFileSync(`${path}.metadata`, JSON.stringify(metadata));
+    const peek = await ok("/peek", { id: rcpt.id }, rcpt.token);
+    expect(peek.count).toBe(3);
+    const polled = await ok("/poll-messages", { id: rcpt.id }, rcpt.token);
+    expect(polled.messages.map((message: { text: string }) => message.text)).toEqual(bodies);
+    expect(readDoorbellMetadata(DB_PATH, rcpt.id, mark)).toBeNull();
+    expect(runWatcher(true)).toBe(ordinary);
+  });
+
   it("rings the doorbell for a none recipient with the new row id", async () => {
     const rcpt = await regRcpt({ cwd: "/tmp/none-1" });
     const sender = await regSender({ cwd: "/tmp/none-1-s" });

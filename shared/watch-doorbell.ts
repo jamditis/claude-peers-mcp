@@ -1,6 +1,6 @@
 import { closeSync, constants, fstatSync, type FSWatcher, mkdirSync, openSync, readFileSync, unlinkSync, watch, writeFileSync } from "node:fs";
 import { isPidDead, pidProbe } from "../delivery.ts";
-import { doorbellDir, doorbellPath, readDrainedDoorbell } from "./notify.ts";
+import { doorbellDir, doorbellPath, readDoorbellMetadata, readDrainedDoorbell } from "./notify.ts";
 
 // Unlike the broker's best-effort marker read, readiness cannot treat an I/O
 // error as "unchanged". Validate and read the same descriptor; O_NONBLOCK keeps
@@ -27,6 +27,7 @@ export interface WatchDoorbellOptions {
   ownerPid?: number;
   exclusive?: boolean;
   drainedCounter?: boolean;
+  metadata?: boolean;
 }
 
 /** Notify only. A host-owned child must deliver completion to its session. */
@@ -122,6 +123,10 @@ export async function watchDoorbell(options: WatchDoorbellOptions): Promise<numb
           console.log(`doorbell armed for ${id} (since=${baseline}; backend=${watcher ? "watch+poll" : "poll"}; consumed=false)`);
         }
         if (cur <= baseline) return;
+        if (options.metadata) {
+          const metadata = readDoorbellMetadata(dbPath, id, cur);
+          if (metadata) console.log(`DOORBELL_META ${JSON.stringify(metadata)}`);
+        }
         if (persistent) {
           console.log(`mail for ${id} (mark=${cur})`);
           baseline = cur;

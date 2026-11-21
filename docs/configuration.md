@@ -63,12 +63,16 @@ With the no-file single-host default, `CLAUDE_PEERS_DB` is used as supplied. Use
 
 The broker and doorbell watcher must resolve the same database path: the marker directory is `<db_path>.doorbells/`. Protect the database and its SQLite sidecar files; they contain message text and session tokens. Do not commit them or include them in public reports.
 
+Keep the adjacent `.mark.metadata` files private. They contain bounded sender,
+urgency and classification metadata for local watchers.
+
 ## Environment variables
 
 | Variable | Behavior |
 | --- | --- |
 | `CLAUDE_PEERS_CONFIG` | Select a config file. Unset means try the default file, then the single-host fallback. |
 | `CLAUDE_PEERS_DB` | Override the database path. Prefer an absolute path. |
+| `CLAUDE_PEERS_DOORBELL_METADATA` | Set to `1` on a doorbell CLI process to print a validated metadata record when the broker supplied one. |
 | `CLAUDE_PEERS_SESSION_NAME` | Override the MCP session's friendly name. Otherwise, use its tmux session name when available. |
 | `CLAUDE_PEERS_IDLE_EXIT_MS` | Broker idle-exit interval. A directly launched broker defaults to `0` (disabled). Auto-launch supplies `600000` unless the environment already sets it. Positive values permit exit when there are no local peers and the idle window expires. Use `0` under a supervisor. |
 | `CLAUDE_PEERS_PORT` | CLI-only fallback when config loading fails. It does not override a successfully loaded config or the no-file single-host default. |
