@@ -58,7 +58,8 @@ Set `CLAUDE_PEERS_DOORBELL_METADATA=1` for a local doorbell process to print an
 optional `DOORBELL_META` JSON line before its usual mail line. Version 1 reports
 the exact observed `mark` and up to 32 readable pending messages in ID order,
 with each message's `id`, opaque `sender_id`, `urgency` and allowlisted `kind`.
-Other message kinds appear as `other`. A missing or invalid projection,
+Other message kinds appear as `other`. The read excludes the broker's drained
+prefix. A missing, drained or invalid projection,
 including one from a broker that predates the sidecar, leaves the ordinary
 mail line as the signal to check the inbox. Older watchers keep the counter
 format and the usual CLI output. Checking the inbox consumes the messages.

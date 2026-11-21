@@ -165,7 +165,10 @@ export function readDoorbellMetadata(dbPath: string, id: string, mark: number): 
         items.push({ id, sender_id, urgency, kind });
         prior = id;
       }
-      return prior === mark ? { version: 1, mark, items } : null;
+      if (prior !== mark) return null;
+      const drained = readDrainedDoorbell(dbPath, id);
+      const unread = items.filter(item => item.id > drained);
+      return unread.length ? { version: 1, mark, items: unread } : null;
     } finally { closeSync(fd); }
   } catch { return null; }
 }

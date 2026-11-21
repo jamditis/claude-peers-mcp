@@ -221,10 +221,13 @@ describe("doorbell marker", () => {
     const path = doorbellPath(DB_PATH, rcpt.id);
     writeFileSync(`${path}.metadata`, "{");
     expect(runWatcher(true)).toBe(ordinary);
+    writeFileSync(`${path}.metadata`, JSON.stringify(metadata));
     const peek = await ok("/peek", { id: rcpt.id }, rcpt.token);
     expect(peek.count).toBe(3);
     const polled = await ok("/poll-messages", { id: rcpt.id }, rcpt.token);
     expect(polled.messages.map((message: { text: string }) => message.text)).toEqual(bodies);
+    expect(readDoorbellMetadata(DB_PATH, rcpt.id, mark)).toBeNull();
+    expect(runWatcher(true)).toBe(ordinary);
   });
 
   it("rings the doorbell for a none recipient with the new row id", async () => {
