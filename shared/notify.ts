@@ -24,8 +24,9 @@
 // floor. The marker carries no message body, so the watcher reads only this signal, never the
 // SQLite store directly, and stays decoupled from the messages schema.
 
-import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import type { Urgency } from "./types.ts";
 
 // Peer ids are `${id_prefix}-${alnum}` (see generatePeerId), and id_prefix is copied verbatim
 // from config — which permits a dot (e.g. a machine-derived `node.a`). So dots must be allowed,
@@ -36,6 +37,42 @@ import { dirname } from "node:path";
 const SAFE_ID_CHARS = /^[A-Za-z0-9._-]+$/;
 function isSafeId(id: string): boolean {
   return SAFE_ID_CHARS.test(id) && !id.includes("..");
+}
+
+const kinds = ["started", "CLAIM", "DONE", "REVIEW READY", "QUESTION", "BLOCKED", "FINDING", "VERDICT", "DRAG", "other"] as const;
+type DoorbellKind = typeof kinds[number];
+export const DOORBELL_METADATA_LIMIT = 32;
+
+function isNoticeSender(id: string): boolean {
+  return id.length <= 128 && isSafeId(id) && /-[a-z0-9]{8}$/.test(id);
+}
+
+interface PendingNotice {
+  id: number;
+  from_id: string;
+  urgency: Urgency;
+  prefix: string;
+}
+
+interface DoorbellNotice {
+  id: number;
+  sender_id: string;
+  urgency: Urgency;
+  kind: DoorbellKind;
+}
+
+interface DoorbellMetadata {
+  version: 1;
+  mark: number;
+  items: DoorbellNotice[];
+}
+
+function noticeKind(prefix: string): DoorbellKind {
+  if (/^[\w.-]+ started, peer [\w.-]+(?:\r?\n|$)/.test(prefix)) return "started";
+  for (const kind of kinds.slice(1, -1)) {
+    if (prefix.startsWith(kind) && (prefix.length === kind.length || /^[\s:]/.test(prefix.slice(kind.length)))) return kind;
+  }
+  return "other";
 }
 
 /**
@@ -75,20 +112,62 @@ export function doorbellPath(dbPath: string, id: string): string | null {
  * Returns whether the marker was written: false for an unsafe id, an IO failure, or a `seq` that
  * would not advance the counter.
  */
-export function writeDoorbell(dbPath: string, id: string, seq: number): boolean {
-  return writeCounter(doorbellPath(dbPath, id), seq);
+export function writeDoorbell(
+  dbPath: string, id: string, seq: number, pending?: () => PendingNotice[],
+): boolean {
+  const path = doorbellPath(dbPath, id);
+  return writeCounter(path, seq, pending && path ? () => {
+    try {
+      const rows = pending();
+      if (rows.some(row => !isNoticeSender(row.from_id))) return;
+      const items = rows.map(({ id, from_id, urgency, prefix }) => ({
+        id, sender_id: from_id, urgency, kind: noticeKind(prefix),
+      }));
+      writeFileSync(`${path}.metadata`, JSON.stringify({ version: 1, mark: seq, items }), { mode: 0o600 });
+    } catch {
+      // The optional projection cannot stop a legacy counter from advancing.
+    }
+  } : undefined);
 }
 
-function writeCounter(path: string | null, seq: number): boolean {
+function writeCounter(path: string | null, seq: number, beforeWrite?: () => void): boolean {
   if (path === null) return false;
   try {
     mkdirSync(dirname(path), { recursive: true });
     if (readCounter(path, -1) >= seq) return false;
+    beforeWrite?.();
     writeFileSync(path, String(seq));
     return true;
   } catch {
     return false;
   }
+}
+
+/** The sidecar is advisory and is usable only with the exact observed mark. */
+export function readDoorbellMetadata(dbPath: string, id: string, mark: number): DoorbellMetadata | null {
+  const path = doorbellPath(dbPath, id);
+  if (!path) return null;
+  try {
+    const fd = openSync(`${path}.metadata`, constants.O_RDONLY | constants.O_NONBLOCK);
+    try {
+      const stat = fstatSync(fd);
+      if (!stat.isFile() || stat.size > 8192) return null;
+      const data = JSON.parse(readFileSync(fd, "utf8")) as DoorbellMetadata;
+      if (data.version !== 1 || data.mark !== mark || !Array.isArray(data.items)
+        || data.items.length < 1 || data.items.length > DOORBELL_METADATA_LIMIT) return null;
+      let prior = 0;
+      const items: DoorbellNotice[] = [];
+      for (const item of data.items) {
+        const { id, sender_id, urgency, kind } = item;
+        if (!Number.isSafeInteger(id) || id <= prior || typeof sender_id !== "string"
+          || !isNoticeSender(sender_id) || !kinds.includes(kind)
+          || (urgency !== "interrupt" && urgency !== "normal" && urgency !== "fyi")) return null;
+        items.push({ id, sender_id, urgency, kind });
+        prior = id;
+      }
+      return prior === mark ? { version: 1, mark, items } : null;
+    } finally { closeSync(fd); }
+  } catch { return null; }
 }
 
 /**
@@ -140,9 +219,9 @@ export function readDrainedDoorbell(dbPath: string, id: string): number {
 export function removeDoorbell(dbPath: string, id: string): void {
   const path = doorbellPath(dbPath, id);
   if (path === null) return;
-  for (const counter of [path, `${path}.drained`]) {
+  for (const file of [path, `${path}.drained`, `${path}.metadata`]) {
     try {
-      unlinkSync(counter);
+      unlinkSync(file);
     } catch {
       // already gone, or never created — nothing to clean up
     }

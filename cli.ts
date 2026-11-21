@@ -537,7 +537,10 @@ switch (cmd) {
         } catch { /* An unavailable handshake keeps the queue-head baseline. */ }
         if (!drainedCounter) console.error("doorbell: broker does not advertise drainedCounter; using the queue-head marker. Re-arm before check_messages, or use --since with the last watcher mark to cover the launch gap.");
       }
-      process.exitCode = await watchDoorbell({ dbPath, id, since, pollMs, timeoutSec, persistent, ownerPid, exclusive, drainedCounter });
+      process.exitCode = await watchDoorbell({
+        dbPath, id, since, pollMs, timeoutSec, persistent, ownerPid, exclusive, drainedCounter,
+        metadata: process.env.CLAUDE_PEERS_DOORBELL_METADATA === "1",
+      });
     } catch (error) {
       console.error(`doorbell failed: ${error instanceof Error ? error.message : String(error)}`);
       process.exitCode = 1;

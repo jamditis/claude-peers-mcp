@@ -51,7 +51,7 @@ import {
 } from "./delivery.ts";
 import { loadConfig, type SiblingConfig } from "./shared/config.ts";
 import { displaySessionName } from "./shared/format-peers.ts";
-import { readDoorbell, removeDoorbell, writeDoorbell, writeDrainedDoorbell } from "./shared/notify.ts";
+import { DOORBELL_METADATA_LIMIT, readDoorbell, removeDoorbell, writeDoorbell, writeDrainedDoorbell } from "./shared/notify.ts";
 import { getRepoKey } from "./shared/repo-key.ts";
 import type {
   ControlPlaneRequest,
@@ -69,6 +69,7 @@ import type {
   RegisterResponse,
   SendMessageRequest,
   SendResult,
+  Urgency,
 } from "./shared/types.ts";
 import {
   LIST_PEERS_SCOPE_ERROR,
@@ -463,6 +464,9 @@ if (import.meta.main) {
   const peekPending = db.prepare(
     "SELECT COUNT(*) AS count, MAX(id) AS max_id FROM messages WHERE to_id = ? AND delivery_state IN ('queued','delivering')"
   );
+  const doorbellPending = db.prepare<{ id: number; from_id: string; urgency: Urgency; prefix: string }, [string, number]>(
+    "SELECT id, from_id, urgency, substr(text, 1, 256) AS prefix FROM messages WHERE to_id = ? AND delivery_state = 'queued' ORDER BY id LIMIT ?"
+  );
   // Is a delivery lease open for this recipient? The doorbell asks so it can withhold a ring that
   // a poll could not honour (see ringDoorbellAfterSettle). Deliberately counts ANY 'delivering'
   // row, expired lease or not: releasableQueuedPrefix stops at the first row that is not 'queued'
@@ -595,7 +599,9 @@ if (import.meta.main) {
     // of its can ever take a lease.
     if (isPushableTarget(peerDelivery(toId))
       && (countPushableQueued.get(toId) as { n: number }).n > 0) return;
-    writeDoorbell(DB_PATH, toId, pending.max_id);
+    writeDoorbell(DB_PATH, toId, pending.max_id, pending.count <= DOORBELL_METADATA_LIMIT
+      ? () => doorbellPending.all(toId, DOORBELL_METADATA_LIMIT)
+      : undefined);
   }
 
   // How many delivery drivers are currently working a recipient: deliverNext itself, plus any
