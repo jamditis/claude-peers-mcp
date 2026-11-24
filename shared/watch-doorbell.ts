@@ -37,8 +37,9 @@ function watcherLockRefusal(id: string, lockPath: string, holder: WatcherLock | 
   const inspect = process.platform === "win32"
     ? `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter 'ProcessId=${holder.pid}' | Format-List CreationDate,CommandLine"`
     : `ps -o lstart=,args= -p ${holder.pid}`;
-  return `doorbell blocked for ${id}: watcher lock ${lockPath} names running process ${holder.pid} (started ${holder.started_at ?? "unrecorded"}); keep that task. `
-    + `If \`${inspect}\` shows a process that is not \`doorbell ${id}\` or was created after that time, the PID was reused: delete the lock and re-arm`;
+  return `doorbell blocked for ${id}: watcher lock ${lockPath} names running process ${holder.pid} (started ${holder.started_at ? `${holder.started_at} UTC` : "unrecorded"}); keep that task. `
+    + `\`${inspect}\` shows the process's start in local time; convert it to UTC before comparing. `
+    + `If it shows a process that is not \`doorbell ${id}\` or was created after that time, the PID was reused: delete the lock and re-arm`;
 }
 
 export interface WatchDoorbellOptions {

@@ -364,8 +364,9 @@ test("a lock left by an exited watcher is taken over; a live one is refused by n
     ? `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter 'ProcessId=${process.pid}' | Format-List CreationDate,CommandLine"`
     : `ps -o lstart=,args= -p ${process.pid}`;
   expect(await new Response(blocked.stderr).text()).toContain(
-    `watcher lock ${lockPath} names running process ${process.pid} (started 2026-11-24T13:46:00.000Z); keep that task. `
-    + `If \`${inspect}\` shows a process that is not \`doorbell test-peer\` or was created after that time, the PID was reused: delete the lock and re-arm`);
+    `watcher lock ${lockPath} names running process ${process.pid} (started 2026-11-24T13:46:00.000Z UTC); keep that task. `
+    + `\`${inspect}\` shows the process's start in local time; convert it to UTC before comparing. `
+    + `If it shows a process that is not \`doorbell test-peer\` or was created after that time, the PID was reused: delete the lock and re-arm`);
   expect(JSON.parse(readFileSync(lockPath, "utf8")).pid).toBe(process.pid);
 });
 
