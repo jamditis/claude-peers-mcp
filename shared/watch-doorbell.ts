@@ -34,9 +34,11 @@ function watcherLockRefusal(id: string, lockPath: string, holder: WatcherLock | 
   if (!holder) {
     return `doorbell blocked for ${id}: watcher lock ${lockPath} names no process; confirm no doorbell for ${id} is running, delete the lock, and re-arm`;
   }
-  const inspect = process.platform === "win32" ? `tasklist /V /FI "PID eq ${holder.pid}"` : `ps -o lstart=,args= -p ${holder.pid}`;
+  const inspect = process.platform === "win32"
+    ? `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter 'ProcessId=${holder.pid}' | Select-Object CreationDate,CommandLine"`
+    : `ps -o lstart=,args= -p ${holder.pid}`;
   return `doorbell blocked for ${id}: watcher lock ${lockPath} names running process ${holder.pid} (started ${holder.started_at ?? "unrecorded"}); keep that task. `
-    + `If \`${inspect}\` shows no doorbell for ${id} started then, the PID was reused: delete the lock and re-arm`;
+    + `If \`${inspect}\` shows a process that is not \`doorbell ${id}\` or was created after that time, the PID was reused: delete the lock and re-arm`;
 }
 
 export interface WatchDoorbellOptions {
@@ -67,6 +69,10 @@ export async function watchDoorbell(options: WatchDoorbellOptions): Promise<numb
   const lock = JSON.stringify({ pid: process.pid, owner_pid: ownerPid, started_at: new Date().toISOString() });
   // Two re-arms can read the same dead holder and both take over. Each poll
   // confirms the lock is still this watcher's, so the one that lost it exits.
+  // Two re-arms of one peer racing on a dead holder is our own agent's mistake,
+  // self-heals within one poll, and costs at most one doubled ring; a second
+  // lock would be new mechanism for a case that has never happened
+  // (coordinator ruling on review finding, Nov. 24, 2026, #135).
   const ownsLock = () => { try { return readFileSync(lockPath, "utf8") === lock; } catch { return false; } };
   if (exclusive) {
     const take = () => writeFileSync(lockPath, lock, { flag: "wx", mode: 0o600 });
