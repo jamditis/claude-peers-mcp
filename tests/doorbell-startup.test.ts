@@ -345,7 +345,7 @@ test("a lock left by an exited watcher is taken over; a live one is refused by n
   const f = fixture();
   const argv = await recipe(f.context);
   const lockPath = `${doorbellPath(f.dbPath, "test-peer")}.watcher`;
-  const gone = Bun.spawn(["true"]);
+  const gone = Bun.spawn([process.execPath, "-e", ""]);
   await gone.exited;
   writeFileSync(lockPath, JSON.stringify({ pid: gone.pid, owner_pid: process.pid }));
   const child = f.launch(argv);
@@ -360,9 +360,24 @@ test("a lock left by an exited watcher is taken over; a live one is refused by n
   writeFileSync(lockPath, JSON.stringify({ pid: process.pid, owner_pid: process.pid, started_at: "2026-11-24T13:46:00.000Z" }));
   const blocked = f.launch(argv);
   expect(await blocked.exited).toBe(3);
+  const inspect = process.platform === "win32" ? `tasklist /V /FI "PID eq ${process.pid}"` : `ps -o lstart=,args= -p ${process.pid}`;
   expect(await new Response(blocked.stderr).text()).toContain(
-    `watcher lock ${lockPath} names running process ${process.pid} (started 2026-11-24T13:46:00.000Z); keep that task, or stop it with \`kill ${process.pid}\` and re-arm`);
+    `watcher lock ${lockPath} names running process ${process.pid} (started 2026-11-24T13:46:00.000Z); keep that task. `
+    + `If \`${inspect}\` shows no doorbell for test-peer started then, the PID was reused: delete the lock and re-arm`);
   expect(JSON.parse(readFileSync(lockPath, "utf8")).pid).toBe(process.pid);
+});
+
+test("a watcher whose lock another re-arm replaced stops and leaves that lock (#135)", async () => {
+  const f = fixture();
+  const argv = await recipe(f.context);
+  const lockPath = `${doorbellPath(f.dbPath, "test-peer")}.watcher`;
+  const child = f.launch(argv);
+  await armed(child);
+  const other = JSON.stringify({ pid: process.pid, owner_pid: process.pid, started_at: "2026-11-24T14:00:00.000Z" });
+  writeFileSync(lockPath, other);
+  expect(await child.exited).toBe(3);
+  expect(await remaining(child)).toContain(`doorbell stopped for test-peer: another watcher replaced ${lockPath}`);
+  expect(readFileSync(lockPath, "utf8")).toBe(other);
 });
 
 test("missing host integration returns no armed claim; malformed baseline fails", async () => {

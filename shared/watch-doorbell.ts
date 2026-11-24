@@ -34,8 +34,9 @@ function watcherLockRefusal(id: string, lockPath: string, holder: WatcherLock | 
   if (!holder) {
     return `doorbell blocked for ${id}: watcher lock ${lockPath} names no process; confirm no doorbell for ${id} is running, delete the lock, and re-arm`;
   }
-  const stop = process.platform === "win32" ? `taskkill /PID ${holder.pid}` : `kill ${holder.pid}`;
-  return `doorbell blocked for ${id}: watcher lock ${lockPath} names running process ${holder.pid} (started ${holder.started_at ?? "unrecorded"}); keep that task, or stop it with \`${stop}\` and re-arm`;
+  const inspect = process.platform === "win32" ? `tasklist /V /FI "PID eq ${holder.pid}"` : `ps -o lstart=,args= -p ${holder.pid}`;
+  return `doorbell blocked for ${id}: watcher lock ${lockPath} names running process ${holder.pid} (started ${holder.started_at ?? "unrecorded"}); keep that task. `
+    + `If \`${inspect}\` shows no doorbell for ${id} started then, the PID was reused: delete the lock and re-arm`;
 }
 
 export interface WatchDoorbellOptions {
@@ -63,8 +64,11 @@ export async function watchDoorbell(options: WatchDoorbellOptions): Promise<numb
   const pollMs = Math.max(250, options.pollMs);
   mkdirSync(doorbellDir(dbPath), { recursive: true });
   const lockPath = `${markPath}.watcher`;
+  const lock = JSON.stringify({ pid: process.pid, owner_pid: ownerPid, started_at: new Date().toISOString() });
+  // Two re-arms can read the same dead holder and both take over. Each poll
+  // confirms the lock is still this watcher's, so the one that lost it exits.
+  const ownsLock = () => { try { return readFileSync(lockPath, "utf8") === lock; } catch { return false; } };
   if (exclusive) {
-    const lock = JSON.stringify({ pid: process.pid, owner_pid: ownerPid, started_at: new Date().toISOString() });
     const take = () => writeFileSync(lockPath, lock, { flag: "wx", mode: 0o600 });
     try { take(); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -126,6 +130,10 @@ export async function watchDoorbell(options: WatchDoorbellOptions): Promise<numb
       }
       function check() {
         if (done) return;
+        if (exclusive && !ownsLock()) {
+          finish(3, `doorbell stopped for ${id}: another watcher replaced ${lockPath}`);
+          return;
+        }
         if (ownerPid && isPidDead(pidProbe(ownerPid))) {
           finish(4, `doorbell stopped for ${id}: owner exited`);
           return;
@@ -184,7 +192,7 @@ export async function watchDoorbell(options: WatchDoorbellOptions): Promise<numb
       check(); // Catch advances between the supplied snapshot and actual child startup.
     });
   } finally {
-    if (exclusive) {
+    if (exclusive && ownsLock()) {
       try { unlinkSync(lockPath); } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
           console.error(`doorbell lock cleanup failed for ${id}; verify the task has stopped before removing ${lockPath}`);
