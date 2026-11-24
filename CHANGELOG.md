@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Take over an `--exclusive` doorbell lock whose recorded watcher has exited, as a WSL interop kill leaves for the Windows watcher. The lock now records its start time, and a refusal names the lock, the running process and the command that shows whether that PID is still a doorbell. A watcher whose lock another re-arm replaced exits `3` and leaves that lock (#135).
 - Wake default manual doorbells for unread remote mail arriving between a poll and watcher launch when `/health` advertises `capabilities.drainedCounter: true`. Protocol stays at 10: new clients use the queue-head baseline with one stderr note against older brokers, and old clients keep working with updated brokers. Update one node at a time using the [rolling upgrade procedure](docs/operations.md#upgrading). With the capability, drain before re-arming a manual watcher without `--since`; managed recipes retain their explicit-baseline order (#121).
 
 - Require the standard framed Claude Code input box before a tmux push. The answer review and plan approval screens defer delivery, and quoted dialog text above the input box allows delivery. After five consecutive unverified-layout deferrals on the same queue head, queued mail moves to polling and the doorbell rings (#118, #130).

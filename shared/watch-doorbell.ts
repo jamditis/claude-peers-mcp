@@ -17,6 +17,31 @@ function readWatchMarker(path: string): number {
   } finally { closeSync(fd); }
 }
 
+interface WatcherLock { pid: number; started_at?: string }
+
+function readWatcherLock(path: string): WatcherLock | null {
+  try {
+    const raw = readFileSync(path, "utf8");
+    if (raw.length > 512) return null;
+    const lock = JSON.parse(raw) as { pid?: unknown; started_at?: unknown };
+    if (!Number.isSafeInteger(lock.pid) || (lock.pid as number) <= 0) return null;
+    const started = typeof lock.started_at === "string" && /^[0-9T:.Z-]{1,40}$/.test(lock.started_at) ? lock.started_at : undefined;
+    return { pid: lock.pid as number, started_at: started };
+  } catch { return null; }
+}
+
+function watcherLockRefusal(id: string, lockPath: string, holder: WatcherLock | null): string {
+  if (!holder) {
+    return `doorbell blocked for ${id}: watcher lock ${lockPath} names no process; confirm no doorbell for ${id} is running, delete the lock, and re-arm`;
+  }
+  const inspect = process.platform === "win32"
+    ? `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter 'ProcessId=${holder.pid}' | Format-List CreationDate,CommandLine"`
+    : `ps -o lstart=,args= -p ${holder.pid}`;
+  return `doorbell blocked for ${id}: watcher lock ${lockPath} names running process ${holder.pid} (started ${holder.started_at ? `${holder.started_at} UTC` : "unrecorded"}); keep that task. `
+    + `\`${inspect}\` shows the process's start in local time; convert it to UTC before comparing. `
+    + `If it shows a process that is not \`doorbell ${id}\` or was created after that time, the PID was reused: delete the lock and re-arm`;
+}
+
 export interface WatchDoorbellOptions {
   dbPath: string;
   id: string;
@@ -42,13 +67,35 @@ export async function watchDoorbell(options: WatchDoorbellOptions): Promise<numb
   const pollMs = Math.max(250, options.pollMs);
   mkdirSync(doorbellDir(dbPath), { recursive: true });
   const lockPath = `${markPath}.watcher`;
+  const lock = JSON.stringify({ pid: process.pid, owner_pid: ownerPid, started_at: new Date().toISOString() });
+  // Two re-arms can read the same dead holder and both take over. Each poll
+  // confirms the lock is still this watcher's, so the one that lost it exits.
+  // Two re-arms of one peer racing on a dead holder is our own agent's mistake,
+  // self-heals within one poll, and costs at most one doubled ring; a second
+  // lock would be new mechanism for a case that has never happened
+  // (coordinator ruling on review finding, Nov. 24, 2026, #135).
+  const ownsLock = () => { try { return readFileSync(lockPath, "utf8") === lock; } catch { return false; } };
   if (exclusive) {
-    try {
-      writeFileSync(lockPath, JSON.stringify({ pid: process.pid, owner_pid: ownerPid }), { flag: "wx", mode: 0o600 });
-    } catch (error) {
+    const take = () => writeFileSync(lockPath, lock, { flag: "wx", mode: 0o600 });
+    try { take(); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      console.error(`doorbell blocked for ${id}: watcher lock exists at ${lockPath}; retain the original host task. If it was hard-killed, verify it has stopped before removing the stale lock.`);
-      return 3;
+      // A host can kill the task without letting it remove its lock (a WSL
+      // interop kill leaves the Windows watcher's lock). A dead recorded
+      // watcher cannot deliver, so its lock is taken over.
+      const holder = readWatcherLock(lockPath);
+      if (!holder || !isPidDead(pidProbe(holder.pid))) {
+        console.error(watcherLockRefusal(id, lockPath, holder));
+        return 3;
+      }
+      try { unlinkSync(lockPath); } catch (unlinkError) {
+        if ((unlinkError as NodeJS.ErrnoException).code !== "ENOENT") throw unlinkError;
+      }
+      try { take(); } catch (retakeError) {
+        if ((retakeError as NodeJS.ErrnoException).code !== "EEXIST") throw retakeError;
+        console.error(watcherLockRefusal(id, lockPath, readWatcherLock(lockPath)));
+        return 3;
+      }
+      console.error(`doorbell for ${id} took over ${lockPath}: recorded watcher ${holder.pid} (started ${holder.started_at ?? "unrecorded"}) has exited`);
     }
   }
 
@@ -90,6 +137,10 @@ export async function watchDoorbell(options: WatchDoorbellOptions): Promise<numb
       }
       function check() {
         if (done) return;
+        if (exclusive && !ownsLock()) {
+          finish(3, `doorbell stopped for ${id}: another watcher replaced ${lockPath}`);
+          return;
+        }
         if (ownerPid && isPidDead(pidProbe(ownerPid))) {
           finish(4, `doorbell stopped for ${id}: owner exited`);
           return;
@@ -148,7 +199,10 @@ export async function watchDoorbell(options: WatchDoorbellOptions): Promise<numb
       check(); // Catch advances between the supplied snapshot and actual child startup.
     });
   } finally {
-    if (exclusive) {
+    // The ownership read and unlink are not atomic. Two re-arms of one peer
+    // racing on a dead holder is our own agent's mistake, self-heals within one
+    // poll, and costs at most one doubled ring (coordinator ruling, Nov. 24, 2026, #135).
+    if (exclusive && ownsLock()) {
       try { unlinkSync(lockPath); } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
           console.error(`doorbell lock cleanup failed for ${id}; verify the task has stopped before removing ${lockPath}`);
