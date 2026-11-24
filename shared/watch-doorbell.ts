@@ -35,7 +35,7 @@ function watcherLockRefusal(id: string, lockPath: string, holder: WatcherLock | 
     return `doorbell blocked for ${id}: watcher lock ${lockPath} names no process; confirm no doorbell for ${id} is running, delete the lock, and re-arm`;
   }
   const inspect = process.platform === "win32"
-    ? `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter 'ProcessId=${holder.pid}' | Select-Object CreationDate,CommandLine"`
+    ? `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter 'ProcessId=${holder.pid}' | Format-List CreationDate,CommandLine"`
     : `ps -o lstart=,args= -p ${holder.pid}`;
   return `doorbell blocked for ${id}: watcher lock ${lockPath} names running process ${holder.pid} (started ${holder.started_at ?? "unrecorded"}); keep that task. `
     + `If \`${inspect}\` shows a process that is not \`doorbell ${id}\` or was created after that time, the PID was reused: delete the lock and re-arm`;
@@ -198,6 +198,9 @@ export async function watchDoorbell(options: WatchDoorbellOptions): Promise<numb
       check(); // Catch advances between the supplied snapshot and actual child startup.
     });
   } finally {
+    // The ownership read and unlink are not atomic. Two re-arms of one peer
+    // racing on a dead holder is our own agent's mistake, self-heals within one
+    // poll, and costs at most one doubled ring (coordinator ruling, Nov. 24, 2026, #135).
     if (exclusive && ownsLock()) {
       try { unlinkSync(lockPath); } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
