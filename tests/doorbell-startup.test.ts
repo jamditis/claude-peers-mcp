@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { doorbellPath, readDoorbell, readDrainedDoorbell, removeDoorbell, writeDoorbell, writeDrainedDoorbell } from "../shared/notify.ts";
@@ -292,7 +292,7 @@ test("one host task per peer, arm-before-drain, and rearm after each fire", asyn
     expect(await armed(child)).toContain("consumed=false");
     const duplicate = f.launch(argv);
     expect(await duplicate.exited).toBe(3);
-    expect(await new Response(duplicate.stderr).text()).toContain("retain the original host task");
+    expect(await new Response(duplicate.stderr).text()).toContain(`names running process ${child.pid} (started `);
     // A different peer's signal never completes this task.
     writeDoorbell(f.dbPath, "another-peer", 900);
     expect(child.exitCode).toBeNull();
@@ -338,6 +338,31 @@ test("peer removal stops a stale binding; an abandoned lock fails closed", async
   const blocked = f.launch(argv);
   expect(await blocked.exited).toBe(3);
   expect(existsSync(lockPath)).toBe(true); // never steal an unknown host task
+});
+
+test("a lock left by an exited watcher is taken over; a live one is refused by name (#135)", async () => {
+  // Nov. 24, 2026: a WSL interop kill left the Windows watcher's lock with a dead PID.
+  const f = fixture();
+  const argv = await recipe(f.context);
+  const lockPath = `${doorbellPath(f.dbPath, "test-peer")}.watcher`;
+  const gone = Bun.spawn(["true"]);
+  await gone.exited;
+  writeFileSync(lockPath, JSON.stringify({ pid: gone.pid, owner_pid: process.pid }));
+  const child = f.launch(argv);
+  await armed(child);
+  const lock = JSON.parse(readFileSync(lockPath, "utf8"));
+  expect(lock.pid).toBe(child.pid);
+  expect(Number.isNaN(Date.parse(lock.started_at))).toBe(false);
+  child.kill();
+  await child.exited;
+  expect(await new Response(child.stderr).text()).toContain(`recorded watcher ${gone.pid} (started unrecorded) has exited`);
+
+  writeFileSync(lockPath, JSON.stringify({ pid: process.pid, owner_pid: process.pid, started_at: "2026-11-24T13:46:00.000Z" }));
+  const blocked = f.launch(argv);
+  expect(await blocked.exited).toBe(3);
+  expect(await new Response(blocked.stderr).text()).toContain(
+    `watcher lock ${lockPath} names running process ${process.pid} (started 2026-11-24T13:46:00.000Z); keep that task, or stop it with \`kill ${process.pid}\` and re-arm`);
+  expect(JSON.parse(readFileSync(lockPath, "utf8")).pid).toBe(process.pid);
 });
 
 test("missing host integration returns no armed claim; malformed baseline fails", async () => {

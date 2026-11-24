@@ -17,6 +17,27 @@ function readWatchMarker(path: string): number {
   } finally { closeSync(fd); }
 }
 
+interface WatcherLock { pid: number; started_at?: string }
+
+function readWatcherLock(path: string): WatcherLock | null {
+  try {
+    const raw = readFileSync(path, "utf8");
+    if (raw.length > 512) return null;
+    const lock = JSON.parse(raw) as { pid?: unknown; started_at?: unknown };
+    if (!Number.isSafeInteger(lock.pid) || (lock.pid as number) <= 0) return null;
+    const started = typeof lock.started_at === "string" && /^[0-9T:.Z-]{1,40}$/.test(lock.started_at) ? lock.started_at : undefined;
+    return { pid: lock.pid as number, started_at: started };
+  } catch { return null; }
+}
+
+function watcherLockRefusal(id: string, lockPath: string, holder: WatcherLock | null): string {
+  if (!holder) {
+    return `doorbell blocked for ${id}: watcher lock ${lockPath} names no process; confirm no doorbell for ${id} is running, delete the lock, and re-arm`;
+  }
+  const stop = process.platform === "win32" ? `taskkill /PID ${holder.pid}` : `kill ${holder.pid}`;
+  return `doorbell blocked for ${id}: watcher lock ${lockPath} names running process ${holder.pid} (started ${holder.started_at ?? "unrecorded"}); keep that task, or stop it with \`${stop}\` and re-arm`;
+}
+
 export interface WatchDoorbellOptions {
   dbPath: string;
   id: string;
@@ -43,12 +64,27 @@ export async function watchDoorbell(options: WatchDoorbellOptions): Promise<numb
   mkdirSync(doorbellDir(dbPath), { recursive: true });
   const lockPath = `${markPath}.watcher`;
   if (exclusive) {
-    try {
-      writeFileSync(lockPath, JSON.stringify({ pid: process.pid, owner_pid: ownerPid }), { flag: "wx", mode: 0o600 });
-    } catch (error) {
+    const lock = JSON.stringify({ pid: process.pid, owner_pid: ownerPid, started_at: new Date().toISOString() });
+    const take = () => writeFileSync(lockPath, lock, { flag: "wx", mode: 0o600 });
+    try { take(); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      console.error(`doorbell blocked for ${id}: watcher lock exists at ${lockPath}; retain the original host task. If it was hard-killed, verify it has stopped before removing the stale lock.`);
-      return 3;
+      // A host can kill the task without letting it remove its lock (a WSL
+      // interop kill leaves the Windows watcher's lock). A dead recorded
+      // watcher cannot deliver, so its lock is taken over.
+      const holder = readWatcherLock(lockPath);
+      if (!holder || !isPidDead(pidProbe(holder.pid))) {
+        console.error(watcherLockRefusal(id, lockPath, holder));
+        return 3;
+      }
+      try { unlinkSync(lockPath); } catch (unlinkError) {
+        if ((unlinkError as NodeJS.ErrnoException).code !== "ENOENT") throw unlinkError;
+      }
+      try { take(); } catch (retakeError) {
+        if ((retakeError as NodeJS.ErrnoException).code !== "EEXIST") throw retakeError;
+        console.error(watcherLockRefusal(id, lockPath, readWatcherLock(lockPath)));
+        return 3;
+      }
+      console.error(`doorbell for ${id} took over ${lockPath}: recorded watcher ${holder.pid} (started ${holder.started_at ?? "unrecorded"}) has exited`);
     }
   }
 
