@@ -156,6 +156,22 @@ test("legacy manual watchers still create an absent marker", async () => {
   expect(await child.exited).toBe(0);
 });
 
+test("an armed manual watcher skips a signal drained by a later poll", async () => {
+  const f = fixture();
+  const child = f.launch([process.execPath, join(root, "cli.ts"), "doorbell", "test-peer", "--db-path", f.dbPath]);
+  expect(await armed(child)).toContain("since=0");
+
+  // Model the state after a poll consumes the mail before the watcher reads the signal.
+  writeDrainedDoorbell(f.dbPath, "test-peer", 1);
+  writeDoorbell(f.dbPath, "test-peer", 1);
+  await Bun.sleep(500);
+  expect(child.exitCode).toBeNull();
+
+  writeDoorbell(f.dbPath, "test-peer", 2);
+  expect(await child.exited).toBe(0);
+  expect(await remaining(child)).toContain("mark=2");
+});
+
 // The old client is modeled at startup with its queue-head baseline. An explicit
 // --since executes that unchanged marker-watching path without negotiating health.
 for (const oldClient of [true, false]) {
