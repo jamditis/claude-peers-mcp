@@ -116,6 +116,27 @@ Linting is [Biome](https://biomejs.dev) `2.4.16` (pinned exact in `devDependenci
 - **Make CI green before requesting review.** Run the four checks listed above locally first and satisfy the repository's current merge requirements.
 - Update the README, `CLAUDE.md`, and `CHANGELOG.md` when a change affects setup, behavior, or the public surface. Stale docs are worse than no docs.
 
+## Post-bootstrap npm publisher review
+
+Use this checklist for the staged publishing workflow planned in [#75](https://github.com/jamditis/claude-peers-mcp/issues/75). The engineering gates in [#85](https://github.com/jamditis/claude-peers-mcp/issues/85) and the initial npm publication in [#35](https://github.com/jamditis/claude-peers-mcp/issues/35) come first.
+
+1. Before each release, the required GitHub environment reviewer inspects the package’s complete trusted publisher list in npm. Record the UTC verification time and each connection’s provider, repository, workflow filename, environment and allowed actions. Record no credentials. Verify again after any connection or permission changes. [npm trusted publishers](https://docs.npmjs.com/trusted-publishers/)
+2. Compare the inventory with the approved GitHub Actions staging workflow and protected environment. Stop if a connection is unexpected, any field or permission is unverified, or any connection can publish directly or manage dist-tags. Ask the package maintainer to reconcile the npm settings, then recheck the full inventory. A successful CI run or CLI help output cannot verify npm package permissions.
+3. Check the package’s publishing access separately. Require 2FA and disallow traditional publishing tokens. Confirm that the GitHub release environment still requires reviewer approval. Stop if either control is missing and recheck it with the maintainer before staging.
+4. The approved workflow stages the inspected CI tarball with `npm stage publish <tarball> --tag next`. Stage approval and dist-tag changes belong outside that workflow.
+5. A maintainer uses an interactive npm session to find the stage with `npm stage list <package>` and inspect its version and tag with `npm stage view <stage-id>`. Use `npm stage download <stage-id>` and compare the downloaded tarball’s SHA-512 digest with the inspected CI artifact’s digest. Confirm the version and `next` tag. If a check fails, stop and reconcile the stage with the CI artifact. After all checks pass, the maintainer approves with `npm stage approve <stage-id>` and the interactive 2FA prompt. [npm stage reference](https://docs.npmjs.com/cli/v11/commands/npm-stage/)
+
+### Example review records
+
+Each example uses the synthetic expected connection `GitHub Actions / example/example / release.yml / npm-release` and a verification time of `2026-01-01T12:00:00Z`. Assume the package controls and GitHub approval in step 3 are verified. These examples verify the checklist decisions. A release still requires current evidence from npm and GitHub.
+
+| Recorded connections and actions | Decision | Follow-up |
+| --- | --- | --- |
+| Expected connection, stage only. | Proceed to staging. | Apply the artifact and tag checks before approval. |
+| Expected stage-only connection plus `GitHub Actions / example/other / publish.yml / production`, with direct publish. | Stop. | Ask the maintainer to remove the unexpected connection and verify the entire list again. |
+| Expected connection, stage and dist-tag access. | Stop. | Ask the maintainer to remove dist-tag access and verify the entire list again. |
+| Expected connection, stage enabled and dist-tag permission unverified. | Stop. | Inspect the connection in npm and record its complete permissions before proceeding. |
+
 ## Project layout
 
 | Path | Purpose |
