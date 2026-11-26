@@ -58,6 +58,7 @@ export interface WatchDoorbellOptions {
 /** Notify only. A host-owned child must deliver completion to its session. */
 export async function watchDoorbell(options: WatchDoorbellOptions): Promise<number> {
   const { dbPath, id, since, timeoutSec, persistent, ownerPid, exclusive, drainedCounter } = options;
+  const followDrain = since === null && drainedCounter;
   const markPath = doorbellPath(dbPath, id);
   if (!markPath) throw new Error("Invalid peer id");
   if (ownerPid && isPidDead(pidProbe(ownerPid))) {
@@ -166,9 +167,11 @@ export async function watchDoorbell(options: WatchDoorbellOptions): Promise<numb
           }
           return;
         }
-        // A capable broker records completed polls; older brokers use the queue head.
-        // An explicit pre-launch baseline must survive startup read failures.
-        baseline ??= drainedCounter ? readDrainedDoorbell(dbPath, id) : cur;
+        // A completed poll can drain mail while a manual watcher is already armed.
+        if (followDrain && (baseline === null || cur > baseline)) {
+          baseline = Math.max(baseline ?? 0, readDrainedDoorbell(dbPath, id));
+        }
+        baseline ??= cur;
         if (!ready) {
           ready = true;
           console.log(`doorbell armed for ${id} (since=${baseline}; backend=${watcher ? "watch+poll" : "poll"}; consumed=false)`);
@@ -181,7 +184,7 @@ export async function watchDoorbell(options: WatchDoorbellOptions): Promise<numb
         if (persistent) {
           console.log(`mail for ${id} (mark=${cur})`);
           baseline = cur;
-        } else finish(0, `mail for ${id} (mark=${cur}) - ${since === null && drainedCounter
+        } else finish(0, `mail for ${id} (mark=${cur}) - ${followDrain
           ? "run check_messages, then re-arm" : "re-arm, then run check_messages"}`);
       }
       function onEvent() {
