@@ -362,7 +362,7 @@ test("a lock left by an exited watcher is taken over; a live one is refused by n
   expect(await blocked.exited).toBe(3);
   const inspect = process.platform === "win32"
     ? `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter 'ProcessId=${process.pid}' | Format-List CreationDate,CommandLine"`
-    : `ps -o lstart=,args= -p ${process.pid}`;
+    : `ps -ww -o lstart=,args= -p ${process.pid}`;
   expect(await new Response(blocked.stderr).text()).toContain(
     `watcher lock ${lockPath} names running process ${process.pid} (started 2026-11-24T13:46:00.000Z UTC); keep that task. `
     + `\`${inspect}\` shows the process's start in local time; convert it to UTC before comparing. `
